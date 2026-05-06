@@ -1,0 +1,103 @@
+spec_version: "1.0"
+name: pinta
+language_stack: [python, typescript]
+frameworks: [fastapi, react, alembic]
+
+surfaces:
+  backend_logic:
+    paths: ["backend/src/services/", "backend/src/agents/tools/"]
+    type: code
+    guardrails:
+      - "ruff check {path}"
+      - "pytest -x -q tests/test_quote_calculator.py"
+  agent_prompts:
+    paths: ["backend/agents/maler.yaml"]
+    type: yaml-keys
+    allowed_keys: ["system_prompt", "tools", "temperature"]
+  frontend:
+    paths: ["frontend/src/components/", "frontend/src/hooks/"]
+    type: code
+    guardrails:
+      - "cd frontend && npx tsc --noEmit"
+      - "cd frontend && npm run lint -- --max-warnings 0"
+
+forbidden:
+  - "backend/src/routes/auth.py"
+  - "backend/src/routes/payments.py"
+  - "backend/src/core/security.py"
+  - "backend/migrations/**"
+  - ".forge/**"
+  - ".github/workflows/**"
+  - "CLAUDE.md"
+
+capabilities:
+  read: ["**/*"]
+  edit: ["{surfaces}"]
+  run:
+    - "pytest *"
+    - "ruff *"
+    - "mypy *"
+    - "tsc *"
+    - "npm test"
+    - "npm run lint*"
+    - "npm run build"
+  commit: true
+  open_pr: true
+  merge_pr: false
+  push_to_main: false
+  push_force: false
+  network_egress:
+    - "api.anthropic.com"
+    - "api.github.com"
+
+eval_suites:
+  quick:
+    cmd: "cd backend && pytest -x -q tests/test_quote_calculator.py tests/test_agent_service.py"
+    budget_s: 60
+    parses: pytest_json
+  full:
+    cmd: "scripts/run_full_eval.sh"
+    budget_s: 600
+    parses: scores_json
+  judge:
+    cmd: "python scripts/judge_quotes.py --scenarios tests/scenarios/*.json"
+    budget_s: 300
+    parses: scores_json
+
+gates:
+  - {kind: pytest_pass_rate, threshold: 1.0, source: quick}
+  - {kind: ruff_warnings,    threshold: 0,   lower_is_better: true}
+  - {kind: tsc_errors,       threshold: 0,   lower_is_better: true}
+  - {kind: mypy_errors,      max_increase: 0}
+
+scores:
+  - {kind: coverage_pct,     weight: 0.25, source: quick}
+  - {kind: p95_latency_ms,   weight: 0.40, source: full, lower_is_better: true}
+  - {kind: bundle_kb,        weight: 0.20, source: full, lower_is_better: true}
+  - {kind: todo_count,       weight: 0.15, lower_is_better: true}
+
+diagnostics:
+  - {kind: llm_judge_score, source: judge}
+  - {kind: complexity_avg,  source: full}
+
+cost_caps:
+  per_generation_usd: 0.50
+  per_run_usd: 5.00
+  per_project_per_day_usd: 30.00
+  per_project_per_month_usd: 500.00
+
+triggers:
+  on_issue_label:
+    auto-fix:    {strategy: sequential, model: sonnet, max_iterations: 10}
+    auto-feature: {strategy: sequential, model: opus,   max_iterations: 15, requires_human_review: true}
+  on_pr_opened:   {strategy: review_only, model: sonnet}
+  on_ci_failure:  {strategy: sequential, model: sonnet, max_iterations: 3}
+  schedule:
+    - cron: "0 2 * * *"
+      strategy: sequential
+      focus: legacy_test_revival
+
+release:
+  conventional_commits: true
+  on_main_green: auto_tag
+  changelog: "CHANGELOG.md"

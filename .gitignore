@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# forge runtime artefacts
+.forge/blobs/
+.forge/worktrees/
+.forge/events.duckdb
+.forge/events.duckdb.wal
+.forge/runs/
+*.duckdb
+*.duckdb.wal

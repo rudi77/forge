@@ -1,0 +1,497 @@
+Ok, klingt vernünftig.  Wie implementiere ich jetzt forge und wie wende ich es dann an?
+
+06:28
+Claude hat geantwortet: Gute Frage — und genau hier wird die Spec konkret.
+Gute Frage — und genau hier wird die Spec konkret. Ich gebe dir einen Plan, der in der Reihenfolge ausführbar ist, mit klaren Erfolgskriterien pro Schritt. Keine 10.000-Zeilen-Auto-Generierung, sondern ein realistischer Pfad über ~3-4 Wochen, an dessen Ende du einen funktionierenden Auto-PR auf PINTA hast.
+
+Die Meta-Frage zuerst: wer baut forge?
+Drei realistische Modi, in steigender Selbst-Disziplin:
+
+Modus A — Du baust mit Claude Code als Pair. Du sitzt am Steuer, Claude Code schreibt Code, du reviewst jeden Commit. Langsam, aber du verstehst jede Zeile. Empfohlen für M1, weil du den Code danach jahrelang debuggen und erweitern wirst.
+
+Modus B — Du beauftragst Claude Code mit klarem Spec-Stub und reviewst Module-weise. Schneller, aber du brauchst sehr scharfe Module-Specs vorab, sonst wandert die Implementierung. Empfohlen ab M2, wenn die Architektur steht.
+
+Modus C — Du lässt forge sich selbst bauen. Das ist der reizvolle Gedanke und auch genau die Falle. Forge optimiert sich nicht selbst (Prinzip 3 der Spec) — aber forge gegen forge zu bauen, wäre Henne-Ei und in den ersten 6 Monaten verboten.
+
+Empfehlung: Modus A für M1, dann graduell zu B übergehen.
+
+Implementierung: 4 Wochen, 5 Schritte
+Schritt 1 — Repo + Skeleton (Tag 1, 2-3 Stunden)
+Bevor irgendwas Komplexes passiert, brauchst du das physische Gerüst. Eigenes Repo, weil getrennt von pytaskforce.
+
+bash
+mkdir forge && cd forge
+git init
+uv init --package
+mkdir -p packages/{forge-core,forge-execute,forge-cli,forge-adapters}/src
+mkdir -p packages/{forge-core,forge-execute,forge-cli,forge-adapters}/tests
+mkdir -p examples/pinta examples/plain-fastapi docs
+pyproject.toml als uv-Workspace:
+
+toml
+[tool.uv.workspace]
+members = ["packages/*"]
+Jedes Package kriegt sein eigenes pyproject.toml mit [project] und Dependencies. forge-core hat keine internen Dependencies. forge-execute hängt von forge-core. forge-cli hängt von beiden. Die Trennung zahlt sich später aus, wenn du Loop 3 als forge-meta dazustellst.
+
+Außerdem heute schon: docs/spec-v0.2.md (das was wir geschrieben haben) committen, plus ein leeres CHANGELOG.md und README.md mit nur dem North-Star-Satz aus der Spec. Erfolgskriterium: uv sync läuft durch, pytest findet keine Tests, beschwert sich nicht.
+
+Schritt 2 — forge-core (Woche 1, ~3-5 Tage)
+Das ist die Stelle, an der jede Stunde Sorgfalt sich später zehnfach auszahlt. Reihenfolge innerhalb des Packages:
+
+2a. events.py — Pydantic-Modelle für Event plus Sub-Schemas pro EventKind. Jedes Sub-Schema in einer eigenen Datei in events/kinds/. Nicht weniger als 16 Dateien, klingt overkill, ist aber genau richtig — sonst wird das Event-Modul zur Riesendatei, die du später nicht refactorn willst.
+
+2b. blobs.py — Content-Addressed Store. Drei Funktionen: put(bytes) -> sha256, get(sha256) -> bytes, gc(keep_referenced_in_last_days=365). Filesystem-Layout <hash[:2]>/<hash>. Atomare Writes via os.rename von temp file. Erfolgskriterium: round-trip Test mit zufälligen Bytes.
+
+2c. store.py — DuckDB-Sink. Eine events-Tabelle mit JSON-Column für payload, getrennten Spalten für die häufig gefilterten Felder (run_id, kind, ts, project). Plus 3-4 Views für die Standard-Queries (runs_with_outcomes, cost_per_focus, pr_merge_rate_by_template). Erfolgskriterium: 1000 Events einfügen, Queries laufen unter 100ms.
+
+2d. spec.py — Loader für .forge/project.yaml. Pydantic-Modell für die ganze Struktur aus Anhang B der Spec. Validierungen, die schon hier scharfe Fehler werfen müssen:
+
+Surfaces dürfen sich nicht überlappen
+Forbidden darf keine Pfade enthalten, die in Surfaces sind
+Capabilities merge_pr und push_to_main müssen false sein (hardcoded in v1, kein Override)
+Gate kind-Werte müssen einer bekannten Enum entsprechen
+Score-Gewichte müssen Summe=1.0 ergeben (oder werden normalisiert mit Warning)
+2e. replay.py — Skelett, nicht voll implementiert. Eine Funktion reconstruct_run(run_id) -> RunReconstruction, die alle Events plus referenzierte Blobs zusammenführt. In v1 nur als Datenstruktur; aktiv genutzt erst in v3. Aber die API muss heute schon stehen, sonst landest du später mit inkompatiblen Datenstrukturen.
+
+Tests pro Modul. Erfolgskriterium für Schritt 2: uv run pytest packages/forge-core/ ist grün, ein End-to-End-Test legt 5 Events an, queriet sie und reconstruct'd sie aus den Blobs.
+
+Schritt 3 — forge-execute minimal (Woche 2, ~5 Tage)
+Jetzt wird's interessant, aber bleib diszipliniert: nur Sequential, nur eine Mutator-Art (code), nur einer Eval-Art (command). Alles andere ist M2 oder später.
+
+3a. worktrees.py — Git-Worktree-Pool. Funktionen create(run_id) -> Path, cleanup(path), apply_patch(path, diff), revert(path), commit(path, message). Wichtig: separater venv pro Worktree (Pre-Warm via Symlink auf eine Master-venv ist Optimierung für später, nicht jetzt). Erfolgskriterium: 3 Worktrees parallel, sauber aufgeräumt nach Run-Ende.
+
+3b. capabilities.py — Capability-Enforcement. Eine Klasse, die jeden geplanten Tool-Call prüft (Pfad gegen Surfaces+Forbidden, Aktion gegen Capability-Liste). Auf Verletzung wird GuardrailViolation emittiert und eine Exception geworfen. Ist der härteste Sicherheitsmechanismus — Tests dafür sind doppelt wichtig.
+
+3c. mutators/code.py — Nimmt strukturierte Edit-Operationen oder unified diffs, applied sie via git apply. Nach Apply: git diff --check (keine Whitespace-Fehler), Syntax-Check via python -m py_compile für .py-Files, tsc --noEmit für .ts. Erfolgskriterium: 10 zufällige Diffs apply+revert == identity.
+
+3d. evaluators/command.py — Führt einen Shell-Command aus, parst stdout als JSON oder pytest-Output. Honoriert budget_s, killt den Prozess bei Timeout. Erfolgskriterium: Ein bekannt-grüner Pytest-Suite-Aufruf liefert {"pytest_pass_rate": 1.0, ...}.
+
+3e. gates.py + scoring.py — Reine Funktionen. evaluate_gates(eval_result, spec) -> tuple[bool, list[GateViolation]] und compute_composite(scores, spec) -> float. Trivial im Code, aber kritisch in Tests: Property-based mit Hypothesis, weil hier später viele Bugs lauern werden.
+
+3f. runner.py — Der Hauptloop. Eine Funktion run_sequential(spec, trigger, max_iterations) -> RunResult. Implementiert die fünf Phasen Propose → Mutate → Preflight → Eval → Decide aus Teil 6 der Spec. Cost-Cap-Checks vor jedem LLM-Call. Emittiert alle Events.
+
+Hier ein wichtiger Punkt: der Proposer-LLM-Call ist in v1 ein einfacher claude -p Headless-Call (subprocess), nicht das volle Anthropic-SDK. Begründung: Claude Code im Headless-Mode kann den Worktree direkt editieren und Patches als unified diff zurückgeben — ist näher an dem, was du in der pinta und bludelta Welt eh gewohnt bist, und du sparst die ganze Tool-Use-Loop-Implementierung.
+
+python
+# vereinfacht
+result = subprocess.run([
+    "claude", "-p", prompt,
+    "--output-format", "json",
+    "--allowedTools", "Read,Edit,Write,Bash(pytest:*),Bash(ruff:*)",
+    "--max-turns", "8",
+    "--cwd", str(worktree_path),
+], capture_output=True, timeout=600, text=True)
+Den Diff bekommst du via git diff vom Worktree nach dem Run. Cleaner als zu versuchen, das Modell strukturierte Diffs zurückgeben zu lassen.
+
+Erfolgskriterium Schritt 3: Ein hand-trigger'ter Run gegen ein lokales Test-Repo (kann ein Mini-Repo mit einem absichtlich roten Test sein) macht den Test grün, committed, und alle Events sind im Store.
+
+Schritt 4 — forge-cli + GitHub-Adapter (Woche 3, ~3-5 Tage)
+Jetzt wird es benutzbar.
+
+4a. forge-cli — Vier Subcommands:
+
+forge run --spec <path> --trigger-type schedule --focus <name> — manueller Trigger
+forge analyze — drei Standard-Reports aus dem Store (PR-Merge-Rate, Cost-pro-Focus, Top-Failure-Modi), als Markdown nach stdout
+forge doctor — prüft Spec auf Konsistenz, prüft ob alle Capabilities-Tools im PATH sind, prüft API-Key-Verfügbarkeit
+forge replay <run_id> — rekonstruiert einen Run als lesbare Markdown-Timeline
+CLI-Framework: typer oder click, nicht argparse. Wenn du keine Präferenz hast, nimm typer, weil's mit Pydantic gut spielt.
+
+4b. forge-adapters/github/ — Drei Komponenten:
+
+GitHub Action Template als YAML-Files, die forge als pip-Package installieren und aufrufen. Eines pro Trigger-Typ (Issue, PR, CI-Failure, Schedule).
+PR-Erstellung: Wrapper um gh pr create, parst Spec-Trigger-Config, baut strukturierten Body mit Score-Trend, Run-Summary-Link, betroffenen Files.
+Webhook-Listener: in v1 minimal — eigentlich nur ein eintreffendes pull_request.merged-Event, das PRMerged ins Store schreibt. Kann als separater kleiner FastAPI-Service laufen oder als zweite GitHub Action, die bei Merge feuert und über gh api ins lokale Store schreibt. Letzteres ist einfacher.
+Erfolgskriterium: forge run auf der Kommandozeile produziert lokal einen PR. Plus: das Issue-Trigger-Workflow-Template auf einem Test-Repo aktivieren, ein Issue mit Label auto-fix öffnen, Workflow läuft durch, PR entsteht.
+
+Schritt 5 — PINTA-Integration (Woche 4)
+Erst jetzt forge auf PINTA loslassen. Vorher wäre verfrüht — du willst nicht echtes Geld auf einer ungetesteten Pipeline brennen.
+
+5a. .forge/project.yaml in PINTA committen — die Reference-Spec aus Anhang B v0.2. Zwei Punkte, an denen du wahrscheinlich nachjustieren musst:
+
+Die eval_suites.full braucht ein Skript, das alle Scores als JSON ausgibt. Ein neues backend/scripts/run_full_eval.sh, das Pytest läuft, dann coverage report --format json, dann ein Mini-Bench-Skript. Den Output als ein konsolidiertes JSON ausgeben.
+Die eval_suites.judge braucht das Scenario-Files und das Judge-Script. Das ist ein nichttriviales Mini-Projekt für sich (LLM-Judge-Implementierung mit konsistentem Prompt). Wenn das zu viel ist für die erste Iteration: Judge erstmal weglassen, in M1 nicht aktivieren — diagnostics darf leer sein.
+5b. Erste Smoke-Runs — manuell, mit forge run --spec .forge/project.yaml --trigger-type manual --focus legacy_test_revival --max-iterations 3. Drei Iterationen, $1.50 Cost-Cap. Wenn das durchläuft und einen sinnvollen PR produziert, ist M1 erreicht.
+
+5c. GitHub Actions aktivieren — die vier Workflow-Files aus Schritt 4b ins .github/workflows/ von PINTA. Sekrets setzen (ANTHROPIC_API_KEY). Erstes Issue mit auto-fix-Label öffnen — eines, von dem du weißt, dass es lösbar ist, aber dem Agent nicht trivial fällt.
+
+Erfolgskriterium M1: drei automatisch generierte PRs auf PINTA innerhalb einer Woche, mindestens einer davon ohne menschliche Edits gemerged.
+
+Anwendung: der erste Monat in Praxis
+Jetzt zum eigentlichen "wie wende ich's an"-Teil. Nicht in M1 erwarten:
+
+Dass die Maschine schwierige Bugs löst
+Dass die Maschine größere Refactors macht
+Dass die Auto-Fix-Rate über 60% steigt
+In M1 erwarten:
+
+Lint-Cleanups, Test-Coverage-Erweiterungen, einfache Bug-Fixes mit klaren Reproduce-Steps, kleinere Doc-Updates
+Cost pro PR irgendwo zwischen $0.50 und $3.00
+Einige PRs, die du zumachst statt zu mergen — und das ist OK, das sind deine ersten Datenpunkte
+Wie du Issues schreibst, damit forge sie versteht
+Das wird die unterschätzteste Disziplin. Ein Issue für die Maschine ist anders als ein Issue für dich selbst. Vier Pflicht-Felder im Issue-Template:
+
+markdown
+## Reproduktion
+<!-- Schritt-für-Schritt, copy-pasteable Commands -->
+
+## Erwartetes Verhalten
+<!-- Konkret, prüfbar -->
+
+## Aktuelles Verhalten
+<!-- Mit Logs/Stack-Traces wenn möglich -->
+
+## Betroffene Surfaces
+<!-- Welche Pfade aus project.yaml -->
+Die Maschine ist nur so gut wie das Issue. Wenn du in Tag 1 bemerkst, dass die Maschine ständig im falschen Surface arbeitet — meistens liegt's am Issue-Body, nicht am Modell.
+
+Was du wöchentlich machst
+Sonntags 30 Minuten: forge analyze, lies die drei Reports, schreib in .forge/insights/<datum>.md zwei oder drei Zeilen "was ich diese Woche gelernt habe". Das ist Phase 3 der Spec, und es ist wichtiger als der Build von M2. Ohne diese Disziplin akkumulierst du Daten ohne Erkenntnis, und Loop 3 in v3 wird darauf gegen Annahmen optimieren.
+
+Wann du forge ausschaltest
+Vier Anlässe, sofort forge auf PINTA pausieren (z.B. via GitHub-Action-Disable):
+
+Wenn ein Forbidden-Pfad-Versuch passiert (sollte nie passieren — wenn doch: Spec-Audit)
+Wenn an einem Tag mehr als $20 verbrannt werden ohne mergebaren PR
+Wenn drei aufeinanderfolgende PRs revertet werden müssen
+Wenn die Maschine sich in einer Endlosschleife auf einem Issue festfrisst
+In der Spec sind diese als Eskalations-Trigger definiert (Teil 8.3) — aber in M1 hast du noch keine automatische Eskalation, also musst du selbst aufmerksam sein.
+
+Was ich an deiner Stelle ZUERST tun würde
+Zwei Sachen heute Abend, eine Stunde Arbeit:
+
+Repo forge auf GitHub anlegen, Spec-v0.2.md committen als docs/spec-v0.2.md, README mit dem einen North-Star-Satz, sonst nichts.
+Die Reference-Spec aus Anhang B in pinta/.forge/project.yaml committen — als reine Doku, mit einem Kommentar-Header # WIP: forge ist noch nicht implementiert, diese Datei ist Architektur-Referenz. So hast du einen frühen Sanity-Check, ob die Spec überhaupt zu PINTAs Realität passt — du wirst beim Schreiben merken, an welchen Stellen die Eval-Suiten fehlen oder die Pfade nicht stimmen.
+Drei Tage später, wenn beides committet ist und sich gesetzt hat, fang mit Schritt 1 (Repo-Skeleton) an. Dazwischen liegt das wichtigste Element des Bauprozesses: das Spec-Dokument lesen die Spec lassen. Es nicht direkt umsetzen, sondern erst nochmal mit Abstand drüber gehen. Ich wette, du findest beim erneuten Lesen mindestens zwei Stellen, wo du sie noch schärfen willst — und das ist viel günstiger zu ändern als später im Code.
+
+Soll ich dir für einen der konkreten Implementierungsschritte ein Detail-Design machen? Konkret zwei Kandidaten, an denen sich's lohnt, vorab gründlich zu sein:
+
+Das Event-Schema mit allen Sub-Schemas als ausgearbeitetes Pydantic-File — das ist die irreversibelste Entscheidung
+Der Sequential Runner als detailliertes Sequenzdiagramm plus Pseudo-Code — weil die Cost-Cap-Logik und die Phase-Übergänge mehr subtile Stellen haben als es aussieht
+Oder lieber direkt das forge init-Template, damit der Bootstrap-Schritt aus Phase 0 der Spec gleich machbar ist?
+
+Du hast gesagt: Und forge verwendet claude code cli als Coding Agent?
+Und forge verwendet claude code cli als Coding Agent?
+
+06:31
+Claude hat geantwortet: Ja — und ich finde, das ist die richtige Wahl, aber es lohnt sich, kurz zu erklären, warum und wo die Grenzen liegen, weil die Entscheidung architektonische Ko…
+Ja — und ich finde, das ist die richtige Wahl, aber es lohnt sich, kurz zu erklären, warum und wo die Grenzen liegen, weil die Entscheidung architektonische Konsequenzen hat.
+
+Warum Claude Code CLI als Coding Agent in v1
+Drei sachliche Gründe:
+
+Du kennst es schon. Aus deinem Hintergrund — /loop, headless mode, Worktree-Parallelisierung, Subagenten — bist du in der Claude-Code-CLI näher an "fließend" als bei Alternativen. Das beschleunigt M1 um Wochen, weil du nicht parallel zu forge ein neues Tool lernst.
+
+Es löst genau das, was forge braucht. Headless mode (claude -p) ist als Subprozess-API gebaut. --allowedTools, --max-turns, --output-format json, --cwd, --permission-mode — das sind genau die Stellschrauben, die forge an seinem Coding-Agent braucht. Ohne dieses CLI müsstest du die Tool-Use-Loop, das Edit-Tooling, das File-Reading selbst implementieren — das ist Wochen Arbeit ohne Mehrwert.
+
+Worktree-Native. Claude Code arbeitet sauber in einem --cwd <pfad> Worktree, ohne dass es globalen State zwischen Aufrufen mitnimmt. Das passt exakt zu forges Generation-Modell (jede Generation = neuer Worktree, sauberer Subprozess-Aufruf).
+
+Wo die architektonische Grenze liegt
+Hier kommt der wichtige Teil: Claude Code CLI ist in forge ein Plug-in, nicht das Fundament. Das ist kein Detail, sondern Designprinzip.
+
+Konkret heißt das: Es gibt in forge-execute/ ein Interface — nennen wir es CodingAgent — das genau drei Methoden hat:
+
+python
+class CodingAgent(Protocol):
+    async def propose(
+        self,
+        worktree: Path,
+        prompt: str,
+        allowed_paths: list[str],
+        capabilities: Capabilities,
+        budget_usd: Decimal,
+        max_turns: int,
+    ) -> ProposalResult:
+        """Generiert Vorschlag im Worktree, returnt strukturiertes Result."""
+        ...
+    
+    async def review(
+        self,
+        worktree: Path,
+        diff: str,
+        ...
+    ) -> ReviewResult: ...
+    
+    async def estimate_cost(self, prompt_tokens: int) -> Decimal: ...
+Und es gibt eine konkrete Implementierung ClaudeCodeCLIAgent, die das via Subprozess-Call umsetzt. Aber die Architektur ist so geschnitten, dass morgen ein CodexCLIAgent, OpenCodeAgent oder ein DirectAnthropicAPIAgent daneben treten kann, ohne dass forge-core oder forge-execute strukturell anders aussehen.
+
+Warum die Trennung wichtig ist:
+
+Lock-in vermeiden. Coding-Agent-Landschaft ändert sich schnell. Wenn du forge in 2 Jahren produktiv betreibst und Claude Code CLI in der Form nicht mehr existiert oder ein deutlich besseres Tool da ist, willst du tauschen können, ohne forge umzubauen.
+
+Multi-Agent-Strategien später. Sobald du in Phase v3 (Loop 3) bist, ist die Modell- und Agent-Wahl Teil dessen, was die Fabrik lernt. Vielleicht stellt sich heraus, dass für lint_cleanup ein deutlich kleineres und billigeres Tool reicht. Die Architektur muss das tragen können.
+
+Testbarkeit. Für Unit-Tests von forge-execute willst du einen MockCodingAgent, der deterministische Antworten gibt. Geht nur, wenn die Schnittstelle abstrakt ist.
+
+Wie der Aufruf konkret aussieht
+In v1 produktiv ist nur eine Implementierung — und die ist erstaunlich kurz:
+
+python
+class ClaudeCodeCLIAgent:
+    def __init__(self, model: str = "sonnet"):
+        self.model = model
+    
+    async def propose(self, worktree, prompt, allowed_paths, 
+                     capabilities, budget_usd, max_turns):
+        allowed_tools = self._build_allowed_tools(capabilities)
+        
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"],
+        }
+        
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", prompt,
+            "--output-format", "json",
+            "--allowedTools", allowed_tools,
+            "--max-turns", str(max_turns),
+            "--cwd", str(worktree),
+            "--model", self.model,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=600,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise CodingAgentTimeout()
+        
+        result = json.loads(stdout)
+        diff = await self._git_diff(worktree)
+        
+        return ProposalResult(
+            diff=diff,
+            tokens_in=result.get("usage", {}).get("input_tokens", 0),
+            tokens_out=result.get("usage", {}).get("output_tokens", 0),
+            cost_usd=self._compute_cost(result),
+            stop_reason=result.get("stop_reason"),
+            model_version=result.get("model"),
+            raw_response=result,
+        )
+Das ist ungefähr 50-80 Zeilen Code. Die ganze Komplexität — Worktree-Management, Capability-Enforcement, Event-Emission, Cost-Caps — sitzt eine Schicht darüber im Runner. Der Coding-Agent macht nur eine Sache: Subprozess starten, Output parsen, Diff abholen.
+
+Drei wichtige Punkte zur tatsächlichen CLI-Nutzung
+--allowedTools ist dein Capability-Enforcement. Forges capabilities-Block aus der Spec wird in den --allowedTools-String übersetzt. Wenn merge_pr: false und push_to_main: false, dann darf in der Bash-Tool-Whitelist nichts mit gh pr merge oder git push stehen. Das ist die wichtigste Sicherheitsschicht — sie wirkt im CLI-Subprozess, bevor der Agent überhaupt was tun könnte.
+
+Permission Mode. Claude Code CLI hat --permission-mode mit Werten wie default, acceptEdits, bypassPermissions. Für forge brauchst du bypassPermissions (oder das Äquivalent in der aktuellen Version), weil der Subprozess vollständig non-interaktiv läuft. Die Sicherheit kommt nicht aus interaktivem Bestätigen, sondern aus --allowedTools plus Worktree-Isolation plus Forbidden-Path-Validierung nach dem Run.
+
+Hooks im Worktree. Du kannst .claude/hooks/ im Worktree setzen, die nur für diesen forge-Run aktiv sind. Konkret nützlich: ein PreToolUse-Hook auf Bash, der nochmal gegen die forbidden-Liste prüft. Das ist die zweite Verteidigungslinie nach --allowedTools und die erste, die innerhalb des Subprozesses wirkt.
+
+Wo Claude Code CLI in v1 NICHT verwendet wird
+Damit es ehrlich ist:
+
+Nicht für PR-Erstellung. Das macht forge selbst via gh CLI. Begründung: PR-Body strukturiert generieren, Labels setzen, Reviewer assignen — das ist forge-Logik, nicht Coding-Agent-Logik.
+Nicht für Eval. Eval ist ein simpler Shell-Command-Aufruf via subprocess.run(spec.eval_suites.quick.cmd). Kein LLM nötig.
+Nicht für Score-Parsing. Auch das ist deterministisches Python.
+Nicht für forge analyze. SQL-Queries auf DuckDB, Markdown-Generierung. Kein LLM.
+Nicht für Loop-3-Tuning (in v3). Das sind Bandits und Bayesian Optimization, klassisches ML/Statistik. Auch kein LLM.
+Der Coding-Agent — und damit Claude Code CLI — wird in v1 nur an genau zwei Stellen aufgerufen: im propose-Schritt jeder Generation, und im review_only-Trigger für PR-Reviews. Sonst nirgendwo. Das ist wenig, und das ist Absicht: die meiste Komplexität von forge ist orchestrierend, nicht generierend.
+
+Zwischen Anthropic-API direkt und Claude Code CLI
+Eine berechtigte Frage, die ich beim Spec-Schreiben offen gelassen habe: warum nicht direkt das Anthropic SDK gegen /v1/messages mit Tool-Use, statt den Subprozess-Umweg über CLI?
+
+Die Antwort hat zwei Teile:
+
+Pro direkte API: Mehr Kontrolle (Tool-Definitions, Streaming, structured outputs), keine Subprozess-Overhead, sauberere Integration in Async-Code, eigene Tool-Implementierungen.
+
+Pro CLI-Subprozess (gewinnt in v1): Tool-Loop, File-Editing, Patch-Application, Git-Awareness sind in Claude Code CLI bereits produktiv-ausgereift. Wenn du das alles selbst implementierst, sind das ~2000 Zeilen Code für eine Funktionalität, die schon existiert. Plus: Claude Code CLI bekommt von Anthropic kontinuierlich Updates (bessere Patch-Application-Heuristiken, robustere Tool-Use-Loops), die du sonst selbst nachziehen müsstest.
+
+Empfehlung für die CodingAgent-Schnittstelle in v1: CLI-Subprozess als einzige Implementierung, aber die Schnittstelle so geschnitten, dass eine direkte API-Implementierung in v2 oder später möglich ist. Wenn du in 6 Monaten merkst, dass dir Streaming, strukturierte Outputs oder bessere Cost-Telemetrie fehlen, ziehst du die zweite Implementierung hoch und schaltest pro Trigger zwischen ihnen um.
+
+Praktisch heißt das für dich beim Bau: Halte die CodingAgent-Abstraktion in forge-execute/agents/ konsequent durch — auch wenn sie sich in v1 wie unnötiges Interface anfühlt, weil es nur eine Implementierung gibt. Der Tag, an dem du froh sein wirst, ist der Tag, an dem du die direkte API oder einen Konkurrenten testen willst, ohne forge umzubauen.
+
+Soll ich die CodingAgent-Schnittstelle und die ClaudeCodeCLIAgent-Implementierung als ausgearbeitetes Modul-Design schreiben? Inklusive der Übersetzungslogik von forges capabilities-Block in den --allowedTools-String — das ist die Stelle, an der die Spec-Sicherheitsgarantien konkret werden.
+
+Du hast gesagt: Wie wird CLAUDE.
+Wie wird CLAUDE.md up to date gehalten?
+
+06:32
+Claude hat geantwortet: Sehr gute Frage — und eine, die in der Spec-v0.
+Sehr gute Frage — und eine, die in der Spec-v0.2 noch nicht sauber adressiert ist. Lass mich das ehrlich auseinandernehmen, weil es auf den ersten Blick simpel wirkt, aber tatsächlich an einem Sicherheitsprinzip kratzt.
+
+Das Problem zuerst
+CLAUDE.md ist die Verfassung des Coding-Agents — Build-Befehle, Test-Befehle, Architektur-Konventionen, Gotchas. Sie veraltet schneller als jede andere Datei im Repo, weil sie nicht von Code-Compilern, Linters oder Tests geprüft wird. Drei Drift-Quellen:
+
+Code ändert sich, Doku nicht. Du benennst einen Service um, du fügst eine Migrationskommando hinzu, du wechselst von npm zu pnpm — CLAUDE.md weiß davon nichts. Bei der nächsten forge-Generation propose't der Agent einen Build mit npm install, der scheitert.
+
+CLAUDE.md driftet weg von der project.yaml. In forge gibt es zwei Wahrheits-Quellen: die project.yaml (Surfaces, Forbidden, Capabilities) und die CLAUDE.md (qualitative Konventionen, Gotchas, Architektur-Hinweise). Wenn die beiden auseinanderlaufen, vertraut der Agent der einen oder anderen — Ergebnis ist nicht-deterministisch.
+
+CLAUDE.md lernt nicht aus Fehlern. Wenn forge dreimal denselben Bug-Typ produziert (z.B. immer wieder await vor synchronen Calls vergisst), sollte das eigentlich als Gotcha in CLAUDE.md landen. Tut es aber nicht automatisch.
+
+Die naheliegende, aber falsche Antwort
+"Lass forge ihre eigene CLAUDE.md aktualisieren". Das ist verlockend, aber es bricht Prinzip 3 der Spec: forge optimiert nicht sich selbst und nicht ihre eigene Konfiguration.
+
+Eine CLAUDE.md ist Teil der Konfiguration des Coding-Agents — wenn die Maschine sie selbst editiert, hat sie Einfluss auf ihr eigenes Verhalten in der nächsten Generation. Das ist genau die unkontrollierte Self-Improvement-Spirale, die wir vermeiden wollen.
+
+Konkret: Stell dir vor, eine schlechte Generation schreibt in CLAUDE.md "ignoriere Type-Errors, sie sind oft falsch". Beim nächsten Run sieht der Agent das, glaubt es, ignoriert Type-Errors. Drei Tage später ist eine Lawine schwer reproduzierbarer Bugs im Repo. Niemand merkt's, weil niemand CLAUDE.md-Änderungen reviewt — sie ist ja "nur Doku".
+
+Daraus folgt: CLAUDE.md muss ins Forbidden-Set. Sie ist forbidden für die Maschine, genauso wie .forge/project.yaml und .github/workflows/.
+
+Die richtige Architektur: vier Schichten
+Nachdem der naive Weg ausscheidet, brauchen wir ein durchdachtes Modell. Vier Schichten, jede mit klarer Verantwortung.
+
+Schicht 1 — Statische Generierung aus Wahrheits-Quellen
+Vieles in einer typischen CLAUDE.md ist eigentlich abgeleitete Information. Build-Befehle stehen in package.json und pyproject.toml. Test-Befehle stehen dort auch. Verzeichnisstruktur kann ein tree-Aufruf liefern. Surfaces und Forbidden stehen in project.yaml.
+
+CLAUDE.md wird daher in Sektionen mit explizitem Status aufgeteilt:
+
+markdown
+# CLAUDE.md
+
+<!-- AUTOGENERATED:START — section_id="build_commands" — do not edit by hand -->
+## Build & Test Commands
+
+- Backend tests: `cd backend && pytest -x -q`
+- Backend lint: `cd backend && ruff check src/`
+- Frontend tests: `cd frontend && npm test`
+- Frontend type-check: `cd frontend && npx tsc --noEmit`
+<!-- AUTOGENERATED:END -->
+
+<!-- AUTOGENERATED:START — section_id="forge_surfaces" -->
+## Surfaces & Forbidden Zones (from .forge/project.yaml)
+
+You may edit:
+- backend/src/services/
+- backend/src/agents/tools/
+- backend/agents/maler.yaml (only keys: system_prompt, tools, temperature)
+
+You may NEVER edit:
+- backend/src/routes/auth.py
+- backend/src/routes/payments.py
+- backend/migrations/**
+<!-- AUTOGENERATED:END -->
+
+<!-- HUMAN:START — section_id="architecture_notes" -->
+## Architecture Notes
+
+PINTA uses a dual-index Azure AI Search architecture...
+<!-- HUMAN:END -->
+
+<!-- HUMAN:START — section_id="gotchas" -->
+## Known Gotchas
+
+- The `quote_calculator.py` rounding uses banker's rounding,
+  not the obvious round-half-up. Don't "fix" this.
+- ...
+<!-- HUMAN:END -->
+Ein neuer CLI-Befehl forge sync-claude-md regeneriert ausschließlich die AUTOGENERATED-Blöcke, lässt HUMAN-Blöcke unangetastet. Läuft als Pre-Commit-Hook und in CI als Drift-Check. Wenn CI einen Drift erkennt (forge sync-claude-md --check exit code != 0), schlägt der Build fehl mit der Meldung "CLAUDE.md ist nicht synchron mit project.yaml — bitte forge sync-claude-md lokal ausführen".
+
+Das ist deterministisch, sicher, und löst etwa 60% des Problems.
+
+Schicht 2 — Vorschlagsmechanismus für Human-Sektionen
+Die HUMAN:START-Blöcke können nicht autogeneriert werden, weil sie qualitatives Wissen enthalten. Aber sie können vorgeschlagen werden — und zwar als ganz normaler PR, der vom Menschen reviewt wird.
+
+Konkret: Es gibt einen speziellen forge-Trigger claude_md_review, der wöchentlich oder auf manuellen Anstoß läuft. Er macht genau das:
+
+Liest die Events der letzten N Tage aus dem Store
+Identifiziert wiederkehrende Failure-Patterns aus GuardrailViolation, PreflightFailed, EvalFinished mit gates_passed=false
+Identifiziert PRs, die nach Merge wieder revertet wurden (PRReverted)
+Schlägt für die HUMAN:START — section_id="gotchas"-Sektion neue Einträge vor — als Diff in einem PR
+Wichtig: Das Ergebnis ist immer ein Pull Request, niemals ein direkter Edit. Der Mensch reviewt, nimmt an, lehnt ab, oder editiert. Der entscheidende Punkt: derselbe Sicherheitsmechanismus wie für jeden anderen Code-Change — Two-Eyes-Principle.
+
+Implementierungs-Hinweis: Dieser Trigger braucht in der project.yaml eine explizite Capability-Erweiterung. Standardmäßig ist CLAUDE.md forbidden. Der claude_md_review-Trigger läuft mit einem Spezial-Profil, das genau eine Datei editieren darf — CLAUDE.md — und nichts anderes:
+
+yaml
+triggers:
+  on_demand:
+    claude_md_review:
+      strategy: review_only
+      model: opus
+      capabilities_override:           # NUR für diesen Trigger
+        edit: ["CLAUDE.md"]            # extrem eng
+        run: []                        # keine Shell-Aktionen
+        commit: true
+        open_pr: true
+Dass diese Override-Möglichkeit überhaupt existiert, ist eine Schwächung von Prinzip 3 — aber eine kontrollierte. Der Mensch genehmigt jeden einzelnen Vorschlag, und der Trigger kann nur CLAUDE.md ändern, sonst nichts.
+
+Schicht 3 — Validierung gegen Realität
+Auch wenn CLAUDE.md aktuell aussieht, kann sie inhaltlich falsch sein. Der Test-Befehl steht drin, ist aber seit drei Wochen broken. Der Build-Pfad existiert nicht mehr.
+
+forge doctor kriegt deshalb einen erweiterten Check --validate-claude-md, der:
+
+Jeden Shell-Command aus den AUTOGENERATED-Blöcken probeweise ausführt (--dry-run wenn möglich, sonst gegen ein temp-Worktree)
+Jeden Pfad-Verweis prüft (existiert er noch?)
+Jeden Datei-Namen prüft (existiert er noch?)
+Inkonsistenzen zwischen CLAUDE.md und project.yaml meldet
+Läuft idealerweise als CI-Job auf jedem PR (auch auf forge-PRs!), und wöchentlich als scheduled Check.
+
+Schicht 4 — Operator-Disziplin
+Ein Teil bleibt nicht automatisierbar und das ist ehrlich so. Architektur-Entscheidungen, Domain-Wissen, "warum haben wir das so gebaut"-Kontext — das ist menschliche Verantwortung.
+
+In Phase 3 der Spec (manuelle Analyse, Teil 10) gehört explizit hinzu: CLAUDE.md lesen und aktualisieren ist Teil der wöchentlichen 30-Minuten-Routine. Die forge analyze-Reports zeigen, wo die Maschine stolpert — der Operator entscheidet, ob ein Stolpern eine Gotcha-Notiz wert ist.
+
+Konkretes Lifecycle-Diagramm
+┌─────────────────────────────────────────────────────────────┐
+│ Wahrheits-Quellen                                           │
+│   .forge/project.yaml — Surfaces, Forbidden, Capabilities   │
+│   pyproject.toml, package.json — Build/Test-Commands        │
+│   Verzeichnisstruktur — Layout-Sektion                      │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+        ┌──────────────────────────────┐
+        │ forge sync-claude-md         │     ← Pre-Commit-Hook
+        │ regeneriert AUTOGENERATED    │     ← CI-Drift-Check
+        │ Blöcke. HUMAN-Blöcke unbe-   │
+        │ rührt.                       │
+        └──────────────┬───────────────┘
+                       │
+                       ▼
+                  CLAUDE.md
+              ┌────────┴────────┐
+              │                 │
+              ▼                 ▼
+   ┌──────────────────┐  ┌─────────────────────┐
+   │ AUTOGENERATED    │  │ HUMAN-Blöcke        │
+   │ Blöcke           │  │ - Architektur       │
+   │ - Commands       │  │ - Gotchas           │
+   │ - Surfaces       │  │ - Domain-Notizen    │
+   │ - Layout         │  │                     │
+   └──────────────────┘  └──────────┬──────────┘
+                                    │
+                       ┌────────────┴────────────┐
+                       │                         │
+                       ▼                         ▼
+              ┌────────────────┐      ┌──────────────────┐
+              │ claude_md_     │      │ Operator wöchent-│
+              │ review-Trigger │      │ lich aktualisiert│
+              │ schlägt Diff   │      │ aus forge        │
+              │ als PR vor.    │      │ analyze Insights │
+              │ Mensch reviewt │      │                  │
+              └────────────────┘      └──────────────────┘
+                       │
+                       ▼
+                  forge doctor --validate-claude-md
+                  prüft alles gegen Realität
+Was das in der Spec ändert
+Drei Stellen in der forge-spec-v0.2.md müssen ergänzt werden:
+
+Teil 5 — Projekt-Spezifikation: CLAUDE.md explizit als forbidden listen, capabilities_override als Konzept einführen für Spezial-Trigger.
+
+Teil 7 — Sicherheit & Guardrails: Eine neue Sektion 7.6 über die kontrollierte Lockerung für eng umrissene Trigger wie claude_md_review. Mit der harten Regel: jede capabilities_override ist explizit, eng (genau eine Datei oder ein klar definierter Pfad), und produziert immer einen menschlich-reviewten PR.
+
+Teil 9 — MVP: forge sync-claude-md als 11. Punkt aufnehmen, weil ohne diesen Befehl die CLAUDE.md schon ab dem ersten Sprint driftet.
+
+Teil 10 — Manuelle Analysephase: Wöchentliche CLAUDE.md-Pflege explizit als Tätigkeit.
+
+Konkret für PINTA, wenn du jetzt anfängst
+Drei Dinge machst du in dieser Reihenfolge:
+
+Heute (15 Minuten): Vorhandene PINTA-CLAUDE.md durchgehen und in Blöcke aufteilen. Was ist abgeleitete Information (→ AUTOGENERATED-Marker drum)? Was ist menschlicher Kontext (→ HUMAN-Marker drum)? Schon dieser Schritt allein bringt Klarheit.
+
+In M1 (Schritt 4 deiner Implementierung): forge sync-claude-md als CLI-Subcommand bauen. Ist deutlich kleiner als die anderen Module — vielleicht 200 Zeilen Code. Liest project.yaml, generiert die AUTOGENERATED-Blöcke, ersetzt sie atomar in der CLAUDE.md.
+
+Nach M1, bevor du claude_md_review als Trigger einbaust: mindestens 30 Runs Erfahrung sammeln. Erst dann hast du genug Failure-Patterns, dass ein automatischer Vorschlag-Mechanismus überhaupt sinnvolle Vorschläge generiert. Vorher generiert er Rauschen.
+
+Eine ehrliche Anmerkung zum Schluss: Die CLAUDE.md-Frage ist eine von mehreren "Sub-Wahrheits-Quellen", die sich in einer reifen forge-Installation ähnlich verhalten werden. .cursor/rules/, AGENTS.md, Lint-Configs, Issue-Templates — alle haben dieselben Drift-Probleme. Das hier skizzierte Vier-Schichten-Modell (Generierung aus Wahrheits-Quellen + kontrollierter Review-Trigger + Validierung + Operator-Routine) ist ein Pattern, das du auf alle anwenden kannst.
+
+Wenn du willst, kann ich die drei Spec-Änderungen als Diff gegen v0.2 ausarbeiten und ein v0.3-Update produzieren — oder erst das forge sync-claude-md Modul-Design schreiben, wenn das die unmittelbarere Frage ist?
+
+
+
+
+

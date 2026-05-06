@@ -1,0 +1,58 @@
+name: forge — nightly schedule
+
+on:
+  schedule:
+    # Default 02:00 UTC — passe an die schedule-Einträge der project.yaml an
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: "Focus-Tag (z.B. legacy_test_revival)"
+        required: true
+        default: legacy_test_revival
+      max_iterations:
+        description: "Max. Iterations"
+        required: false
+        default: "10"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  forge-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv + forge + claude
+        run: |
+          pip install uv
+          uv pip install --system forge-cli
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Run forge nightly
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FOCUS: ${{ github.event.inputs.focus || 'legacy_test_revival' }}
+          MAX_ITER: ${{ github.event.inputs.max_iterations || '10' }}
+        run: |
+          forge run \
+            --trigger schedule \
+            --focus "$FOCUS" \
+            --template-id "schedule_$FOCUS" \
+            --max-iterations "$MAX_ITER" \
+            --model sonnet \
+            --create-pr \
+            --pr-draft \
+            --pr-label "forge:auto" \
+            --pr-label "forge:nightly"

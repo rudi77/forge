@@ -1,3 +1,4 @@
-"""forge-adapters — Integrationen ohne Logik."""
+"""forge-adapters — Integrationen ohne Logik.
 
-__version__ = "0.1.0"
+Aktuell: GitHub. Slack folgt, wenn die Notifications-Spec konkretisiert wird.
+"""

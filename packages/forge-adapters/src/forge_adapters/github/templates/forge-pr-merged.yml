@@ -1,0 +1,77 @@
+name: forge — record PR-merge
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  record-merge:
+    if: ${{ github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'forge:auto') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install forge
+        run: |
+          pip install uv
+          uv pip install --system forge-cli
+
+      - name: Compute time-to-merge and emit PRMerged event
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGER: ${{ github.event.pull_request.merged_by.login }}
+          CREATED_AT: ${{ github.event.pull_request.created_at }}
+          MERGED_AT: ${{ github.event.pull_request.merged_at }}
+        run: |
+          python <<'PY'
+          import os
+          from datetime import datetime
+          from forge_adapters.github.webhook import find_run_id_for_pr, record_pr_merged
+          from forge_cli.runtime import load_context
+
+          ctx = load_context()
+          store = ctx.open_store()
+
+          pr_number = int(os.environ["PR_NUMBER"])
+          merger = os.environ["MERGER"]
+          created = datetime.fromisoformat(os.environ["CREATED_AT"].replace("Z", "+00:00"))
+          merged = datetime.fromisoformat(os.environ["MERGED_AT"].replace("Z", "+00:00"))
+          ttm = int((merged - created).total_seconds())
+
+          run_id = find_run_id_for_pr(store=store, pr_number=pr_number)
+          if run_id is None:
+              print(f"no run found for PR #{pr_number}; skipping record")
+              raise SystemExit(0)
+
+          record_pr_merged(
+              pr_number=pr_number,
+              merger=merger,
+              time_to_merge_s=ttm,
+              run_id=run_id,
+              project=ctx.spec.name,
+              project_fingerprint=ctx.project_fingerprint,
+              factory_version=ctx.factory_version,
+              spec_version=ctx.spec.spec_version,
+              store=store,
+          )
+          store.close()
+          print(f"recorded PRMerged for PR #{pr_number} (run_id={run_id}, ttm={ttm}s)")
+          PY
+
+      - name: Commit + push event store
+        run: |
+          # Damit der Event-Store über Runs hinweg persistiert, wird er als
+          # Branch in einer eigenen Orphan-Ref gespeichert. Diese Logik kommt
+          # in M2 — in v1 ist forge meist lokal ausgeführt, GitHub Actions
+          # ist Bonus.
+          echo "(persisted to .forge/events.duckdb in checkout)"

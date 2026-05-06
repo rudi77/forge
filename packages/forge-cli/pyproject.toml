@@ -6,12 +6,13 @@ requires-python = ">=3.12"
 dependencies = [
     "forge-core",
     "forge-execute",
+    "forge-adapters",
     "typer>=0.12",
     "rich>=13.7",
 ]
 
 [project.scripts]
-forge = "forge_cli.main:app"
+forge = "forge_cli.main:main"
 
 [project.optional-dependencies]
 dev = [

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from forge_core.spec import ProjectSpec
 from forge_execute.scoring import ScoreBaseline, compute_composite, keep_or_discard
 

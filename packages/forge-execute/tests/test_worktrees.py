@@ -5,12 +5,10 @@ Brauchen ein echtes Git, weil wir gegen `git worktree` arbeiten.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
-
 from forge_execute.worktrees import (
     GitError,
     PatchApplyError,

@@ -115,19 +115,32 @@ def keep_or_discard(
     new_composite: float | None,
     baseline_composite: float | None,
     tolerance: float = 0.02,
+    baseline_gates_passed: bool = True,
 ) -> tuple[bool, str]:
     """Keep/Discard-Logik aus Spec Teil 6.5.
 
     Wird vom Runner nach erfolgreichen Gates aufgerufen.
 
+    Wenn die Baseline ihre Gates nicht erfüllt hat (`baseline_gates_passed=False`)
+    und der neue Stand sie erfüllt, ist das immer ein `improvement` — egal,
+    was die Composite sagt. Das ist die typische `legacy_test_revival`-Situation:
+    der Composite vor und nach dem Fix kann identisch sein, aber der Übergang
+    rot→grün ist der eigentliche Wertgewinn.
+
     Returns:
         (keep, reason) — `reason` ∈ {"improvement", "no_significant_change", "regression"}
     """
+    if not baseline_gates_passed:
+        return True, "improvement"
+
     if new_composite is None:
         return False, "no_significant_change"
     if baseline_composite is None:
-        # Erste Generation: alles >0 zählt als Improvement
-        return new_composite > 0, "improvement" if new_composite > 0 else "no_significant_change"
+        # Erste Generation mit unbekannter Baseline: alles >0 zählt als Improvement
+        return (
+            new_composite > 0,
+            "improvement" if new_composite > 0 else "no_significant_change",
+        )
 
     delta = new_composite - baseline_composite
     if delta > tolerance:

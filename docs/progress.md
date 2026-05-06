@@ -145,11 +145,12 @@ werden ohne Edits gemerged.
 
 ### 3d. `evaluators/command.py` — Command-Evaluator
 
-- [ ] Shell-Command mit `budget_s`-Timeout ausführen
-- [ ] stdout als JSON oder pytest-Output parsen
-- [ ] `tool_versions`-Artefakt erzeugen (pytest --version, ruff --version, …)
-- [ ] Exit-Code in `EvalFinishedPayload` reflektiert
-- [ ] Tests: bekannt-grüner Pytest-Aufruf liefert `pytest_pass_rate=1.0`
+- [x] Shell-Command mit `budget_s`-Timeout ausführen
+- [x] stdout als JSON oder pytest-Output parsen (`pytest_json`, `scores_json`, `raw`)
+- [x] `tool_versions`-Artefakt erzeugen (python, pytest, ruff, mypy, node, npm, git)
+- [x] Exit-Code via `EvalRunResult.success`
+- [x] Process-Tree-Termination auf Windows via `taskkill /T /F`, POSIX via `os.killpg`
+- [x] Tests: 16 Tests inkl. echtes pytest, partial pass, Timeout-Killing, JSON-Parser
 
 ### 3e. `gates.py` + `scoring.py` — Gates und Composite
 
@@ -162,24 +163,32 @@ werden ohne Edits gemerged.
 
 ### 3f. `runner.py` — Sequential Runner
 
-- [ ] `run_sequential(spec, trigger, max_iterations) -> RunResult`
-- [ ] Phasen: Propose → Mutate → Preflight → Eval → Decide
-- [ ] Cost-Cap-Check pro Generation, pro Run
-- [ ] `RunStarted`/`RunFinished`-Events emittieren
-- [ ] `GenerationStarted`/`GenerationFinished`-Events
-- [ ] Bei `KEEP`: commit auf Run-Branch
-- [ ] Bei `DISCARD`: Worktree-Reset
-- [ ] Tests: hand-trigger'ter Run gegen Mini-Repo macht Test grün
+- [x] `SequentialRunner.run() -> RunResult` mit `RunConfig`-Eingabe
+- [x] Phasen: Propose → Mutate-Validate → Preflight → Eval → Decide
+- [x] Cost-Cap-Check pro Generation und pro Run; `CostCapHit`-Events
+- [x] `RunStarted`/`RunFinished`-Events mit baseline_metrics, decision, total_cost
+- [x] `GenerationStarted`/`GenerationFinished`-Events
+- [x] Bei `KEEP`: commit auf Run-Branch mit strukturierter Message; Baseline-Update
+- [x] Bei `DISCARD`: `worktree.revert()`
+- [x] Capability-Verletzung → `GuardrailViolation`-Event + Run-Abort
+- [x] Preflight-Failure → `PreflightFailed`-Event + Discard
+- [x] Score-Delta-Logic erweitert: rot→grün-Übergang ist immer Improvement
+- [x] Tests: 3 End-to-End Szenarien (red→green, no-op, capability-violation)
 
 ### 3g. `agents/` — CodingAgent-Interface
 
-- [ ] `CodingAgent`-Protocol (`propose`, `review`, `estimate_cost`)
-- [ ] `ClaudeCodeCLIAgent` (Subprozess via `claude -p`, `--allowedTools`)
-- [ ] `MockCodingAgent` für Tests
-- [ ] Übersetzung `capabilities` → `--allowedTools` String
+- [x] `CodingAgent`-Protocol (`propose` mit Worktree-Path, Capabilities, Budget)
+- [x] `ClaudeCodeCLIAgent` (Subprozess via `claude -p --output-format json`)
+- [x] `MockCodingAgent` mit static_result / sequence / callable_ Modi
+- [x] Übersetzung `capabilities.run` → `--allowedTools` Bash(...)-Patterns
+- [x] Defensive Fehlermeldung bei fehlendem `claude`-Binary oder API-Key
+- [ ] `review` und `estimate_cost` (M2)
+- [x] Tests: 9 Tests, MockCodingAgent für Runner-Integration
 
-**Erfolgskriterium Schritt 3:** Hand-trigger'ter Run gegen lokales Test-Repo
-mit absichtlich rotem Test → grün, committed, alle Events im Store.
+**Erfolgskriterium Schritt 3 erreicht:** `test_runner_red_test_to_green_pr`
+beweist End-to-End Funktion. Mini-Repo mit rotem Test → MockCodingAgent fixt
+calc.py → Runner führt 5 Phasen aus → KEEP, commit auf forge/&lt;run_id&gt;-Branch,
+alle 11 erwarteten Event-Kinds im DuckDB-Store, Prompt+Diff im Blob-Store.
 
 ---
 

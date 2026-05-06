@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
-
-import pytest
-
-from forge_core.spec import GateConfig, ProjectSpec
+from forge_core.spec import ProjectSpec
 from forge_execute.gates import GateBaseline, evaluate_gates
 
 

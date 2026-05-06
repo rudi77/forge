@@ -19,11 +19,9 @@ import ast
 import re
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from forge_execute.capabilities import Capabilities, CheckResult
 from forge_execute.worktrees import PatchApplyError, Worktree, WorktreeManager
-
 
 # Erkennt die Header-Zeile eines unified diff-Hunks für eine Datei:
 #     diff --git a/src/foo.py b/src/foo.py

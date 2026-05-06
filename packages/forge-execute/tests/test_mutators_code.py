@@ -6,7 +6,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
 from forge_core.spec import ProjectSpec
 from forge_execute.capabilities import Capabilities
 from forge_execute.mutators.code import (

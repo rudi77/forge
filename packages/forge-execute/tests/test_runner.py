@@ -1,0 +1,263 @@
+"""End-to-End-Tests für SequentialRunner.
+
+Aus todos.txt Schritt 3f: hand-trigger'ter Run gegen ein lokales Test-Repo
+(absichtlich roter Test) → Test grün, committed, alle Events im Store.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from forge_core.blobs import BlobStore
+from forge_core.events import EventKind
+from forge_core.spec import ProjectSpec
+from forge_core.store import EventStore
+from forge_execute.agents import MockCodingAgent
+from forge_execute.runner import RunConfig, SequentialRunner
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
+    )
+
+
+@pytest.fixture
+def red_repo(tmp_path: Path) -> Path:
+    """Mini-Repo mit einem absichtlich roten Test."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "test@forge.local")
+    _git(repo, "config", "user.name", "forge-test")
+
+    (repo / "src").mkdir()
+    (repo / "src" / "__init__.py").write_text("", encoding="utf-8")
+    # Bug: subtraction statt addition
+    (repo / "src" / "calc.py").write_text(
+        "def add(a, b):\n    return a - b\n",
+        encoding="utf-8",
+    )
+    (repo / "tests").mkdir()
+    (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "tests" / "test_calc.py").write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).parent.parent))\n"
+        "from src.calc import add\n\n"
+        "def test_add():\n    assert add(2, 3) == 5\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "initial (with red test)")
+    return repo
+
+
+def _spec_for_red_repo() -> ProjectSpec:
+    return ProjectSpec.model_validate(
+        {
+            "spec_version": "1.0",
+            "name": "red-repo",
+            "cost_caps": {
+                "per_generation_usd": "0.50",
+                "per_run_usd": "5.00",
+                "per_project_per_day_usd": "30.00",
+                "per_project_per_month_usd": "500.00",
+            },
+            "surfaces": {
+                "code": {"paths": ["src/"], "type": "code"},
+            },
+            "forbidden": [],
+            "capabilities": {"run": ["pytest *", "python *"]},
+            "eval_suites": {
+                "quick": {
+                    "cmd": f'"{sys.executable}" -m pytest -q --no-header --tb=no',
+                    "budget_s": 60,
+                    "parses": "pytest_json",
+                },
+            },
+            "gates": [
+                {"kind": "pytest_pass_rate", "threshold": 1.0, "source": "quick"},
+            ],
+            "scores": [
+                # Erlaubt die KEEP-Logic, eine Composite zu erzeugen
+                {"kind": "test_count", "weight": 1.0},
+            ],
+        }
+    )
+
+
+def _fix_callable(wt: Path, prompt: str) -> None:
+    """Mock-Agent-Callable: ersetzt die buggy add-Funktion durch eine korrekte."""
+    target = wt / "src" / "calc.py"
+    target.write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    return None
+
+
+def test_runner_red_test_to_green_pr(red_repo: Path, tmp_path: Path) -> None:
+    """Goldenes M1-Szenario: roter Test → Mock-Agent fixt → KEEP → committed."""
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+
+    agent = MockCodingAgent(callable_=_fix_callable)
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="fix_failing_test_v1",
+        initial_prompt="Fix the failing test in tests/test_calc.py.",
+        focus="legacy_test_revival",
+        max_iterations=2,
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+
+    result = runner.run()
+
+    # Run war erfolgreich — wenigstens eine Generation hat KEEP gemacht
+    assert result.decision == "pr_created", f"unexpected decision: {result.decision}"
+    assert result.final_diff is not None
+    assert "+    return a + b" in result.final_diff
+    assert "-    return a - b" in result.final_diff
+    assert result.branch is not None and result.branch.startswith("forge/")
+    assert result.final_commit is not None
+    assert any(g.kept for g in result.generations)
+
+    # Events: vollständige Kette muss da sein
+    events = store.events_for_run(result.run_id)
+    kinds = [e.kind for e in events]
+    assert EventKind.RUN_STARTED in kinds
+    assert EventKind.GENERATION_STARTED in kinds
+    assert EventKind.PROPOSAL_REQUESTED in kinds
+    assert EventKind.PROPOSAL_RECEIVED in kinds
+    assert EventKind.MUTATION_APPLIED in kinds
+    assert EventKind.EVAL_STARTED in kinds
+    assert EventKind.EVAL_FINISHED in kinds
+    assert EventKind.DECISION_MADE in kinds
+    assert EventKind.GENERATION_FINISHED in kinds
+    assert EventKind.RUN_FINISHED in kinds
+
+    # Artefakte: Prompt + Diff im Blob-Store
+    refs = store.referenced_artifact_hashes()
+    assert any(blobs.get_text(h) == config.initial_prompt for h in refs if blobs.has(h))
+
+    # RunFinished trägt das richtige Outcome
+    [run_finished] = [e for e in events if e.kind == EventKind.RUN_FINISHED]
+    assert run_finished.payload["decision"] == "pr_created"
+    assert run_finished.payload["generations_count"] >= 1
+
+    # EvalFinished hat gates_passed=True
+    eval_finished = [e for e in events if e.kind == EventKind.EVAL_FINISHED]
+    assert any(e.payload["gates_passed"] is True for e in eval_finished)
+
+    store.close()
+
+
+def test_runner_discards_when_agent_breaks_test(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """Wenn der Mock-Agent eine schlechtere Lösung macht (Test bleibt rot),
+    muss der Run mit decision='no_improvement' enden, ohne Commit."""
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+
+    def break_more(wt: Path, prompt: str) -> None:
+        # Bug bleibt — Datei nur kosmetisch ändern, Tests bleiben rot
+        (wt / "src" / "calc.py").write_text(
+            "def add(a, b):\n    return a - b  # noqa\n",
+            encoding="utf-8",
+        )
+        return None
+
+    agent = MockCodingAgent(callable_=break_more)
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="fix_failing_test_v1",
+        initial_prompt="x",
+        max_iterations=2,
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+    result = runner.run()
+
+    assert result.decision == "no_improvement"
+    assert result.final_diff is None
+    assert result.branch is None
+    # Generationen sind alle DISCARD
+    assert all(not g.kept for g in result.generations)
+    # Im Store sind DECISION_MADE-Events mit kept=False
+    decisions = store.events_by_kind(EventKind.DECISION_MADE)
+    assert all(e.payload["kept"] is False for e in decisions)
+
+    store.close()
+
+
+def test_runner_blocks_capability_violation(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """Agent versucht in einen Forbidden-Path zu schreiben → Run abgebrochen."""
+    spec_dict = {
+        "spec_version": "1.0",
+        "name": "red-repo",
+        "cost_caps": {
+            "per_generation_usd": "0.50",
+            "per_run_usd": "5.00",
+            "per_project_per_day_usd": "30.00",
+            "per_project_per_month_usd": "500.00",
+        },
+        "surfaces": {"code": {"paths": ["src/"], "type": "code"}},
+        "forbidden": ["tests/**"],
+        "capabilities": {"run": ["pytest *"]},
+        "eval_suites": {
+            "quick": {
+                "cmd": f'"{sys.executable}" -m pytest -q',
+                "budget_s": 60,
+                "parses": "pytest_json",
+            }
+        },
+    }
+    spec = ProjectSpec.model_validate(spec_dict)
+
+    def edit_forbidden(wt: Path, prompt: str) -> None:
+        # Editiert eine forbidden-Datei
+        (wt / "tests" / "test_calc.py").write_text(
+            "def test_add():\n    assert True  # disabled by hostile agent\n",
+            encoding="utf-8",
+        )
+        return None
+
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+    agent = MockCodingAgent(callable_=edit_forbidden)
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="t1",
+        initial_prompt="x",
+        max_iterations=2,
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+    result = runner.run()
+
+    assert result.decision == "guardrail_blocked"
+    # GuardrailViolation-Event muss im Store sein
+    violations = store.events_by_kind(EventKind.GUARDRAIL_VIOLATION)
+    assert len(violations) >= 1
+    assert violations[0].payload["guardrail_id"] == "forbidden_path"
+
+    store.close()

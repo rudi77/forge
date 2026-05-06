@@ -21,12 +21,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from pathspec import GitIgnoreSpec
-
 from forge_core.events import GuardrailViolationPayload
 from forge_core.events.kinds.guardrail import GuardrailKind
 from forge_core.spec import ProjectSpec
-
+from pathspec import GitIgnoreSpec
 
 CapabilityAction = Literal[
     "commit",

@@ -132,6 +132,7 @@ eval_suites:
         tests/test_quote_search.py \
         tests/test_ai_prompts_smoke.py \
         tests/test_quote_calculator.py \
+        tests/test_quote_pdf_branding.py \
         --no-header -q --tb=no
     budget_s: 180
     parses: pytest_json

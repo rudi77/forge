@@ -64,6 +64,13 @@ def run_command(
         int,
         typer.Option("--max-iterations", "-n", help="Max. Anzahl Generations pro Run."),
     ] = 3,
+    max_turns: Annotated[
+        int,
+        typer.Option(
+            "--max-turns",
+            help="Max. claude-Tool-Turns pro Generation. Default 8 ist knapp für Tasks mit black/isort/flake8 + pytest — bei error_max_turns auf 16+ erhöhen.",
+        ),
+    ] = 8,
     model: Annotated[
         str | None,
         typer.Option("--model", help="Claude-Modell (sonnet, opus). Default: aus Trigger-Config."),
@@ -103,6 +110,17 @@ def run_command(
         bool,
         typer.Option("--pr-draft", help="PR als Draft erzeugen."),
     ] = False,
+    multi_agent: Annotated[
+        bool,
+        typer.Option(
+            "--multi-agent",
+            help=(
+                "Aktiviert das Subagent-Team (architect/developer/tester). "
+                "Claude Code orchestriert via Task-Tool. Erfordert größeres "
+                "--max-turns (default 8 ist zu knapp)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Implementierung von `forge run`."""
     try:
@@ -129,9 +147,12 @@ def run_command(
         console.print("[yellow]dry-run[/yellow]: using MockCodingAgent (no Claude calls)")
         agent = MockCodingAgent(callable_=lambda wt, prompt: None)
     else:
+        if multi_agent:
+            console.print("[cyan]multi-agent[/cyan]: architect -> developer -> tester via Claude Code subagents")
         agent = ClaudeCodeCLIAgent(
             claude_bin=claude_bin,
             default_model=model,
+            multi_agent=multi_agent,
         )
 
     config = RunConfig(
@@ -146,6 +167,7 @@ def run_command(
         focus=focus,
         base_ref=base_ref,
         max_iterations=max_iterations,
+        max_turns_per_proposal=max_turns,
         eval_suite=eval_suite,
         model=model,
         issue_number=issue_number,

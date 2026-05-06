@@ -862,6 +862,8 @@ def _normalize_stop_reason(stop: str) -> str:
 def _quick_run(cmd: str, *, cwd: Path, timeout: int) -> int | None:
     """Führt einen Preflight-Befehl aus und liefert den Exit-Code (oder None
     bei Timeout)."""
+    from forge_execute._venv import venv_aware_env
+
     try:
         result = subprocess.run(
             cmd,
@@ -872,6 +874,7 @@ def _quick_run(cmd: str, *, cwd: Path, timeout: int) -> int | None:
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
+            env=venv_aware_env(cwd),
         )
         return result.returncode
     except subprocess.TimeoutExpired:

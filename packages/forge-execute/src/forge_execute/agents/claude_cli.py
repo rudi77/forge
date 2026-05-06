@@ -16,17 +16,23 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import subprocess
 import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from forge_execute._venv import venv_aware_env
 from forge_execute.agents.base import (
     CodingAgent,
     CodingAgentError,
     CodingAgentTimeout,
     ProposalResult,
+)
+from forge_execute.agents.templates import (
+    ORCHESTRATOR_SYSTEM_PROMPT,
+    list_templates,
 )
 from forge_execute.evaluators.command import _kill_tree
 
@@ -59,12 +65,19 @@ class ClaudeCodeCLIAgent:
         claude_bin: str = "claude",
         default_model: str | None = None,
         permission_mode: str = "bypassPermissions",
-        timeout_s: int = DEFAULT_TIMEOUT_S,
+        timeout_s: int | None = None,
+        multi_agent: bool = False,
     ) -> None:
         self.claude_bin = claude_bin
         self.default_model = default_model
         self.permission_mode = permission_mode
-        self.timeout_s = timeout_s
+        self.multi_agent = multi_agent
+        # Multi-Agent-Runs spawnen Subagents (architect/developer/tester),
+        # daher mehr Wallclock-Budget. Single-Agent-Runs reichen 10 Min.
+        if timeout_s is None:
+            self.timeout_s = 1500 if multi_agent else DEFAULT_TIMEOUT_S
+        else:
+            self.timeout_s = timeout_s
 
     def propose(
         self,
@@ -77,6 +90,12 @@ class ClaudeCodeCLIAgent:
         allowed_tools: str | None = None,
         env: dict[str, str] | None = None,
     ) -> ProposalResult:
+        # Multi-Agent: Subagent-Markdowns in den Worktree kopieren, bevor
+        # Claude Code startet — dann werden sie via .claude/agents/ entdeckt.
+        if self.multi_agent:
+            _install_subagents(worktree)
+            allowed_tools = _augment_tools_for_multi_agent(allowed_tools)
+
         cmd = [
             self.claude_bin,
             "-p",
@@ -88,6 +107,8 @@ class ClaudeCodeCLIAgent:
             "--permission-mode",
             self.permission_mode,
         ]
+        if self.multi_agent:
+            cmd.extend(["--append-system-prompt", ORCHESTRATOR_SYSTEM_PROMPT])
         if allowed_tools:
             cmd.extend(["--allowedTools", allowed_tools])
         chosen_model = model or self.default_model
@@ -101,6 +122,11 @@ class ClaudeCodeCLIAgent:
         # `claude /login` mit einem Subscription-Account angemeldet.
         # forge entscheidet das nicht — wenn beides fehlt, schlägt der
         # claude-Subprozess mit klarem Error fehl, den wir hier propagieren.
+
+        # venv-Auto-Detection: claude führt im Worktree pytest/black/python
+        # via Bash-Tool aus. Damit die in der Projekt-venv landen statt System-
+        # Python, prependen wir <repo>/.venv/Scripts in PATH.
+        run_env = venv_aware_env(Path(worktree), run_env)
 
         # Capture base SHA, damit wir hinterher den Diff bauen können
         base_sha = _git(worktree, "rev-parse", "HEAD")
@@ -146,12 +172,25 @@ class ClaudeCodeCLIAgent:
                 f"claude exceeded {self.timeout_s}s wallclock budget"
             )
 
-        if proc.returncode != 0:
-            raise CodingAgentError(
-                f"claude exited {proc.returncode}: {stderr.strip()[:500]}"
-            )
-
         raw = _parse_json_output(stdout)
+
+        # `error_max_turns`/`tool_use` sind Soft-Fails: claude hat das
+        # turn-Limit erreicht, aber im Worktree LIEGEN evtl. fertige
+        # Änderungen. Wir verwerfen die nicht — der Runner soll sie wie
+        # einen normalen Vorschlag validieren und evaluieren.
+        soft_fail_subtypes = {"error_max_turns", "error_during_execution"}
+        is_soft_fail = (
+            proc.returncode != 0
+            and raw.get("subtype") in soft_fail_subtypes
+        )
+        if proc.returncode != 0 and not is_soft_fail:
+            stderr_clean = stderr.strip()
+            stdout_clean = stdout.strip()
+            detail_parts = [p for p in [stderr_clean, stdout_clean] if p]
+            detail = " | ".join(detail_parts) if detail_parts else "(no output)"
+            raise CodingAgentError(
+                f"claude exited {proc.returncode}: {detail[:800]}"
+            )
         diff = _git(worktree, "diff", base_sha, "HEAD")
         # Für noch nicht committete Änderungen ergänzen
         wt_diff = _git(worktree, "diff")
@@ -161,21 +200,56 @@ class ClaudeCodeCLIAgent:
         usage = raw.get("usage") or {}
         cost = _extract_cost(raw)
 
+        # Soft-fail subtype trumps any stop_reason claude reports.
+        # `error_max_turns` ist deutlicher als `tool_use` für die Telemetrie.
+        if raw.get("subtype") == "error_max_turns":
+            stop_reason = "max_turns"
+        elif raw.get("subtype") == "error_during_execution":
+            stop_reason = "error"
+        else:
+            stop_reason = str(raw.get("stop_reason") or "unknown")
+
         return ProposalResult(
             diff=diff,
             tokens_in=int(usage.get("input_tokens", 0) or 0),
             tokens_out=int(usage.get("output_tokens", 0) or 0),
             cost_usd=cost,
-            stop_reason=str(raw.get("stop_reason") or "unknown"),
+            stop_reason=stop_reason,
             model=str(raw.get("model") or chosen_model or ""),
             model_version=str(raw.get("model") or ""),
             turns_used=int(raw.get("num_turns", 0) or 0),
             duration_ms=duration_ms,
             raw_response=raw,
+            error=None if proc.returncode == 0 else f"exit {proc.returncode}, subtype={raw.get('subtype')}",
         )
 
 
 # --- Helpers ----------------------------------------------------------
+
+
+def _install_subagents(worktree: Path) -> None:
+    """Kopiert die Subagent-Markdowns nach `<worktree>/.claude/agents/`.
+
+    Idempotent: existierende gleichnamige Files werden überschrieben.
+    Damit hat Claude Code projektspezifische Subagents zur Verfügung.
+    """
+    target = worktree / ".claude" / "agents"
+    target.mkdir(parents=True, exist_ok=True)
+    for src in list_templates():
+        shutil.copyfile(src, target / src.name)
+
+
+def _augment_tools_for_multi_agent(allowed_tools: str | None) -> str:
+    """Sicherstellen, dass `Task` in der Allowlist ist — der Master-Claude
+    spawnt Subagents über das Task-Tool.
+
+    Wenn `allowed_tools` leer ist, fügen wir Task als einzigen Eintrag.
+    """
+    if not allowed_tools:
+        return "Task"
+    if "Task" in allowed_tools:
+        return allowed_tools
+    return f"{allowed_tools},Task"
 
 
 def _git(worktree: Path, *args: str) -> str:

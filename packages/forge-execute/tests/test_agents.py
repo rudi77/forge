@@ -136,3 +136,41 @@ def test_claude_cli_raises_on_missing_binary(repo: Path, monkeypatch) -> None:
 def test_claude_cli_satisfies_protocol() -> None:
     agent: CodingAgent = ClaudeCodeCLIAgent()
     assert agent is not None
+
+
+# --- Subagent installation -------------------------------------------------
+
+
+def test_subagent_templates_are_packaged() -> None:
+    """architect.md / developer.md / tester.md müssen via importlib.resources
+    auffindbar sein, sonst landet `forge run --multi-agent` ohne Subagents."""
+    from forge_execute.agents.templates import list_templates, templates_dir
+
+    assert templates_dir().is_dir()
+    names = {p.name for p in list_templates()}
+    assert names >= {"architect.md", "developer.md", "tester.md"}
+
+
+def test_install_subagents_copies_templates_into_worktree(repo: Path) -> None:
+    """`_install_subagents` legt die Markdowns unter <wt>/.claude/agents/ ab."""
+    from forge_execute.agents.claude_cli import _install_subagents
+
+    _install_subagents(repo)
+    target = repo / ".claude" / "agents"
+    assert target.is_dir()
+    assert (target / "architect.md").is_file()
+    assert (target / "developer.md").is_file()
+    assert (target / "tester.md").is_file()
+    # Inhalt: erwartet eine YAML-Frontmatter-Zeile mit "name:"
+    text = (target / "architect.md").read_text(encoding="utf-8")
+    assert "name: architect" in text
+
+
+def test_augment_tools_adds_task_when_missing() -> None:
+    from forge_execute.agents.claude_cli import _augment_tools_for_multi_agent
+
+    assert _augment_tools_for_multi_agent(None) == "Task"
+    assert _augment_tools_for_multi_agent("") == "Task"
+    assert _augment_tools_for_multi_agent("Read,Edit") == "Read,Edit,Task"
+    # idempotent
+    assert _augment_tools_for_multi_agent("Read,Task,Edit") == "Read,Task,Edit"

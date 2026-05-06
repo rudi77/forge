@@ -28,6 +28,8 @@ from pathlib import Path
 
 from forge_core.spec import EvalSuiteConfig
 
+from forge_execute._venv import venv_aware_env
+
 _IS_WINDOWS = platform.system() == "Windows"
 
 
@@ -103,6 +105,10 @@ class CommandEvaluator:
         timeout = False
         exit_code = -1
 
+        # venv-Auto-Detection: liegt eine venv im Repo-Root, prependen wir sie
+        # in PATH, damit `python`/`pytest` aus der venv kommen.
+        run_env = venv_aware_env(Path(cwd), env)
+
         popen_kwargs: dict = dict(
             cwd=str(cwd),
             shell=True,
@@ -111,7 +117,7 @@ class CommandEvaluator:
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env,
+            env=run_env,
         )
         # Auf beiden Plattformen brauchen wir eine Möglichkeit, den ganzen
         # Prozessbaum zu killen, nicht nur den Shell-Wrapper.

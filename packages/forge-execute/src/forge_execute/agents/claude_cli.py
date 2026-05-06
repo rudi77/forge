@@ -97,11 +97,10 @@ class ClaudeCodeCLIAgent:
         run_env: dict[str, str] = dict(os.environ)
         if env:
             run_env.update(env)
-        # API-Key muss da sein
-        if "ANTHROPIC_API_KEY" not in run_env:
-            raise CodingAgentError(
-                "ANTHROPIC_API_KEY is not set; ClaudeCodeCLIAgent requires it"
-            )
+        # Auth: entweder ANTHROPIC_API_KEY in env ODER claude ist via
+        # `claude /login` mit einem Subscription-Account angemeldet.
+        # forge entscheidet das nicht — wenn beides fehlt, schlägt der
+        # claude-Subprozess mit klarem Error fehl, den wir hier propagieren.
 
         # Capture base SHA, damit wir hinterher den Diff bauen können
         base_sha = _git(worktree, "rev-parse", "HEAD")
@@ -193,7 +192,7 @@ def _git(worktree: Path, *args: str) -> str:
         raise CodingAgentError(
             f"git {args} failed in {worktree}: {result.stderr.strip()}"
         )
-    return result.stdout
+    return result.stdout.strip()
 
 
 def _parse_json_output(stdout: str) -> dict[str, Any]:

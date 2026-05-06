@@ -121,18 +121,6 @@ def test_mock_satisfies_protocol() -> None:
 # --- ClaudeCodeCLIAgent -------------------------------------------------
 
 
-def test_claude_cli_raises_on_missing_api_key(repo: Path, monkeypatch) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    agent = ClaudeCodeCLIAgent(claude_bin="claude")
-    with pytest.raises(CodingAgentError, match="ANTHROPIC_API_KEY"):
-        agent.propose(
-            worktree=repo,
-            prompt="x",
-            max_turns=1,
-            budget_usd=Decimal("1"),
-        )
-
-
 def test_claude_cli_raises_on_missing_binary(repo: Path, monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     agent = ClaudeCodeCLIAgent(claude_bin="this-binary-does-not-exist-99999")

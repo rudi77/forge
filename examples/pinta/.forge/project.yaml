@@ -119,26 +119,21 @@ capabilities:
 
 # === EVAL-SUITEN ===
 eval_suites:
-  # Reduzierter Smoke-Gate — Stand 2026-05-06.
-  #
-  # Der vollständige MVP-Gate aus .github/workflows/ci.yml umfasst auch
-  # test_onboarding.py, test_agent_service.py, test_ai_prompts_smoke.py.
-  # Diese können zur Zeit nicht collected werden, weil PINTAs
-  # src/agents/factory.py von `taskforce.host` importiert — das Modul gibt
-  # es in der aktuellen pytaskforce-Version nicht mehr (Renaming/Move).
-  #
-  # Bis pytaskforce-Kompatibilität restauriert ist, läuft forge nur gegen
-  # die drei Tests, die ohne taskforce.host collectable sind. Sobald
-  # PINTAs Imports geheilt sind, hier die fehlenden 3 Files wieder
-  # eintragen und budget_s ggf. erhöhen.
+  # MVP-Gate aus .github/workflows/ci.yml — 46 Tests, deterministisch grün.
+  # Legacy class-based Suites (TestQuotesIntegration, TestUsersIntegration,
+  # TestAuthIntegration) sind quarantäniert bis P5 Cleanup; sie hier laufen
+  # zu lassen würde echte Regressionen maskieren.
   quick:
     cmd: |
       cd backend && python -m pytest \
-        tests/test_quote_calculator.py \
-        tests/test_quote_search.py \
         tests/test_quote_pdf_routes.py \
+        tests/test_onboarding.py \
+        tests/test_agent_service.py \
+        tests/test_quote_search.py \
+        tests/test_ai_prompts_smoke.py \
+        tests/test_quote_calculator.py \
         --no-header -q --tb=no
-    budget_s: 120
+    budget_s: 180
     parses: pytest_json
 
   # Volltest mit allen nicht-quarantänierten Tests; teurer, aber breiter.

@@ -1,103 +1,204 @@
+# PINTA — forge project specification
+# Diese Datei ist die Wahrheit für forge in PINTA. Bevor du sie änderst:
+# 1. forge-spec-v0.2.md Teil 5 lesen
+# 2. mit dem Operator (Rudolf) abklären
+
 spec_version: "1.0"
 name: pinta
-language_stack: [python, typescript]
-frameworks: [fastapi, react, alembic]
+language_stack: [python, javascript]
+frameworks: [fastapi, react, alembic, vite, pytaskforce]
 
+# === SURFACES — was darf wie geändert werden ===
+# Surfaces sind ENG. Lieber neuen Surface anlegen als bestehenden ausweiten.
 surfaces:
-  backend_logic:
-    paths: ["backend/src/services/", "backend/src/agents/tools/"]
+  backend_services:
+    paths:
+      - "backend/src/services/"
     type: code
     guardrails:
-      - "ruff check {path}"
-      - "pytest -x -q tests/test_quote_calculator.py"
+      # Preflight: schnelle Sanity-Checks, Budget <30s gesamt
+      - "cd backend && black --check src/services/"
+      - "cd backend && isort --check src/services/"
+      - "cd backend && flake8 src/services/ --max-line-length 120"
+
+  backend_agent_tools:
+    paths:
+      - "backend/src/agents/tools/"
+    type: code
+    guardrails:
+      - "cd backend && black --check src/agents/tools/"
+      - "cd backend && isort --check src/agents/tools/"
+      - "cd backend && flake8 src/agents/tools/ --max-line-length 120"
+
   agent_prompts:
-    paths: ["backend/agents/maler.yaml"]
+    # Nur die deklarativen YAML-Configs; Python-Agent-Code ist
+    # eine eigene Surface (s.o.).
+    paths:
+      - "backend/agents/maler.yaml"
     type: yaml-keys
-    allowed_keys: ["system_prompt", "tools", "temperature"]
-  frontend:
-    paths: ["frontend/src/components/", "frontend/src/hooks/"]
+    allowed_keys:
+      - "system_prompt"
+      - "tools"
+      - "temperature"
+
+  frontend_components:
+    paths:
+      - "frontend/src/components/"
+      - "frontend/src/hooks/"
     type: code
     guardrails:
-      - "cd frontend && npx tsc --noEmit"
+      # PINTA nutzt JS/JSX, kein TypeScript — daher kein tsc.
       - "cd frontend && npm run lint -- --max-warnings 0"
 
+# === FORBIDDEN — Pfade, die forge NIE editiert ===
+# Das ist die feinere Auflösung über Surfaces. Wenn ein Pfad sowohl in einer
+# Surface als auch hier ist, gewinnt forbidden.
 forbidden:
+  # Sicherheits-/Auth-/Payment-kritisch
   - "backend/src/routes/auth.py"
   - "backend/src/routes/payments.py"
-  - "backend/src/core/security.py"
-  - "backend/migrations/**"
+  - "backend/src/routes/ai.py"
+  - "backend/src/routes/agent.py"
+  - "backend/src/routes/chat.py"
+  - "backend/src/core/**"
+
+  # Datenbank-Migrationen — nur Mensch
+  - "backend/alembic/**"
+  - "backend/src/migrations/**"
+
+  # Konfiguration / Secrets / Build
+  - "backend/.env*"
+  - "frontend/.env*"
+  - "**/Dockerfile*"
+  - "docker-compose*.yml"
+  - "nginx/**"
+  - "scripts/**"
+  - "backend/entrypoint.sh"
+  - "backend/run_tests.bat"
+  - "backend/move_old_tests.bat"
+
+  # forge selbst (Spec Teil 7.4)
   - ".forge/**"
   - ".github/workflows/**"
-  - "CLAUDE.md"
 
+  # Doku / Konventionen — Mensch entscheidet
+  - "CLAUDE.md"
+  - "README.md"
+  - "BENUTZERHANDBUCH.md"
+  - "API_DOCUMENTATION.md"
+  - "DOCUMENTATION.md"
+  - "CHANGELOG.md"
+  - "TODOList.md"
+  - ".bmad-core/**"
+
+# === CAPABILITIES — was darf forge als Aktion tun ===
 capabilities:
   read: ["**/*"]
   edit: ["{surfaces}"]
   run:
+    # Backend-Tools
     - "pytest *"
-    - "ruff *"
-    - "mypy *"
-    - "tsc *"
+    - "black *"
+    - "isort *"
+    - "flake8 *"
+    - "python *"
+    # Frontend-Tools
     - "npm test"
     - "npm run lint*"
     - "npm run build"
+    # Sub-cd ist nötig wegen `cd backend &&`-Patterns in der Spec
+    - "cd *"
   commit: true
   open_pr: true
-  merge_pr: false
-  push_to_main: false
+  merge_pr: false           # hardcoded v1
+  push_to_main: false       # hardcoded v1
   push_force: false
   network_egress:
     - "api.anthropic.com"
     - "api.github.com"
 
+# === EVAL-SUITEN ===
 eval_suites:
+  # MVP-Gate aus .github/workflows/ci.yml — nur diese Tests passen
+  # deterministisch. Legacy class-based Suites (TestQuotesIntegration,
+  # TestUsersIntegration, TestAuthIntegration) sind quarantäniert bis P5
+  # Cleanup — sie hier laufen zu lassen würde echte Regressionen maskieren.
   quick:
-    cmd: "cd backend && pytest -x -q tests/test_quote_calculator.py tests/test_agent_service.py"
-    budget_s: 60
+    cmd: |
+      cd backend && python -m pytest \
+        tests/test_quote_pdf_routes.py \
+        tests/test_onboarding.py \
+        tests/test_agent_service.py \
+        tests/test_quote_search.py \
+        tests/test_ai_prompts_smoke.py \
+        tests/test_quote_calculator.py \
+        --no-header -q --tb=no
+    budget_s: 180
     parses: pytest_json
-  full:
-    cmd: "scripts/run_full_eval.sh"
-    budget_s: 600
-    parses: scores_json
-  judge:
-    cmd: "python scripts/judge_quotes.py --scenarios tests/scenarios/*.json"
-    budget_s: 300
-    parses: scores_json
 
+  # Volltest mit allen nicht-quarantänierten Tests; teurer, aber breiter.
+  # In v1 (M1) noch nicht aktiv — `quick` reicht zum Loop schließen.
+  full:
+    cmd: |
+      cd backend && python -m pytest \
+        tests/ --ignore=tests/old --no-header -q --tb=no
+    budget_s: 600
+    parses: pytest_json
+
+# === GATES — harte Pass/Fail, blocken Generation ===
+# Bewusst minimal in v1: nur Tests müssen grün sein. Lint läuft als
+# Surface-Preflight (s.o.) — schneller, ohne Eval-Suite-Cost.
 gates:
   - {kind: pytest_pass_rate, threshold: 1.0, source: quick}
-  - {kind: ruff_warnings,    threshold: 0,   lower_is_better: true}
-  - {kind: tsc_errors,       threshold: 0,   lower_is_better: true}
-  - {kind: mypy_errors,      max_increase: 0}
 
-scores:
-  - {kind: coverage_pct,     weight: 0.25, source: quick}
-  - {kind: p95_latency_ms,   weight: 0.40, source: full, lower_is_better: true}
-  - {kind: bundle_kb,        weight: 0.20, source: full, lower_is_better: true}
-  - {kind: todo_count,       weight: 0.15, lower_is_better: true}
+# === SCORES — kontinuierliche Metriken (leer in v1) ===
+# In M1 bleibt scores leer. Konsequenz: KEEP triggert NUR auf
+# rot→grün-Übergängen (legacy_test_revival-Pfad). Das ist genau, was
+# wir für die ersten Runs wollen. Composite-Optimierung kommt in M2,
+# sobald wir eine messende Pipeline für Coverage / p95 / Bundle haben.
+scores: []
 
-diagnostics:
-  - {kind: llm_judge_score, source: judge}
-  - {kind: complexity_avg,  source: full}
+# === DIAGNOSTICS — geloggt, nicht in Composite ===
+diagnostics: []
 
+# === COST-CAPS — Pflicht ab Tag eins ===
+# Erste Runs konservativ, später lockern. Bei Smoke-Tests $1.50 / Run
+# ist sicherer Start.
 cost_caps:
   per_generation_usd: 0.50
-  per_run_usd: 5.00
-  per_project_per_day_usd: 30.00
-  per_project_per_month_usd: 500.00
+  per_run_usd: 1.50         # Smoke-Limit; nach 10 Runs auf 5.00 erhöhen
+  per_project_per_day_usd: 10.00
+  per_project_per_month_usd: 100.00
 
+# === TRIGGERS ===
 triggers:
   on_issue_label:
-    auto-fix:    {strategy: sequential, model: sonnet, max_iterations: 10}
-    auto-feature: {strategy: sequential, model: opus,   max_iterations: 15, requires_human_review: true}
-  on_pr_opened:   {strategy: review_only, model: sonnet}
-  on_ci_failure:  {strategy: sequential, model: sonnet, max_iterations: 3}
+    auto-fix:
+      strategy: sequential
+      model: sonnet
+      max_iterations: 5     # konservativer als die generische Reference (10)
+    auto-feature:
+      strategy: sequential
+      model: opus
+      max_iterations: 10
+      requires_human_review: true
+
+  on_pr_opened:
+    strategy: review_only
+    model: sonnet
+
+  on_ci_failure:
+    strategy: sequential
+    model: sonnet
+    max_iterations: 3
+
   schedule:
     - cron: "0 2 * * *"
       strategy: sequential
       focus: legacy_test_revival
 
+# === RELEASE ===
 release:
   conventional_commits: true
-  on_main_green: auto_tag
+  on_main_green: "off"     # Tag erst, wenn die ersten 5 Auto-PRs sauber durch sind
   changelog: "CHANGELOG.md"

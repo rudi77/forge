@@ -43,8 +43,16 @@ def test_pinta_reference_spec_loads(tmp_path: Path) -> None:
         pytest.skip(f"reference spec not found at {pinta}")
     spec = load_spec(pinta)
     assert spec.name == "pinta"
-    assert "backend_logic" in spec.surfaces
-    assert spec.cost_caps.per_run_usd == Decimal("5.00")
+    # Surfaces aus der echten PINTA-Spec
+    assert "backend_services" in spec.surfaces
+    assert "backend_agent_tools" in spec.surfaces
+    assert "agent_prompts" in spec.surfaces
+    assert "frontend_components" in spec.surfaces
+    # Forbidden enthält auth/payments/agent
+    assert "backend/src/routes/auth.py" in spec.forbidden
+    assert "backend/src/routes/agent.py" in spec.forbidden
+    # Conservative cost cap für Smoke-Phase
+    assert spec.cost_caps.per_run_usd == Decimal("1.50")
 
 
 def test_merge_pr_true_rejected() -> None:

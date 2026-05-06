@@ -1,0 +1,150 @@
+# CLAUDE.md
+
+> Architektur- und Konventions-Notizen für Pair-Programming-Sessions auf forge selbst. Lies das, bevor du Code änderst — das Dokument lebt zusammen mit dem Repo, im Gegensatz zur statischen Spec.
+
+## Einordnung
+
+forge ist die **messbare, replay-fähige Auto-PR-Maschine** aus `docs/forge-spec-v0.2.md`. Die Spec ist Vertrag: wenn dein Vorschlag einem der drei Mantras widerspricht, ist es kein Bug, sondern eine Designentscheidung.
+
+Die drei Mantras:
+
+- Nur was messbar ist, darf die Maschine optimieren — und nicht alles Wertvolle ist messbar.
+- Jeder Schritt ist ein Event. Ohne Events keine Lernkurve.
+- Loop berührt seine eigene Loop-Logik nie. Strikte Schichtung ist Sicherheit.
+
+## Was forge in v1 NICHT tut
+
+Diese Punkte sind **kategorisch ausgeschlossen** — nicht aus Vorsicht, sondern weil zuerst Daten gesammelt werden müssen, bevor sie sich rechtfertigen:
+
+- Auto-Merge (`capabilities.merge_pr`, `push_to_main`, `push_force` sind als `Literal[False]` typisiert, nicht runtime-konfigurierbar)
+- Population-Based Search (kommt mit v2, nach 100+ Runs)
+- Bandit / Bayesian Optimization (kommt mit v3, nach 300+ Runs)
+- Self-Improvement: forge ändert ihre eigene Konfiguration NIE (Prinzip 3, Spec Teil 7.4)
+
+## Architektur — vier Packages
+
+```
+forge-core ──── Schema, Store, CAS, Spec, Replay (keine internen Deps)
+     │
+     ├── forge-execute ──── Loop 1: Runner + Strategies + Mutators + Evaluators
+     │       │
+     │       └── forge-cli ──── Endbenutzer-CLI
+     │              │
+     └── forge-adapters ──── GitHub: PR + Webhook + Action-Templates
+            │
+            └── forge-cli (transitiv)
+```
+
+**Boundaries sind hart**:
+- `forge-core` darf keine Imports aus `forge-execute`/`forge-cli`/`forge-adapters` haben
+- `forge-execute` darf keine Imports aus `forge-cli`/`forge-adapters` haben
+- `forge-cli` und `forge-adapters` dürfen sich gegenseitig referenzieren
+
+Wenn du eine Datei verschiebst, prüfe Import-Direction.
+
+## Build / Test / Lint Commands
+
+```bash
+# Setup nach Clone
+uv sync --all-packages --extra dev
+
+# Volltest
+uv run pytest                            # 163 Tests, ~40s
+uv run pytest packages/forge-core        # nur ein Package
+uv run pytest -v --tb=short              # verbose mit kurzem Traceback
+
+# Lint
+uv run ruff check packages/
+uv run ruff check --fix packages/        # Auto-Fix
+
+# CLI lokal
+uv run forge --help
+uv run forge doctor --spec examples/pinta/.forge/project.yaml
+```
+
+**Vor Commit**: `uv run pytest && uv run ruff check packages/` müssen beide grün sein.
+
+## Code-Konventionen
+
+### Pydantic v2
+
+- Alle Models sind `model_config = ConfigDict(extra="forbid")` — fängt Tippfehler ab
+- `Event` ist `frozen=True` — Events sind immutable nach Konstruktion
+- Sub-Modelle für Enums verwenden `Literal[...]` (in Specs) oder `StrEnum` (in Code)
+
+### Identitäten und Hashes
+
+- Event-IDs und Run-IDs sind ULIDs (sortable nach Zeit, lexikographisch)
+- Artefakt-Hashes haben das Format `sha256:<64-hex>` — der Prefix ist Pflicht und wird validiert
+- Project-Fingerprint hashed `{lang, framework, file_count}` — siehe `forge_cli.runtime.compute_project_fingerprint`
+
+### Zeit
+
+- Alle `ts`-Felder sind `datetime` mit `tzinfo=UTC` — `Event` lehnt naive oder nicht-UTC ab
+- DuckDB gibt TIMESTAMPTZ in Local-Time zurück; `_row_to_event` konvertiert zurück nach UTC
+
+### Subprocess
+
+- Auf Windows brauchst du `creationflags=CREATE_NEW_PROCESS_GROUP`, um Process-Trees zu killen — siehe `evaluators/command.py::_kill_tree`
+- Niemals `shell=True` ohne Bewusstsein, dass die Inputs trusted sein müssen — Spec-Commands sind das, User-Issue-Bodies nicht
+- Encoding: `text=True, encoding="utf-8", errors="replace"` ist Standard
+
+### Tests
+
+- Es gibt **kein** `tests/__init__.py` in den Packages — pytest-Discovery braucht die rootdir-Mode-Variante, sonst kollidieren gleichnamige Test-Module zwischen Packages
+- Fixtures in `conftest.py` global, Helper-Functions privat in der Test-Datei
+- Echte Subprozesse (git, pytest) sind ok in Tests, solange sie schnell sind — die forge-execute-Tests laufen in <30s
+- Hypothesis ist installiert, aber nur für Property-Tests von gates/scoring nutzen
+
+## Bekannte Stolperfallen
+
+### DuckDB Performance
+
+Single-row INSERT via Python-Binding kostet ~12 ms each, auch in-Memory. Das ist ein bekanntes Issue von DuckDB; nicht versuchen, mit Indexes oder PRAGMA zu fighten. Für Bulk → `executemany`. Für Tests, die Zeit messen, statt 1000 Events lieber 10 nehmen.
+
+### Scoring bei rot→grün
+
+Wenn die Baseline-Gates nicht passen (Tests rot) und nach der Mutation passen, ist das **immer** ein Improvement, unabhängig vom Composite-Delta. Siehe `scoring.keep_or_discard(baseline_gates_passed=False)`. Vergessen → der `legacy_test_revival`-Pfad bleibt stuck.
+
+### Forbidden Zones überschneiden Surfaces
+
+Die Spec-Validierung verbietet exakte String-Overlaps (`forbidden: ["src/foo/"]` und `surface.paths: ["src/foo/"]`). Glob-Overlap ist gewollt erlaubt: `surface: ["src/**"]` mit `forbidden: ["src/secrets.py"]` ist OK — Forbidden ist die feinere Auflösung.
+
+### Pathspec API
+
+Nutze `GitIgnoreSpec.from_lines(...)` (modern API), nicht `PathSpec.from_lines(GitWildMatchPattern, ...)` (deprecated). `pathspec >= 0.12`.
+
+### CRLF-Warnings
+
+Windows-Default. Ignorieren. Wenn du sie wirklich loswerden willst: `git config core.autocrlf false`. Inhalte bleiben identisch.
+
+## Event-Schema — Achtung, irreversibel
+
+`payload_schema_version` ist **pro Kind** versioniert (Spec Teil 4.1). Wenn du ein bestehendes Sub-Schema änderst:
+
+- Additive Änderungen (neues optionales Feld) → `1.0` → `1.1`, alte Events lesen weiterhin
+- Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
+- Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
+
+Vor jeder Schema-Änderung: `len(EventKind) == 16` und `len(_PAYLOAD_REGISTRY) == 16` testen.
+
+## CodingAgent ist Plug-in, nicht Fundament
+
+`ClaudeCodeCLIAgent` ist eine konkrete Implementierung. Das `CodingAgent`-Protocol erlaubt morgen einen `CodexCLIAgent`, `OpenCodeAgent` oder `DirectAnthropicAPIAgent`. Wenn du im Runner gegen `claude` direkt programmierst statt gegen das Protocol, brichst du das.
+
+## Sicherheit — vier Schichten
+
+1. **Forbidden Zones** (Pfad-Ebene) — `Capabilities.check_edit/read`
+2. **Capabilities** (Aktions-Ebene) — `Capabilities.check_action/run/egress`
+3. **Cost-Caps** (Ressourcen-Ebene) — `SequentialRunner._check_run_cost_cap`
+4. **Subprocess-Isolation** (Prozess-Ebene) — Worktree pro Run, separate venv kommt in M2
+
+`merge_pr` / `push_to_main` / `push_force` sind dreifach gesichert: in der Spec via `Literal[False]`, in `Capabilities.check_action` als hartkodiertes Deny, und im PR-Body steht der Hinweis explizit.
+
+## Wenn du nicht sicher bist
+
+- **Eine neue Mutation einführen?** Trag sie in `forge_core.events.kinds.mutation.py` als neuen `MutatorKind` ein, schreibe ein eigenes Modul in `forge_execute/mutators/`, registriere im Runner.
+- **Eine neue Eval-Suite?** Erweitere `EvalSuiteConfig.parses` um den neuen Modus, schreibe einen Parser in `evaluators/command.py`, hänge ihn an `_parse()` an.
+- **Eine neue Capability?** Erweitere `CapabilitiesConfig`, dann `Capabilities`-Klasse, dann Tests doppelt schreiben — Capabilities sind die wichtigste Verteidigungslinie.
+
+Wenn dein Change ein bestehendes Modul „etwas größer" macht statt klar zuordenbar zu sein: stop, denk nach, frag den Operator. Das ist meistens ein Anzeichen, dass die Schichtung verletzt würde.

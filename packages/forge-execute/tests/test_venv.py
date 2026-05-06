@@ -71,7 +71,7 @@ def test_venv_aware_env_no_venv_returns_unchanged(tmp_path: Path) -> None:
 
 
 def test_venv_aware_env_idempotent(tmp_path: Path) -> None:
-    venv = _make_fake_venv(tmp_path)
+    _make_fake_venv(tmp_path)
     base = {"PATH": "/usr/bin"}
     once = venv_aware_env(tmp_path, base)
     twice = venv_aware_env(tmp_path, once)

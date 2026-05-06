@@ -432,7 +432,13 @@ class SequentialRunner:
 
         if kept:
             commit_msg = self._format_commit_message(gen_idx, score_delta)
-            self.worktrees.commit(worktree, commit_msg)
+            # Nur Surface-Files committen — Subagent-Files (.claude/agents/*.md)
+            # sind transient und gehören nicht in den PR.
+            self.worktrees.commit(
+                worktree,
+                commit_msg,
+                paths=validation.files_changed or None,
+            )
             # Baseline für nächste Generation aktualisieren
             self._update_baselines_from_eval(eval_result, composite)
         else:

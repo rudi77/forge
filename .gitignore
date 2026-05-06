@@ -225,3 +225,8 @@ __marimo__/
 .forge/runs/
 *.duckdb
 *.duckdb.wal
+
+# Claude Code local state (per-developer)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+.claude/plans/

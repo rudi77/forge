@@ -94,7 +94,12 @@ class CommandEvaluator:
         cwd: Path,
         env: dict[str, str] | None = None,
     ) -> EvalRunResult:
-        cmd_str = suite.cmd
+        # YAML `cmd: |` Blocks mit `\<newline>` als Line-Continuation sind
+        # POSIX-Shell-Konvention. Cmd.exe auf Windows kennt das nicht — der
+        # backslash würde an pytest als nacktes `\` Argument durchgereicht
+        # (Drive-Root-Path-Bug). Wir normalisieren `\<newline>` → ` ` für beide
+        # Plattformen, damit Specs cross-platform schreibbar bleiben.
+        cmd_str = _normalize_line_continuations(suite.cmd)
         timeout_s = suite.budget_s
 
         # `shell=True` bewusst — die Spec erlaubt Pipes und `cd backend && pytest`
@@ -190,6 +195,22 @@ class CommandEvaluator:
                 # Tool nicht da oder timeout — wir lassen es stumm aus.
                 continue
         return result
+
+
+# --- Helpers -----------------------------------------------------------
+
+
+def _normalize_line_continuations(cmd: str) -> str:
+    """Ersetzt `\\<newline>`-Sequenzen durch ein einzelnes Space.
+
+    YAML-Specs nutzen oft `cmd: |` mit Backslash-Continuations zur Lesbarkeit.
+    Auf Windows-cmd.exe ist `\\<newline>` keine Continuation — ohne diese
+    Normalisierung crasht der Subprozess (Backslash wird als Argument
+    durchgereicht).
+    """
+    import re
+
+    return re.sub(r"[ \t]*\\\r?\n\s*", " ", cmd).strip()
 
 
 # --- Process-Tree-Termination ------------------------------------------

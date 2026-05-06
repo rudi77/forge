@@ -163,14 +163,25 @@ class WorktreeManager:
         worktree: Worktree,
         message: str,
         *,
+        paths: list[str] | None = None,
         allow_empty: bool = False,
     ) -> str:
-        """Stagest und committed alle Änderungen im Worktree.
+        """Stagest und committed Änderungen im Worktree.
+
+        Args:
+            paths: Wenn gegeben, werden nur diese Files gestaged. Sonst
+                `git add -A` (alles). Pfade sind relativ zum Worktree.
+                Caller, die Subagent-Files (z.B. `.claude/agents/*.md` von
+                forge-execute) NICHT committen wollen, übergeben hier eine
+                Whitelist.
 
         Returns:
             Commit-SHA des neuen Commits.
         """
-        add = self._run(["git", "add", "-A"], cwd=worktree.path)
+        if paths:
+            add = self._run(["git", "add", "--", *paths], cwd=worktree.path)
+        else:
+            add = self._run(["git", "add", "-A"], cwd=worktree.path)
         if add.returncode != 0:
             raise GitError(f"git add failed: {add.stderr.strip()}")
 

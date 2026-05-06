@@ -111,32 +111,37 @@ werden ohne Edits gemerged.
 
 ### 3a. `worktrees.py` — Git-Worktree-Pool
 
-- [ ] `create(run_id) -> Path`
-- [ ] `cleanup(path)`
-- [ ] `apply_patch(path, diff)`
-- [ ] `revert(path)`
-- [ ] `commit(path, message)`
-- [ ] Separate venv pro Worktree
-- [ ] Tests: 3 parallele Worktrees, sauberes Cleanup
+- [x] `create(run_id) -> Path`
+- [x] `cleanup(path)`
+- [x] `apply_patch(path, diff)`
+- [x] `revert(path)`
+- [x] `commit(path, message)`
+- [ ] Separate venv pro Worktree (Optimierung; v1 reicht eine Repo-venv)
+- [x] Zusatz: `diff_against_base`, `changed_files`, `has_changes`
+- [x] Tests: 3 parallele Worktrees, sauberes Cleanup, apply+revert Roundtrip (10 Tests)
 
 ### 3b. `capabilities.py` — Capability-Enforcement
 
-- [ ] `Capabilities`-Klasse mit `check(path, action)`
-- [ ] Pfad gegen Surfaces+Forbidden prüfen
-- [ ] Aktion gegen Capability-Listen prüfen
-- [ ] Auf Verletzung `GuardrailViolation`-Event + Exception
-- [ ] Glob-Matching für Pattern wie `pytest *`, `**/*.py`
-- [ ] `merge_pr`/`push_to_main`/`push_force` immer abgelehnt
-- [ ] Tests doppelt: Surfaces, Forbidden, Capabilities, Egress
+- [x] `Capabilities`-Klasse mit `check_edit/read/run/action/egress`
+- [x] Pfad gegen Surfaces+Forbidden prüfen (gitignore-Glob via pathspec)
+- [x] Aktion gegen Capability-Listen prüfen
+- [x] `CheckResult.to_violation()` für Event-Payload-Konvertierung
+- [x] Glob-Matching für Pattern wie `pytest *`, `**/*.py`, `backend/migrations/**`
+- [x] `merge_pr`/`push_to_main`/`push_force` immer abgelehnt (Defense-in-depth)
+- [x] `allowed_tools_string()` für Claude-CLI-Übersetzung
+- [x] Tests: Surfaces, Forbidden, Capabilities, Egress, Tool-String (19 Tests)
 
 ### 3c. `mutators/code.py` — Code-Mutator
 
-- [ ] Unified-Diff via `git apply` anwenden
-- [ ] Edit-Operations als alternative Eingabe
-- [ ] `git diff --check` (Whitespace)
-- [ ] Syntax-Check: `python -m py_compile`, `tsc --noEmit`
-- [ ] Idempotenz: apply + revert == identity
-- [ ] Tests: 10 zufällige Diffs Roundtrip
+- [x] Unified-Diff via `git apply` anwenden
+- [x] Capability-Pre-Check für alle betroffenen Pfade
+- [x] `git diff --check` (Whitespace)
+- [x] Syntax-Check via `ast.parse` für .py-Files
+- [x] Auto-Revert bei Syntax/Whitespace-Failure
+- [x] Idempotenz: apply + revert == identity
+- [x] `extract_changed_paths`, `count_diff_lines` Helpers
+- [x] Tests: 11 Tests inkl. malformed Diff, syntax error, forbidden path
+- [ ] Edit-Operations als alternative Eingabe (M2)
 
 ### 3d. `evaluators/command.py` — Command-Evaluator
 
@@ -148,10 +153,12 @@ werden ohne Edits gemerged.
 
 ### 3e. `gates.py` + `scoring.py` — Gates und Composite
 
-- [ ] `evaluate_gates(eval_result, spec) -> (passed, list[GateResult])`
-- [ ] `compute_composite(scores, spec) -> float | None`
-- [ ] Composite nur, wenn alle Gates grün
-- [ ] Property-based Tests via Hypothesis
+- [x] `evaluate_gates(measurements, spec, baseline) -> (passed, list[GateResult])`
+- [x] `compute_composite(measurements, spec, baseline) -> float | None`
+- [x] Composite nur, wenn alle Gates grün (Caller-Vertrag)
+- [x] `keep_or_discard(new, baseline, tolerance)` aus Spec Teil 6.5
+- [x] `max_increase`-Gates mit Baseline-Logic
+- [x] Tests: 23 Tests, deckt Gates+Scores+Decision-Logic ab
 
 ### 3f. `runner.py` — Sequential Runner
 

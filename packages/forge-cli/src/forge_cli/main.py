@@ -14,6 +14,7 @@ import typer
 
 from forge_cli import analyze as analyze_mod
 from forge_cli import doctor as doctor_mod
+from forge_cli import plan as plan_mod
 from forge_cli import replay as replay_mod
 from forge_cli import run as run_mod
 
@@ -43,6 +44,11 @@ app.command(
     name="replay",
     help="Rekonstruiert einen Run als lesbare Markdown-Timeline.",
 )(replay_mod.replay_command)
+
+app.command(
+    name="plan",
+    help="Generiert einen Plan für eine Aufgabe (architect-only, kein Code).",
+)(plan_mod.plan_command)
 
 
 def main() -> None:

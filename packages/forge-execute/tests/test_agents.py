@@ -166,6 +166,55 @@ def test_install_subagents_copies_templates_into_worktree(repo: Path) -> None:
     assert "name: architect" in text
 
 
+def test_install_subagents_project_override_wins(repo: Path) -> None:
+    """Spec v0.3 Teil 6.5 Designentscheidung 5.1: per-Projekt-Override
+    in `<repo>/.forge/agents/<name>.md` überschreibt forge-Defaults."""
+    from forge_execute.agents.claude_cli import _install_subagents
+
+    # Projekt-Override für architect anlegen
+    override_dir = repo / ".forge" / "agents"
+    override_dir.mkdir(parents=True)
+    (override_dir / "architect.md").write_text(
+        "---\nname: architect\n---\n# CUSTOM ARCHITECT — pinta-spezifisch\n",
+        encoding="utf-8",
+    )
+
+    _install_subagents(repo)
+    target = repo / ".claude" / "agents"
+
+    # Override hat sich durchgesetzt
+    architect_text = (target / "architect.md").read_text(encoding="utf-8")
+    assert "CUSTOM ARCHITECT" in architect_text
+    # Andere Defaults sind trotzdem da
+    assert (target / "developer.md").is_file()
+    assert (target / "tester.md").is_file()
+
+
+def test_install_subagents_finds_override_above_worktree(
+    tmp_path: Path,
+) -> None:
+    """Bei einem Worktree unter <repo>/.forge/worktrees/<id>/ findet
+    der Lookup das `.forge/agents/`-Verzeichnis im Repo-Root."""
+    from forge_execute.agents.claude_cli import _install_subagents
+
+    repo_root = tmp_path / "repo"
+    worktree = repo_root / ".forge" / "worktrees" / "01ABC"
+    worktree.mkdir(parents=True)
+
+    override_dir = repo_root / ".forge" / "agents"
+    override_dir.mkdir(parents=True)
+    (override_dir / "developer.md").write_text(
+        "---\nname: developer\n---\n# Project-specific developer\n",
+        encoding="utf-8",
+    )
+
+    _install_subagents(worktree)
+    text = (worktree / ".claude" / "agents" / "developer.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Project-specific developer" in text
+
+
 def test_augment_tools_adds_task_when_missing() -> None:
     from forge_execute.agents.claude_cli import _augment_tools_for_multi_agent
 

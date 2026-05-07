@@ -210,6 +210,11 @@ class TriggerStrategy(StrEnum):
     REVIEW_ONLY = "review_only"
 
 
+# Subagent-Namen, die Spec v0.3 Teil 6.5 als Pflicht/Optional definiert.
+# v1: architect, developer, tester. v1.5+: reviewer, operations.
+SubagentName = Literal["architect", "developer", "tester", "reviewer", "operations"]
+
+
 class IssueLabelTriggerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -217,6 +222,9 @@ class IssueLabelTriggerConfig(BaseModel):
     model: str
     max_iterations: int | None = Field(default=None, gt=0)
     requires_human_review: bool = False
+    agents: list[SubagentName] = Field(
+        default_factory=lambda: ["architect", "developer", "tester"]
+    )
 
 
 class PROpenedTriggerConfig(BaseModel):
@@ -224,6 +232,8 @@ class PROpenedTriggerConfig(BaseModel):
 
     strategy: TriggerStrategy = TriggerStrategy.REVIEW_ONLY
     model: str
+    # Default: Reviewer-Only für PR-Review-Trigger
+    agents: list[SubagentName] = Field(default_factory=lambda: ["reviewer"])
 
 
 class CIFailureTriggerConfig(BaseModel):
@@ -232,6 +242,8 @@ class CIFailureTriggerConfig(BaseModel):
     strategy: TriggerStrategy = TriggerStrategy.SEQUENTIAL
     model: str
     max_iterations: int = Field(default=3, gt=0)
+    # CI-Fix ist eng — single-agent reicht, kein Plan-Mode nötig
+    agents: list[SubagentName] = Field(default_factory=lambda: ["developer"])
 
 
 class ScheduleTriggerConfig(BaseModel):
@@ -242,6 +254,9 @@ class ScheduleTriggerConfig(BaseModel):
     focus: NonEmptyStr
     model: str | None = None
     max_iterations: int | None = Field(default=None, gt=0)
+    agents: list[SubagentName] = Field(
+        default_factory=lambda: ["architect", "developer", "tester"]
+    )
 
 
 class TriggersConfig(BaseModel):

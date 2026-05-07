@@ -96,6 +96,23 @@ def test_main_help_lists_all_subcommands() -> None:
     assert "analyze" in out
     assert "doctor" in out
     assert "replay" in out
+    assert "plan" in out
+
+
+def test_plan_help_works() -> None:
+    """`forge plan --help` prints usage; doesn't invoke claude."""
+    result = runner.invoke(app, ["plan", "--help"])
+    assert result.exit_code == 0
+    assert "architect" in result.stdout.lower()
+
+
+def test_plan_errors_without_repo(tmp_path: Path, monkeypatch) -> None:
+    """In einem nicht-git-Verzeichnis liefert `forge plan` Exit 2."""
+    nogit = tmp_path / "nogit"
+    nogit.mkdir()
+    monkeypatch.chdir(nogit)
+    result = runner.invoke(app, ["plan", "Some task"])
+    assert result.exit_code == 2
 
 
 # --- forge doctor ------------------------------------------------------

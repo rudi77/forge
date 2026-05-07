@@ -158,3 +158,69 @@ def test_dump_then_load_roundtrip(tmp_path: Path) -> None:
     reloaded = load_spec(out)
     assert reloaded.name == spec.name
     assert reloaded.cost_caps == spec.cost_caps
+
+
+# --- Spec v0.3: Trigger-spezifische agents-Listen --------------------------
+
+
+def test_trigger_default_agents_for_issue_label() -> None:
+    d = _minimal_spec_dict()
+    d["triggers"] = {
+        "on_issue_label": {
+            "auto-fix": {"strategy": "sequential", "model": "sonnet", "max_iterations": 3},
+        },
+    }
+    spec = ProjectSpec.model_validate(d)
+    auto_fix = spec.triggers.on_issue_label["auto-fix"]
+    assert auto_fix.agents == ["architect", "developer", "tester"]
+
+
+def test_trigger_default_agents_for_ci_failure_is_developer_only() -> None:
+    d = _minimal_spec_dict()
+    d["triggers"] = {
+        "on_ci_failure": {"strategy": "sequential", "model": "sonnet"},
+    }
+    spec = ProjectSpec.model_validate(d)
+    assert spec.triggers.on_ci_failure.agents == ["developer"]
+
+
+def test_trigger_default_agents_for_pr_opened_is_reviewer_only() -> None:
+    d = _minimal_spec_dict()
+    d["triggers"] = {
+        "on_pr_opened": {"strategy": "review_only", "model": "sonnet"},
+    }
+    spec = ProjectSpec.model_validate(d)
+    assert spec.triggers.on_pr_opened.agents == ["reviewer"]
+
+
+def test_trigger_explicit_agents_override_default() -> None:
+    d = _minimal_spec_dict()
+    d["triggers"] = {
+        "on_issue_label": {
+            "auto-feature": {
+                "strategy": "sequential",
+                "model": "opus",
+                "max_iterations": 10,
+                "agents": ["architect", "developer", "tester", "reviewer"],
+            },
+        },
+    }
+    spec = ProjectSpec.model_validate(d)
+    assert spec.triggers.on_issue_label["auto-feature"].agents == [
+        "architect", "developer", "tester", "reviewer",
+    ]
+
+
+def test_invalid_agent_name_rejected() -> None:
+    d = _minimal_spec_dict()
+    d["triggers"] = {
+        "on_issue_label": {
+            "auto-fix": {
+                "strategy": "sequential",
+                "model": "sonnet",
+                "agents": ["architect", "magicworker"],  # magicworker existiert nicht
+            },
+        },
+    }
+    with pytest.raises((ValueError, SpecValidationError)):
+        ProjectSpec.model_validate(d)

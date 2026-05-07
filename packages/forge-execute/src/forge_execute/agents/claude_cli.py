@@ -239,13 +239,36 @@ class ClaudeCodeCLIAgent:
 def _install_subagents(worktree: Path) -> None:
     """Kopiert die Subagent-Markdowns nach `<worktree>/.claude/agents/`.
 
-    Idempotent: existierende gleichnamige Files werden überschrieben.
-    Damit hat Claude Code projektspezifische Subagents zur Verfügung.
+    Hybrid-Lookup (Spec v0.3 Teil 6.5, Designentscheidung 5.1):
+    1. Projekt-Override unter `<repo-root>/.forge/agents/<name>.md` hat
+       Vorrang
+    2. forge-Defaults aus forge_execute.agents.templates füllen die
+       restlichen Subagents auf
+
+    Identifikation per Datei-Basename: `architect.md` aus dem Projekt
+    überschreibt `architect.md` aus den Defaults, andere Defaults bleiben.
+
+    Idempotent: existierende Files in `.claude/agents/` werden überschrieben.
     """
     target = worktree / ".claude" / "agents"
     target.mkdir(parents=True, exist_ok=True)
+
+    # Projekt-Override-Verzeichnis aufwärts vom Worktree finden — analog
+    # zur venv-Auto-Detection. forge-Worktrees liegen unter
+    # `<repo>/.forge/worktrees/<id>/`, der Repo-Root hat das `.forge/agents/`.
+    project_overrides: dict[str, Path] = {}
+    for ancestor in [worktree, *worktree.parents]:
+        candidate = ancestor / ".forge" / "agents"
+        if candidate.is_dir():
+            for md in candidate.glob("*.md"):
+                project_overrides.setdefault(md.name, md)
+            break  # ersten Treffer aufwärts nehmen — kein Suchen weiter
+
+    # Erst Defaults legen, dann Projekt-Overrides drüberkopieren.
     for src in list_templates():
         shutil.copyfile(src, target / src.name)
+    for name, src in project_overrides.items():
+        shutil.copyfile(src, target / name)
 
 
 def _augment_tools_for_multi_agent(allowed_tools: str | None) -> str:

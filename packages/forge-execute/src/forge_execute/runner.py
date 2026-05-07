@@ -91,7 +91,14 @@ class RunConfig:
 
 @dataclass
 class GenerationOutcome:
-    """Pro-Generation-Zusammenfassung, vom Runner intern geführt."""
+    """Pro-Generation-Zusammenfassung, vom Runner intern geführt.
+
+    `error` ist ein Aufruf-übergreifender Marker:
+    - `"guardrail"` — Run abbrechen (Capability-Verletzung)
+    - `"cost_cap_hit"` — Run abbrechen (Generation-Cost-Cap)
+    - `"self_terminated"` — Run abbrechen (Agent: nothing more to do)
+    - sonst None
+    """
 
     idx: int
     kept: bool
@@ -158,6 +165,9 @@ class SequentialRunner:
         self._score_baseline: ScoreBaseline | None = None
         self._baseline_composite: float | None = None
         self._baseline_gates_passed: bool = True
+        # Pro-Gate Baseline-Resultate (Spec v0.3 Teil 5.2 — strikte
+        # Erhaltung: keine vorher-grüne Gate darf rot werden).
+        self._baseline_gate_results: dict[str, bool] | None = None
         self._kept_outcomes: list[GenerationOutcome] = []
         self._all_outcomes: list[GenerationOutcome] = []
         # Aktueller Commit, auf den DISCARD-Generations zurückrollen.
@@ -165,6 +175,12 @@ class SequentialRunner:
         # auf den dann commitierten HEAD aktualisiert. Sonst würde ein
         # DISCARD nach einem KEEP die KEPT-Commits wegblasen.
         self._current_base_commit: str | None = None
+
+        # Inter-Generation-Memory (Spec v0.3 Teil 6.8): akkumulierte
+        # KEPT-Diffs werden in den Prompt der nächsten Generation gespliced.
+        from forge_execute._run_context import RunContext
+
+        self._run_context = RunContext()
 
     # --- Top-level run ---------------------------------------------------
 
@@ -226,6 +242,14 @@ class SequentialRunner:
                 break
             if outcome.error == "cost_cap_hit":
                 decision = "cost_cap_hit"
+                break
+            if outcome.error == "self_terminated":
+                # Agent meldete "nothing more to do" — Run ist vollständig
+                # (Spec v0.3 Teil 6.8). Wenn KEPT-Generations existieren,
+                # endet der Run weiter unten als pr_created; sonst als
+                # explizit self_terminated.
+                if not self._kept_outcomes:
+                    decision = "self_terminated"
                 break
 
         # --- Abschluss --------------------------------------------------
@@ -325,6 +349,17 @@ class SequentialRunner:
             self._finish_generation(gen_id, outcome)
             return outcome
 
+        if proposal.error == "self_terminated":
+            outcome = GenerationOutcome(
+                idx=gen_idx,
+                kept=False,
+                reason="self_terminated",
+                cost_usd=proposal.cost_usd,
+                error="self_terminated",
+            )
+            self._finish_generation(gen_id, outcome)
+            return outcome
+
         if not proposal.has_changes:
             outcome = GenerationOutcome(
                 idx=gen_idx,
@@ -413,12 +448,18 @@ class SequentialRunner:
         kept = False
         reason = "gate_failure"
         score_delta: float | None = None
+        new_gate_results = {g.kind: g.passed for g in gate_results}
+        # gates_passed ist hier per Logik True — aber wir reichen die
+        # detaillierte Map an keep_or_discard, damit Modus 3 (Trade-off)
+        # vorher-grüne-jetzt-rote-Gates erkennen kann.
         if gates_passed:
             kept, reason = keep_or_discard(
                 new_composite=composite,
                 baseline_composite=self._baseline_composite,
                 tolerance=self.config.tolerance,
                 baseline_gates_passed=self._baseline_gates_passed,
+                baseline_gate_results=self._baseline_gate_results,
+                new_gate_results=new_gate_results,
             )
             if (
                 composite is not None
@@ -443,16 +484,21 @@ class SequentialRunner:
             commit_msg = self._format_commit_message(gen_idx, score_delta)
             # Nur Surface-Files committen — Subagent-Files (.claude/agents/*.md)
             # sind transient und gehören nicht in den PR.
+            prev_base = self._current_base_commit or worktree.base_commit
             new_sha = self.worktrees.commit(
                 worktree,
                 commit_msg,
                 paths=validation.files_changed or None,
             )
+            # Inter-Generation-Memory: Diff dieser KEPT-Generation für
+            # nächste Generation registrieren.
+            kept_diff = self._capture_kept_diff(worktree, prev_base, new_sha)
+            self._run_context.record_keep(generation_idx=gen_idx, diff=kept_diff)
             # Revert-Anker aktualisieren, damit DISCARD in einer späteren
             # Generation NICHT diesen KEPT-Commit wegblastet.
             self._current_base_commit = new_sha
             # Baseline für nächste Generation aktualisieren
-            self._update_baselines_from_eval(eval_result, composite)
+            self._update_baselines_from_eval(eval_result, composite, gate_results)
         else:
             self.worktrees.revert(worktree, to_commit=self._current_base_commit)
 
@@ -475,7 +521,13 @@ class SequentialRunner:
         gen_id: str,
         gen_idx: int,
     ) -> ProposalResult | None:
-        prompt_hash = self.blobs.put_text(self.config.initial_prompt)
+        # Inter-Generation-Memory: existierende KEPT-Diffs werden an den
+        # initial_prompt angehängt, damit der Subagent weiß, was schon gemacht
+        # ist und auf das aufbaut (Spec v0.3 Teil 6.8).
+        addendum = self._run_context.render_prompt_addendum()
+        effective_prompt = self.config.initial_prompt + addendum
+
+        prompt_hash = self.blobs.put_text(effective_prompt)
 
         self._emit(
             EventKind.PROPOSAL_REQUESTED,
@@ -492,12 +544,28 @@ class SequentialRunner:
         try:
             result = self.agent.propose(
                 worktree=worktree.path,
-                prompt=self.config.initial_prompt,
+                prompt=effective_prompt,
                 max_turns=self.config.max_turns_per_proposal,
                 budget_usd=self.config.spec.cost_caps.per_generation_usd,
                 model=self.config.model,
                 allowed_tools=self.capabilities.allowed_tools_string(),
             )
+            # Self-Termination-Signal (Spec v0.3 Teil 6.8): wenn der Agent
+            # `forge: nothing more to do` im result-text gesendet hat, ist
+            # der Run vollständig.
+            from forge_execute._run_context import proposal_signals_done
+
+            done_signal = proposal_signals_done(
+                str(result.raw_response.get("result") or "")
+            )
+            if done_signal:
+                # Markiere im error-Feld; der Caller bricht den Run-Loop ab.
+                result = result.__class__(
+                    **{
+                        **result.__dict__,
+                        "error": "self_terminated",
+                    }
+                )
         except CodingAgentTimeout as exc:
             self._emit(
                 EventKind.PROPOSAL_RECEIVED,
@@ -766,12 +834,13 @@ class SequentialRunner:
     def _update_baselines(self, eval_result: EvalRunResult) -> None:
         self._gate_baseline = GateBaseline(values=dict(eval_result.measurements))
         self._score_baseline = ScoreBaseline(values=dict(eval_result.measurements))
-        gates_passed, _ = evaluate_gates(
+        gates_passed, gate_results = evaluate_gates(
             measurements=eval_result.measurements,
             spec=self.config.spec,
             baseline=None,
         )
         self._baseline_gates_passed = gates_passed
+        self._baseline_gate_results = {g.kind: g.passed for g in gate_results}
         self._baseline_composite = (
             compute_composite(
                 measurements=eval_result.measurements,
@@ -783,12 +852,17 @@ class SequentialRunner:
         )
 
     def _update_baselines_from_eval(
-        self, eval_result: EvalRunResult, composite: float | None
+        self,
+        eval_result: EvalRunResult,
+        composite: float | None,
+        gate_results: list | None = None,
     ) -> None:
         self._gate_baseline = GateBaseline(values=dict(eval_result.measurements))
         self._score_baseline = ScoreBaseline(values=dict(eval_result.measurements))
         # Wenn wir KEEP gemacht haben, sind die Gates per Definition grün.
         self._baseline_gates_passed = True
+        if gate_results is not None:
+            self._baseline_gate_results = {g.kind: g.passed for g in gate_results}
         if composite is not None:
             self._baseline_composite = composite
 
@@ -812,6 +886,21 @@ class SequentialRunner:
             tools_text = "\n".join(f"{k}: {v}" for k, v in result.tool_versions.items())
             out["tool_versions"] = self.blobs.put_text(tools_text)
         return out
+
+    def _capture_kept_diff(
+        self, worktree: Worktree, from_commit: str, to_commit: str
+    ) -> str:
+        """Holt `git diff <from_commit>..<to_commit>` aus dem Worktree."""
+        result = subprocess.run(
+            ["git", "diff", from_commit, to_commit],
+            cwd=str(worktree.path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        return result.stdout if result.returncode == 0 else ""
 
     def _format_commit_message(
         self, gen_idx: int, score_delta: float | None

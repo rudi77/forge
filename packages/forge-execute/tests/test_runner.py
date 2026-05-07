@@ -2,6 +2,7 @@
 
 Aus todos.txt Schritt 3f: hand-trigger'ter Run gegen ein lokales Test-Repo
 (absichtlich roter Test) → Test grün, committed, alle Events im Store.
+Spec v0.3 Sprint 2.3: Self-Termination via Signal.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from forge_core.events import EventKind
 from forge_core.spec import ProjectSpec
 from forge_core.store import EventStore
 from forge_execute.agents import MockCodingAgent
+from forge_execute.agents.base import ProposalResult
 from forge_execute.runner import RunConfig, SequentialRunner
 
 
@@ -200,6 +202,47 @@ def test_runner_discards_when_agent_breaks_test(
     # Im Store sind DECISION_MADE-Events mit kept=False
     decisions = store.events_by_kind(EventKind.DECISION_MADE)
     assert all(e.payload["kept"] is False for e in decisions)
+
+    store.close()
+
+
+def test_runner_self_terminates_on_done_signal(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """Wenn der Agent `forge: nothing more to do` zurückgibt, beendet
+    der Run sich, ohne weitere Generationen zu starten."""
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+
+    # Mock-Agent, der einen ProposalResult mit done-signal in raw_response
+    # zurückgibt — kein Diff, kein Code-Change.
+    done_result = ProposalResult(
+        diff="",
+        raw_response={"result": "forge: nothing more to do"},
+        stop_reason="end_turn",
+    )
+    agent = MockCodingAgent(static_result=done_result)
+
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="t1",
+        initial_prompt="Try to fix the failing test.",
+        max_iterations=5,  # genug Slack — sollte trotzdem nach gen 0 enden
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+    result = runner.run()
+
+    assert result.decision == "self_terminated"
+    assert len(result.generations) == 1, (
+        f"Run hat nicht beim done-Signal abgebrochen, "
+        f"{len(result.generations)} Generationen liefen"
+    )
+    assert result.generations[0].reason == "self_terminated"
 
     store.close()
 

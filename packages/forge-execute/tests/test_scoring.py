@@ -129,3 +129,92 @@ def test_keep_or_discard_no_score() -> None:
     keep, reason = keep_or_discard(new_composite=None, baseline_composite=None)
     assert keep is False
     assert reason == "no_significant_change"
+
+
+# --- Spec v0.3 Teil 5.2: drei explizite Modi ----------------------------
+
+
+def test_modus1_gate_revival_with_explicit_maps() -> None:
+    """Vorher-rotes Gate jetzt grün, vorher-grüne Gates bleiben grün
+    → KEEP, reason `gate_revival`."""
+    keep, reason = keep_or_discard(
+        new_composite=0.5,
+        baseline_composite=0.5,
+        baseline_gate_results={"pytest_pass_rate": False, "ruff_warnings": True},
+        new_gate_results={"pytest_pass_rate": True, "ruff_warnings": True},
+    )
+    assert keep is True
+    assert reason == "gate_revival"
+
+
+def test_modus2_composite_optimization_pure() -> None:
+    """Alle Gates waren grün und sind grün, Composite besser → KEEP `improvement`."""
+    keep, reason = keep_or_discard(
+        new_composite=0.8,
+        baseline_composite=0.7,
+        baseline_gate_results={"pytest_pass_rate": True},
+        new_gate_results={"pytest_pass_rate": True},
+    )
+    assert keep is True
+    assert reason == "improvement"
+
+
+def test_modus3_regression_pre_green_gate_now_red() -> None:
+    """Vorher-grüne Gate ist jetzt rot — DISCARD, reason `regression`,
+    egal was Composite sagt."""
+    keep, reason = keep_or_discard(
+        new_composite=0.99,  # toller Composite, irrelevant
+        baseline_composite=0.5,
+        baseline_gate_results={"pytest_pass_rate": True, "ruff_warnings": True},
+        new_gate_results={"pytest_pass_rate": True, "ruff_warnings": False},
+    )
+    assert keep is False
+    assert reason == "regression"
+
+
+def test_strict_preservation_blocks_revival_if_other_gate_breaks() -> None:
+    """Auch wenn ein Gate revived wird, blockt eine andere broken-gate die
+    KEEP-Entscheidung (Modus 3 hat Vorrang)."""
+    keep, reason = keep_or_discard(
+        new_composite=0.5,
+        baseline_composite=0.5,
+        baseline_gate_results={"pytest_pass_rate": False, "ruff_warnings": True},
+        new_gate_results={"pytest_pass_rate": True, "ruff_warnings": False},
+    )
+    # ruff war grün, ist jetzt rot → regression trumpft Revival
+    assert keep is False
+    assert reason == "regression"
+
+
+def test_revival_with_multiple_red_gates_partial() -> None:
+    """Genau ein vorher-rotes Gate wird grün, andere bleiben rot —
+    KEEP (Modus 1), weil mind. eine vorher-rote jetzt grün UND
+    keine vorher-grüne ist rot geworden."""
+    keep, reason = keep_or_discard(
+        new_composite=None,
+        baseline_composite=None,
+        baseline_gate_results={
+            "pytest_pass_rate": False,
+            "ruff_warnings": False,
+            "mypy_errors": True,
+        },
+        new_gate_results={
+            "pytest_pass_rate": True,    # revived
+            "ruff_warnings": False,      # bleibt rot, OK
+            "mypy_errors": True,         # bleibt grün, OK
+        },
+    )
+    assert keep is True
+    assert reason == "gate_revival"
+
+
+def test_no_change_in_gates_falls_through_to_composite() -> None:
+    """Gate-Map identisch (alle grün) → Composite-Vergleich entscheidet."""
+    keep, reason = keep_or_discard(
+        new_composite=0.71,  # innerhalb tolerance von 0.7
+        baseline_composite=0.7,
+        baseline_gate_results={"pytest_pass_rate": True},
+        new_gate_results={"pytest_pass_rate": True},
+    )
+    assert keep is False
+    assert reason == "no_significant_change"

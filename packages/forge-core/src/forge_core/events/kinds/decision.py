@@ -13,6 +13,7 @@ from forge_core.events.base import EventKind, register_payload
 
 DecisionReason = Literal[
     "improvement",
+    "gate_revival",
     "no_significant_change",
     "regression",
     "gate_failure",

@@ -40,6 +40,7 @@ RunDecision = Literal[
     "cost_cap_hit",
     "preflight_blocked",
     "guardrail_blocked",
+    "self_terminated",
     "error",
 ]
 

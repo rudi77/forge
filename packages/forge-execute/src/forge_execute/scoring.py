@@ -116,27 +116,53 @@ def keep_or_discard(
     baseline_composite: float | None,
     tolerance: float = 0.02,
     baseline_gates_passed: bool = True,
+    baseline_gate_results: dict[str, bool] | None = None,
+    new_gate_results: dict[str, bool] | None = None,
 ) -> tuple[bool, str]:
-    """Keep/Discard-Logik aus Spec Teil 6.5.
+    """Keep/Discard-Logik aus Spec v0.3 Teil 5.2.
 
-    Wird vom Runner nach erfolgreichen Gates aufgerufen.
+    Drei Modi werden unterschieden:
 
-    Wenn die Baseline ihre Gates nicht erfüllt hat (`baseline_gates_passed=False`)
-    und der neue Stand sie erfüllt, ist das immer ein `improvement` — egal,
-    was die Composite sagt. Das ist die typische `legacy_test_revival`-Situation:
-    der Composite vor und nach dem Fix kann identisch sein, aber der Übergang
-    rot→grün ist der eigentliche Wertgewinn.
+    1. **Gate-Revival** — mindestens ein vorher-rotes Gate ist jetzt grün UND
+       alle vorher-grünen Gates bleiben grün. KEEP, reason `gate_revival`.
+    2. **Composite-Optimization** — alle Gates waren und sind grün, Composite
+       hat sich um mehr als `tolerance` verbessert. KEEP, reason `improvement`.
+    3. **Trade-off** (v0.3-Stub) — vorher-grüne Gate ist jetzt rot. Egal was
+       sonst — DISCARD, reason `regression`. Pareto-Logik in v2.
+
+    Wenn `baseline_gate_results`/`new_gate_results` nicht übergeben werden,
+    fällt die Logik auf den boolean `baseline_gates_passed` zurück (alter
+    v0.2-Pfad). Damit bleibt der Code rückwärtskompatibel.
 
     Returns:
-        (keep, reason) — `reason` ∈ {"improvement", "no_significant_change", "regression"}
+        (keep, reason) — `reason` ∈ {`gate_revival`, `improvement`,
+        `no_significant_change`, `regression`}.
     """
-    if not baseline_gates_passed:
-        return True, "improvement"
+    # --- Modus 3 zuerst: strikte Erhaltung ---------------------------
+    # Eine vorher-grüne Gate, die jetzt rot ist, bricht alles ab.
+    if baseline_gate_results and new_gate_results:
+        for kind, was_passed in baseline_gate_results.items():
+            if was_passed and not new_gate_results.get(kind, False):
+                return False, "regression"
 
+    # --- Modus 1: Gate-Revival ---------------------------------------
+    # Mindestens ein vorher-rotes Gate ist jetzt grün.
+    if baseline_gate_results and new_gate_results:
+        revived = any(
+            not was_passed and new_gate_results.get(kind, False)
+            for kind, was_passed in baseline_gate_results.items()
+        )
+        if revived:
+            return True, "gate_revival"
+    elif not baseline_gates_passed:
+        # Fallback ohne detaillierte Gate-Maps: gröberes Signal
+        return True, "gate_revival"
+
+    # --- Modus 2: Composite-Optimization -----------------------------
     if new_composite is None:
         return False, "no_significant_change"
     if baseline_composite is None:
-        # Erste Generation mit unbekannter Baseline: alles >0 zählt als Improvement
+        # Erste Generation ohne Baseline-Composite: alles >0 zählt
         return (
             new_composite > 0,
             "improvement" if new_composite > 0 else "no_significant_change",

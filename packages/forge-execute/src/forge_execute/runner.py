@@ -160,6 +160,11 @@ class SequentialRunner:
         self._baseline_gates_passed: bool = True
         self._kept_outcomes: list[GenerationOutcome] = []
         self._all_outcomes: list[GenerationOutcome] = []
+        # Aktueller Commit, auf den DISCARD-Generations zurückrollen.
+        # Bei Run-Start = worktree.base_commit; nach jeder KEEP-Generation
+        # auf den dann commitierten HEAD aktualisiert. Sonst würde ein
+        # DISCARD nach einem KEEP die KEPT-Commits wegblasen.
+        self._current_base_commit: str | None = None
 
     # --- Top-level run ---------------------------------------------------
 
@@ -177,6 +182,10 @@ class SequentialRunner:
             pass
 
     def _run_in_worktree(self, worktree: Worktree) -> RunResult:
+        # Initialer revert-Anker = base_commit. Wird nach jeder KEEP-Generation
+        # auf den dann committeten HEAD aktualisiert.
+        self._current_base_commit = worktree.base_commit
+
         # --- Initiale Baseline aus dem Worktree-Stand ableiten ----------
         # In v1 ist das HEAD vor jeder Mutation; spätere Iterationen aktualisieren
         # die Baseline pro KEEP.
@@ -305,7 +314,7 @@ class SequentialRunner:
                 ),
                 generation_id=gen_id,
             )
-            self.worktrees.revert(worktree)
+            self.worktrees.revert(worktree, to_commit=self._current_base_commit)
             outcome = GenerationOutcome(
                 idx=gen_idx,
                 kept=False,
@@ -344,7 +353,7 @@ class SequentialRunner:
         # --- Phase 3: Preflight --------------------------------------
         preflight_err = self._preflight(worktree, validation.files_changed, gen_id)
         if preflight_err is not None:
-            self.worktrees.revert(worktree)
+            self.worktrees.revert(worktree, to_commit=self._current_base_commit)
             outcome = GenerationOutcome(
                 idx=gen_idx,
                 kept=False,
@@ -434,15 +443,18 @@ class SequentialRunner:
             commit_msg = self._format_commit_message(gen_idx, score_delta)
             # Nur Surface-Files committen — Subagent-Files (.claude/agents/*.md)
             # sind transient und gehören nicht in den PR.
-            self.worktrees.commit(
+            new_sha = self.worktrees.commit(
                 worktree,
                 commit_msg,
                 paths=validation.files_changed or None,
             )
+            # Revert-Anker aktualisieren, damit DISCARD in einer späteren
+            # Generation NICHT diesen KEPT-Commit wegblastet.
+            self._current_base_commit = new_sha
             # Baseline für nächste Generation aktualisieren
             self._update_baselines_from_eval(eval_result, composite)
         else:
-            self.worktrees.revert(worktree)
+            self.worktrees.revert(worktree, to_commit=self._current_base_commit)
 
         outcome = GenerationOutcome(
             idx=gen_idx,
@@ -563,7 +575,7 @@ class SequentialRunner:
                     generation_id=gen_id,
                     success=False,
                 )
-                self.worktrees.revert(worktree)
+                self.worktrees.revert(worktree, to_commit=self._current_base_commit)
                 return MutationResult(
                     success=False,
                     error_class="CapabilityDenied",
@@ -574,7 +586,7 @@ class SequentialRunner:
         # Whitespace + Syntax — wir reverten bei Failure.
         ws = self.mutator._whitespace_check(worktree)
         if ws is not None:
-            self.worktrees.revert(worktree)
+            self.worktrees.revert(worktree, to_commit=self._current_base_commit)
             self._emit(
                 EventKind.GUARDRAIL_VIOLATION,
                 GuardrailViolationPayload(
@@ -591,7 +603,7 @@ class SequentialRunner:
 
         syntax = self.mutator._syntax_check(worktree, target_paths)
         if syntax is not None:
-            self.worktrees.revert(worktree)
+            self.worktrees.revert(worktree, to_commit=self._current_base_commit)
             return MutationResult(
                 success=False, error_class="SyntaxError", error_msg=syntax
             )

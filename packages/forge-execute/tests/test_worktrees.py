@@ -193,3 +193,32 @@ def test_create_rejects_existing_path(repo: Path) -> None:
             wm.create(run_id="r1")
     finally:
         wm.cleanup(wt)
+
+
+def test_revert_with_explicit_to_commit(repo: Path) -> None:
+    """Revert kann auf einen anderen Commit als base zurücksetzen — wichtig
+    für KEEP→DISCARD-Sequenz, damit DISCARD nicht KEPT-commits wegblasten.
+    """
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="r1")
+    try:
+        # Erste Mutation: commit
+        (wt.path / "src" / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n", encoding="utf-8"
+        )
+        sha_after_keep = wm.commit(wt, "forge: keep")
+
+        # Zweite Mutation: ändert was, dann discard
+        (wt.path / "src" / "calc.py").write_text(
+            "def add(a, b):\n    return a * b  # buggy\n", encoding="utf-8"
+        )
+        # revert auf sha_after_keep — die zweite Mutation wird verworfen,
+        # die erste KEPT-commit bleibt erhalten
+        wm.revert(wt, to_commit=sha_after_keep)
+
+        content = (wt.path / "src" / "calc.py").read_text(encoding="utf-8")
+        assert content == "def add(a, b):\n    return a + b\n", (
+            "DISCARD nach KEEP hat die KEPT-Änderung weggeblasten"
+        )
+    finally:
+        wm.cleanup(wt)

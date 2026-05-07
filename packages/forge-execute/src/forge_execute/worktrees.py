@@ -140,16 +140,19 @@ class WorktreeManager:
                 f"{applied.stderr.strip()}"
             )
 
-    def revert(self, worktree: Worktree) -> None:
-        """Setzt den Worktree zurück auf seinen `base_commit`.
+    def revert(self, worktree: Worktree, *, to_commit: str | None = None) -> None:
+        """Setzt den Worktree auf einen Commit zurück.
 
-        Discard-Pfad: Nach einer DISCARD-Entscheidung will der Runner den
-        Worktree „leerräumen", damit die nächste Generation auf einer sauberen
-        Basis startet.
+        Default ist `worktree.base_commit` (der Stand bei Run-Start). Der
+        Runner overrided das nach einer KEEP-Generation auf den damaligen
+        HEAD-SHA — sonst würde ein DISCARD in einer späteren Generation
+        auch die schon committeten Änderungen aus der KEEP-Generation
+        wegblasen.
         """
-        # Hard reset auf base_commit + clean (untracked files raus)
+        target = to_commit or worktree.base_commit
+        # Hard reset + clean (untracked files raus)
         reset = self._run(
-            ["git", "reset", "--hard", worktree.base_commit],
+            ["git", "reset", "--hard", target],
             cwd=worktree.path,
         )
         if reset.returncode != 0:

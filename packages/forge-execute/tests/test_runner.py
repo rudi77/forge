@@ -209,14 +209,13 @@ def test_runner_discards_when_agent_breaks_test(
 def test_runner_self_terminates_on_done_signal(
     red_repo: Path, tmp_path: Path
 ) -> None:
-    """Wenn der Agent `forge: nothing more to do` zurückgibt, beendet
-    der Run sich, ohne weitere Generationen zu starten."""
+    """Wenn der Agent `forge: nothing more to do` zurückgibt OHNE Änderungen,
+    beendet der Run sich sofort."""
     spec = _spec_for_red_repo()
     store = EventStore(tmp_path / "events.duckdb")
     blobs = BlobStore(tmp_path / "blobs")
 
-    # Mock-Agent, der einen ProposalResult mit done-signal in raw_response
-    # zurückgibt — kein Diff, kein Code-Change.
+    # Mock-Agent: kein Diff, done-Signal — eindeutiges "fertig, nichts zu tun".
     done_result = ProposalResult(
         diff="",
         raw_response={"result": "forge: nothing more to do"},
@@ -243,6 +242,63 @@ def test_runner_self_terminates_on_done_signal(
         f"{len(result.generations)} Generationen liefen"
     )
     assert result.generations[0].reason == "self_terminated"
+
+    store.close()
+
+
+def test_runner_self_termination_with_changes_still_keeps(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """Bug-Regression: Wenn der Agent Änderungen macht UND danach
+    `forge: nothing more to do` sendet, muss der Diff trotzdem committed
+    werden. Self-Termination soll den Run-LOOP beenden, nicht die
+    Generation prematurely skippen."""
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+
+    # Callable, der den Bug fixt UND done-Signal in raw_response setzt.
+    def fix_and_signal_done(wt: Path, prompt: str) -> ProposalResult:
+        # Fix den failing test (rot→grün)
+        path = wt / "src" / "calc.py"
+        path.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        # Build diff manually so we can attach raw_response
+        import subprocess as sp
+        diff = sp.run(
+            ["git", "diff"], cwd=str(wt), capture_output=True, text=True
+        ).stdout
+        return ProposalResult(
+            diff=diff,
+            raw_response={"result": "Done.\n\nforge: nothing more to do"},
+            stop_reason="end_turn",
+        )
+
+    agent = MockCodingAgent(callable_=fix_and_signal_done)
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="t1",
+        initial_prompt="Fix the failing test.",
+        max_iterations=5,
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+    result = runner.run()
+
+    # Erwartung: KEEP fand statt (rot→grün), Run beendet sich nach gen 0
+    assert len(result.generations) == 1
+    assert result.generations[0].kept is True, (
+        "Bug: KEEP fand nicht statt obwohl Tests rot→grün gingen"
+    )
+    # decision soll pr_created sein (KEPT-Generation existiert), nicht
+    # self_terminated. Self-Termination triggert Run-Loop-Abort, nicht eine
+    # Decision-Override wenn KEEP-Generations da sind.
+    assert result.decision == "pr_created"
+    assert result.branch is not None
+    assert result.final_diff is not None
+    assert "+    return a + b" in result.final_diff
 
     store.close()
 

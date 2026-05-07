@@ -349,23 +349,23 @@ class SequentialRunner:
             self._finish_generation(gen_id, outcome)
             return outcome
 
-        if proposal.error == "self_terminated":
-            outcome = GenerationOutcome(
-                idx=gen_idx,
-                kept=False,
-                reason="self_terminated",
-                cost_usd=proposal.cost_usd,
-                error="self_terminated",
-            )
-            self._finish_generation(gen_id, outcome)
-            return outcome
+        # Self-Termination-Marker MERKEN, aber Generation NICHT prematurely
+        # beenden: wenn der Agent bereits Änderungen gemacht hat, müssen die
+        # noch durch Validate/Eval/Decide laufen — sonst geht der KEEP-commit
+        # verloren. Der `error="self_terminated"`-Marker wird am Generation-
+        # Outcome durchgereicht, der Run-Loop bricht später ab.
+        is_self_terminated = proposal.error == "self_terminated"
 
         if not proposal.has_changes:
+            # Keine Änderungen UND Signal? → eindeutig "fertig", kein KEEP nötig.
+            # Keine Änderungen OHNE Signal? → leerer Vorschlag (z.B. Plan ohne
+            # Implementierung), regulärer DISCARD ohne Run-Abort.
             outcome = GenerationOutcome(
                 idx=gen_idx,
                 kept=False,
-                reason="empty_proposal",
+                reason="self_terminated" if is_self_terminated else "empty_proposal",
                 cost_usd=proposal.cost_usd,
+                error="self_terminated" if is_self_terminated else None,
             )
             self._finish_generation(gen_id, outcome)
             return outcome
@@ -509,6 +509,10 @@ class SequentialRunner:
             composite=composite,
             score_delta=score_delta,
             cost_usd=proposal.cost_usd,
+            # Self-Termination wird am Generation-Outcome durchgereicht,
+            # damit der Run-Loop danach abbricht — das Generation-Outcome
+            # selbst (kept/reason) reflektiert aber das echte Eval-Resultat.
+            error="self_terminated" if is_self_terminated else None,
         )
         self._finish_generation(gen_id, outcome)
         return outcome

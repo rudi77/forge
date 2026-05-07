@@ -2,11 +2,17 @@
 
 > Lebende Datei. Wir haken ab, was fertig ist; bei Status-Änderung committen.
 > Quelle: `docs/forge-spec-v0.2.md` Teil 9 (MVP) + `docs/todos.txt` (5 Schritte).
+>
+> **Hinweis 2026-05-07:** M1 ist abgeschlossen, plus Spec v0.3 (Multi-Agent-
+> Erweiterung). Aktiver Stand siehe `docs/v0.3-implementation-roadmap.md`
+> und `docs/forge-spec-v0.3.md`. Diese Datei bleibt als historisches
+> M1-Dokument; weiterführende Tasks stehen jetzt in der v0.3-Roadmap.
 
 **Erfolgsdefinition M1** (Spec Teil 9): Auf PINTA läuft `forge run --strategy
 sequential --focus legacy_test_revival` über Nacht und produziert einen
 mergebaren PR. Alle Events sind im Store, alle Artefakte im Blob-Store, Replay
-funktioniert.
+funktioniert. **— eingelöst am 2026-05-06/07: 5 reale PINTA-Runs, 5 PRs
+gemerged + gepusht.**
 
 **Übergangs-Erfolg M1 → Phase 2** (Spec Teil 12.2): >50% der Auto-Fix-PRs
 werden ohne Edits gemerged.

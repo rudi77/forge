@@ -527,6 +527,17 @@ class SequentialRunner:
         # Cost akkumulieren
         self._total_cost += result.cost_usd
 
+        # Plan-Persistierung (Spec v0.3 Teil 6.1) — vor ProposalReceived emittieren,
+        # damit die zeitliche Reihenfolge im Replay stimmt: PlanProposed kommt
+        # logisch BEFORE der eigentlichen Code-Mutation, auch wenn beide aus
+        # demselben claude-Aufruf stammen.
+        if result.plan_md is not None:
+            self._emit_plan_proposed(
+                plan_md=result.plan_md,
+                gen_id=gen_id,
+                architect_turns=result.turns_used,
+            )
+
         self._emit(
             EventKind.PROPOSAL_RECEIVED,
             ProposalReceivedPayload(
@@ -545,6 +556,38 @@ class SequentialRunner:
             success=True,
         )
         return result
+
+    def _emit_plan_proposed(
+        self,
+        *,
+        plan_md: str,
+        gen_id: str,
+        architect_turns: int,
+    ) -> None:
+        """Persistiert den Plan im Blob-Store und emittiert PlanProposed.
+
+        `architect_turns` ist heute der Master-Total — wir haben kein
+        feinkörniges Subagent-Turn-Tracking. Spec v0.3 erlaubt das (das
+        Feld ist informativ, nicht semantisch).
+        """
+        from forge_core.events.kinds.plan import PlanProposedPayload
+
+        from forge_execute._plan_parser import parse_plan
+
+        plan_hash = self.blobs.put_text(plan_md)
+        parsed = parse_plan(plan_md)
+        self._emit(
+            EventKind.PLAN_PROPOSED,
+            PlanProposedPayload(
+                architect_turns=architect_turns,
+                subtask_count=parsed.subtask_count,
+                risk_level=parsed.risk_level,
+                out_of_scope=parsed.out_of_scope,
+                insufficient_context=parsed.insufficient_context,
+            ),
+            generation_id=gen_id,
+            artifacts={"plan": plan_hash},
+        )
 
     def _validate_changes(
         self,

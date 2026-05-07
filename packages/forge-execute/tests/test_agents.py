@@ -174,3 +174,53 @@ def test_augment_tools_adds_task_when_missing() -> None:
     assert _augment_tools_for_multi_agent("Read,Edit") == "Read,Edit,Task"
     # idempotent
     assert _augment_tools_for_multi_agent("Read,Task,Edit") == "Read,Task,Edit"
+
+
+# --- Plan extraction from master output -----------------------------------
+
+
+def test_extract_plan_from_master_output_with_markers() -> None:
+    from forge_execute.agents.templates import extract_plan_from_master_output
+
+    text = """Some intro
+
+---FORGE-PLAN-BEGIN---
+# Plan: do X
+
+## Subtasks
+1. one
+2. two
+
+## Risk
+low
+---FORGE-PLAN-END---
+
+## Run summary
+- subtasks done
+"""
+    plan = extract_plan_from_master_output(text)
+    assert plan is not None
+    assert plan.startswith("# Plan: do X")
+    assert "Subtasks" in plan
+    assert "Run summary" not in plan
+
+
+def test_extract_plan_returns_none_without_markers() -> None:
+    from forge_execute.agents.templates import extract_plan_from_master_output
+
+    text = "Just a normal message, no plan markers here."
+    assert extract_plan_from_master_output(text) is None
+
+
+def test_extract_plan_returns_none_with_only_begin_marker() -> None:
+    from forge_execute.agents.templates import extract_plan_from_master_output
+
+    text = "---FORGE-PLAN-BEGIN---\nIncomplete plan, no end marker."
+    assert extract_plan_from_master_output(text) is None
+
+
+def test_extract_plan_returns_none_when_block_empty() -> None:
+    from forge_execute.agents.templates import extract_plan_from_master_output
+
+    text = "before\n---FORGE-PLAN-BEGIN---\n\n---FORGE-PLAN-END---\nafter"
+    assert extract_plan_from_master_output(text) is None

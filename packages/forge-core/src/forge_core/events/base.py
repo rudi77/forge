@@ -28,6 +28,7 @@ class EventKind(StrEnum):
     RUN_FINISHED = "RunFinished"
     GENERATION_STARTED = "GenerationStarted"
     GENERATION_FINISHED = "GenerationFinished"
+    PLAN_PROPOSED = "PlanProposed"
     PROPOSAL_REQUESTED = "ProposalRequested"
     PROPOSAL_RECEIVED = "ProposalReceived"
     MUTATION_APPLIED = "MutationApplied"

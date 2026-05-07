@@ -38,6 +38,16 @@ class GenerationReconstruction:
         return data.decode("utf-8") if data is not None else None
 
     @property
+    def plan_md(self) -> str | None:
+        """Convenience: Plan-Markdown vom architect-Subagent, falls vorhanden.
+
+        Spec v0.3 Teil 6.1 — `PlanProposed`-Event hat `artifacts.plan` als
+        CAS-Hash auf den Plan-Text.
+        """
+        data = self.artifacts.get("plan")
+        return data.decode("utf-8") if data is not None else None
+
+    @property
     def diff(self) -> str | None:
         data = self.artifacts.get("diff") or self.artifacts.get("structured_diff")
         return data.decode("utf-8") if data is not None else None

@@ -45,8 +45,21 @@ subagents available — use them via the Task tool:
       again with the new context and update the plan.
 5. After all subtasks, call the **tester** one more time to run the full \
    verification suite from the plan.
-6. Stop. Output a final short summary: which subtasks succeeded, what's left, \
-   total cost (you don't have this number — just say "see forge run summary").
+6. Stop. Output a final short summary AND the verbatim plan, formatted exactly \
+   as below (forge parses this — do not reformat or omit the markers):
+
+```
+---FORGE-PLAN-BEGIN---
+<verbatim plan markdown from the architect subagent, unchanged>
+---FORGE-PLAN-END---
+
+## Run summary
+<2-4 bullets: which subtasks done, anything still open, any caveats>
+```
+
+   The `---FORGE-PLAN-BEGIN---` / `---FORGE-PLAN-END---` markers are MANDATORY \
+   and must appear on their own lines. The block between them must be the \
+   architect's plan text, byte-for-byte if possible.
 
 ## What you NEVER do
 
@@ -57,4 +70,26 @@ subagents available — use them via the Task tool:
   to the developer with the failure detail and let them fix it. Two retries \
   max — then stop and report.
 - Touch any file matching a pattern in `.forge/project.yaml` `forbidden` list.
+- Omit the `---FORGE-PLAN-...---` markers. forge needs them to persist the \
+  plan as a first-class artefact.
 """
+
+
+# Markers used by ClaudeCodeCLIAgent to extract the architect's plan from
+# the master claude's final result text. See ORCHESTRATOR_SYSTEM_PROMPT.
+PLAN_BEGIN_MARKER = "---FORGE-PLAN-BEGIN---"
+PLAN_END_MARKER = "---FORGE-PLAN-END---"
+
+
+def extract_plan_from_master_output(text: str) -> str | None:
+    """Extracts the architect's plan from the master claude's final output.
+
+    Returns None when the markers are absent (master ignored instructions, or
+    single-agent run with no plan).
+    """
+    begin = text.find(PLAN_BEGIN_MARKER)
+    end = text.find(PLAN_END_MARKER)
+    if begin == -1 or end == -1 or end <= begin:
+        return None
+    plan = text[begin + len(PLAN_BEGIN_MARKER) : end].strip()
+    return plan or None

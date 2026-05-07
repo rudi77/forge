@@ -17,6 +17,7 @@ from forge_core.events.kinds.generation import (
 )
 from forge_core.events.kinds.guardrail import GuardrailViolationPayload
 from forge_core.events.kinds.mutation import MutationAppliedPayload
+from forge_core.events.kinds.plan import PlanProposedPayload, RiskLevel
 from forge_core.events.kinds.pr import (
     PRCreatedPayload,
     PRMergedPayload,
@@ -41,9 +42,11 @@ __all__ = [
     "PRCreatedPayload",
     "PRMergedPayload",
     "PRRevertedPayload",
+    "PlanProposedPayload",
     "PreflightFailedPayload",
     "ProposalReceivedPayload",
     "ProposalRequestedPayload",
+    "RiskLevel",
     "RunFinishedPayload",
     "RunStartedPayload",
 ]

@@ -155,3 +155,35 @@ def test_reconstruct_started_finished_at(store_and_blobs) -> None:
     assert rec.started_at is not None
     assert rec.finished_at is not None
     assert rec.started_at <= rec.finished_at
+
+
+def test_reconstruct_resolves_plan_md(store_and_blobs) -> None:
+    """Spec v0.3: PlanProposed-Event verweist auf einen Plan-Blob; replay
+    macht ihn als `g.plan_md` verfügbar."""
+    from forge_core.events.kinds.plan import PlanProposedPayload
+
+    store, blobs = store_and_blobs
+    _seed_run(store, blobs)
+
+    # Plan zur bestehenden Generation g1 ergänzen
+    plan_text = "# Plan: refactor xyz\n## Subtasks\n1. foo\n## Risk\nlow\n"
+    plan_hash = blobs.put_text(plan_text)
+    plan_evt = build_event(
+        kind=EventKind.PLAN_PROPOSED,
+        run_id="r1",
+        generation_id="g1",
+        payload=PlanProposedPayload(
+            architect_turns=8,
+            subtask_count=1,
+            risk_level="low",
+        ),
+        artifacts={"plan": plan_hash},
+        **COMMON,
+    )
+    store.append(plan_evt)
+
+    rec = reconstruct_run("r1", store=store, blobs=blobs)
+    g = rec.generations[0]
+    assert g.plan_md is not None
+    assert "refactor xyz" in g.plan_md
+    assert "## Risk" in g.plan_md

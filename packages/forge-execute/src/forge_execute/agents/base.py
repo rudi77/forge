@@ -31,8 +31,12 @@ class ProposalResult:
 
     Der eigentliche Diff wird NICHT vom Agent zurückgegeben, sondern vom
     Runner via `worktrees.diff_against_base()` ermittelt — der Agent editiert
-    Files direkt im Worktree (todos.txt). Hier ist nur der Diff-Text mit
-    aufgenommen, weil der Runner ihn dem Mutator und PR weiterreicht.
+    Files direkt im Worktree. Hier ist nur der Diff-Text mit aufgenommen,
+    weil der Runner ihn dem Mutator und PR weiterreicht.
+
+    `plan_md` ist der Plan-Markdown vom architect-Subagent (Spec v0.3 Teil 6.1)
+    falls der Agent im Multi-Agent-Modus läuft und die Marker im finalen
+    Output gefunden wurden. Sonst None — keine PlanProposed-Emission im Runner.
     """
 
     diff: str
@@ -46,6 +50,7 @@ class ProposalResult:
     duration_ms: int = 0
     raw_response: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    plan_md: str | None = None
 
     @property
     def has_changes(self) -> bool:

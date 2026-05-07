@@ -32,6 +32,7 @@ from forge_execute.agents.base import (
 )
 from forge_execute.agents.templates import (
     ORCHESTRATOR_SYSTEM_PROMPT,
+    extract_plan_from_master_output,
     list_templates,
 )
 from forge_execute.evaluators.command import _kill_tree
@@ -209,6 +210,13 @@ class ClaudeCodeCLIAgent:
         else:
             stop_reason = str(raw.get("stop_reason") or "unknown")
 
+        # Plan-Extraktion: nur im multi_agent-Modus, aus result-Text der
+        # Master-claude-Antwort. Single-agent → kein architect, kein Plan.
+        plan_md: str | None = None
+        if self.multi_agent:
+            result_text = str(raw.get("result") or "")
+            plan_md = extract_plan_from_master_output(result_text)
+
         return ProposalResult(
             diff=diff,
             tokens_in=int(usage.get("input_tokens", 0) or 0),
@@ -221,6 +229,7 @@ class ClaudeCodeCLIAgent:
             duration_ms=duration_ms,
             raw_response=raw,
             error=None if proc.returncode == 0 else f"exit {proc.returncode}, subtype={raw.get('subtype')}",
+            plan_md=plan_md,
         )
 
 

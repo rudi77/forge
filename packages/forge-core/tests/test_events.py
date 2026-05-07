@@ -22,8 +22,9 @@ COMMON = dict(
 )
 
 
-def test_all_16_event_kinds_have_registered_payload_schemas() -> None:
-    assert len(EventKind) == 16
+def test_all_event_kinds_have_registered_payload_schemas() -> None:
+    # Spec v0.3: 16 (v0.2) + PlanProposed = 17 Kinds
+    assert len(EventKind) == 17
     for kind in EventKind:
         assert kind in _PAYLOAD_REGISTRY, f"missing schema for {kind}"
 

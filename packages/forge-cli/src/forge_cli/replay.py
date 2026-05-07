@@ -101,6 +101,12 @@ def _render_timeline(rec, *, show_artifacts: bool) -> str:
             lines.append("")
 
         if show_artifacts:
+            # Plan zuerst (chronologisch + konzeptionell vor Prompt/Diff)
+            if g.plan_md:
+                lines.append("**plan (from architect subagent):**")
+                lines.append("")
+                lines.append(_truncate(g.plan_md, 6000))
+                lines.append("")
             if g.proposal_prompt:
                 lines.append("**prompt:**")
                 lines.append("")

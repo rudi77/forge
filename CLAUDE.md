@@ -118,6 +118,28 @@ Nutze `GitIgnoreSpec.from_lines(...)` (modern API), nicht `PathSpec.from_lines(G
 
 Windows-Default. Ignorieren. Wenn du sie wirklich loswerden willst: `git config core.autocrlf false`. Inhalte bleiben identisch.
 
+### Auto-Merge ist Spec-Grauzone, nicht Spec-Bruch
+
+`forge board-loop --auto-merge` und `forge run --auto-merge` rufen
+`gh pr merge --auto --squash --delete-branch` auf. Das **queued** den
+Merge bei GitHub — der eigentliche Merge passiert server-seitig, von
+GitHubs Bots, asynchron, sobald alle required Checks grün sind. forge
+selbst führt **keinen** synchronen `merge`-Subprozess aus.
+
+Das ist die erlaubte Lesart der `merge_pr`-Capability (typed
+`Literal[False]`): die Capability verbietet, dass forge selbst mergt
+(forge ruft nicht `gh pr merge <N>` ohne `--auto` auf). GitHub mergt
+auf Operator-Anfrage hin, nicht auf forge-Anfrage. Gleiche Logik wie
+`release.on_main_green: auto_tag` — Tagging ist erlaubt (kein Code-
+Change), und Auto-Merge ist erlaubt-via-GitHub-Feature, nicht erlaubt-
+via-forge-Subprozess.
+
+Wenn du das nicht willst: einfach `--auto-merge` weglassen. PR wird
+geöffnet, Operator mergt manuell. Default-Verhalten bleibt **kein**
+Auto-Merge — der Flag ist explizit opt-in pro Aufruf.
+
+Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
+
 ## Event-Schema — Achtung, irreversibel
 
 `payload_schema_version` ist **pro Kind** versioniert (Spec Teil 4.1). Wenn du ein bestehendes Sub-Schema änderst:

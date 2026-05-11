@@ -224,3 +224,85 @@ def test_invalid_agent_name_rejected() -> None:
     }
     with pytest.raises((ValueError, SpecValidationError)):
         ProjectSpec.model_validate(d)
+
+
+# --- BoardConfig (v0.4) ------------------------------------------------
+
+
+def test_board_config_optional_default_none() -> None:
+    """Spec ohne board: bleibt None — kein Default ohne Operator-opt-in."""
+    spec = ProjectSpec.model_validate(_minimal_spec_dict())
+    assert spec.board is None
+
+
+def test_board_config_minimal_valid() -> None:
+    d = _minimal_spec_dict()
+    d["board"] = {"owner": "rudi77", "project_number": 3}
+    spec = ProjectSpec.model_validate(d)
+    assert spec.board is not None
+    assert spec.board.provider == "github"
+    assert spec.board.owner == "rudi77"
+    assert spec.board.project_number == 3
+    assert spec.board.filter_status == "Todo"
+    assert spec.board.filter_labels == ["bug"]
+    assert spec.board.default_focus_template == "issue-{number}"
+    assert spec.board.default_template_id == "board_loop_v1"
+
+
+def test_board_config_full_overrides() -> None:
+    d = _minimal_spec_dict()
+    d["board"] = {
+        "owner": "acme",
+        "project_number": 7,
+        "filter_status": "In Progress",
+        "filter_labels": ["bug", "ready"],
+        "default_focus_template": "fix-{number}",
+        "default_template_id": "auto_v2",
+    }
+    spec = ProjectSpec.model_validate(d)
+    assert spec.board is not None
+    assert spec.board.filter_status == "In Progress"
+    assert spec.board.filter_labels == ["bug", "ready"]
+    assert spec.board.default_focus_template == "fix-{number}"
+    assert spec.board.default_template_id == "auto_v2"
+
+
+def test_board_config_project_number_must_be_positive() -> None:
+    d = _minimal_spec_dict()
+    d["board"] = {"owner": "rudi77", "project_number": 0}
+    with pytest.raises((ValueError, SpecValidationError)):
+        ProjectSpec.model_validate(d)
+
+
+def test_board_config_owner_must_be_non_empty() -> None:
+    d = _minimal_spec_dict()
+    d["board"] = {"owner": "", "project_number": 3}
+    with pytest.raises((ValueError, SpecValidationError)):
+        ProjectSpec.model_validate(d)
+
+
+def test_board_config_unknown_provider_rejected() -> None:
+    d = _minimal_spec_dict()
+    d["board"] = {"provider": "gitlab", "owner": "rudi77", "project_number": 3}
+    with pytest.raises((ValueError, SpecValidationError)):
+        ProjectSpec.model_validate(d)
+
+
+def test_board_config_extra_field_rejected() -> None:
+    d = _minimal_spec_dict()
+    d["board"] = {
+        "owner": "rudi77",
+        "project_number": 3,
+        "magic_field": "boom",  # extra="forbid"
+    }
+    with pytest.raises((ValueError, SpecValidationError)):
+        ProjectSpec.model_validate(d)
+
+
+def test_board_config_empty_filter_labels_allowed() -> None:
+    """Leere Label-Liste = AND-trivial = alle Labels akzeptiert. Bewusst erlaubt."""
+    d = _minimal_spec_dict()
+    d["board"] = {"owner": "rudi77", "project_number": 3, "filter_labels": []}
+    spec = ProjectSpec.model_validate(d)
+    assert spec.board is not None
+    assert spec.board.filter_labels == []

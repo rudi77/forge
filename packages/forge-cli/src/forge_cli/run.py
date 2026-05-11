@@ -4,21 +4,47 @@ Drei Eingabe-Modi für den Prompt:
   --prompt-file <path>   — wörtlicher Prompt-Text
   --prompt <string>      — Prompt direkt auf der CLI
   (default)              — generischer Template-Prompt aus focus
+
+Der Body von ``run_command`` ist in :func:`execute_run` extrahiert, damit
+``forge board-loop`` denselben Pfad ohne Typer-Layer wiederverwendet.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
 import typer
-from forge_adapters.github import GitHubError, create_pr_for_run, render_pr_body
+from forge_adapters.github import (
+    GitHubError,
+    create_pr_for_run,
+    queue_auto_merge,
+    render_pr_body,
+)
 from forge_execute.agents import ClaudeCodeCLIAgent, MockCodingAgent
-from forge_execute.runner import RunConfig, SequentialRunner
+from forge_execute.runner import RunConfig, RunResult, SequentialRunner
 from rich.panel import Panel
 from rich.table import Table
 
-from forge_cli.runtime import ContextError, console, err_console, load_context
+from forge_cli.runtime import ContextError, ForgeContext, console, err_console, load_context
+
+
+@dataclass
+class RunOutcome:
+    """Strukturiertes Ergebnis eines Run-Aufrufs für Caller wie board-loop.
+
+    Kapselt das, was die alte ``run_command``-Funktion früher inline
+    zusammensuchte: Runner-Ergebnis, PR-Outcome (URL oder Fehlermeldung)
+    und Auto-Merge-Status (wenn aktiviert).
+    """
+
+    result: RunResult
+    pr_url: str | None = None
+    pr_number: int | None = None
+    pr_error: str | None = None
+    auto_merge_queued: bool = False
+    auto_merge_error: str | None = None
 
 
 def run_command(
@@ -121,6 +147,20 @@ def run_command(
             ),
         ),
     ] = False,
+    auto_merge: Annotated[
+        bool,
+        typer.Option(
+            "--auto-merge",
+            help=(
+                "Nach `gh pr create` GitHubs Auto-Merge aktivieren "
+                "(`gh pr merge --auto --squash --delete-branch`). "
+                "Benötigt --create-pr. Repo muss in Settings → 'Allow "
+                "auto-merge' das Feature aktiviert haben. forge selbst "
+                "merged nichts — GitHub merged server-seitig wenn "
+                "alle required Checks grün sind."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Implementierung von `forge run`."""
     try:
@@ -136,19 +176,99 @@ def run_command(
         )
         raise typer.Exit(code=2)
 
-    rendered_prompt = _resolve_prompt(prompt, prompt_file, focus, ctx.spec.name)
+    if auto_merge and not create_pr:
+        err_console.print(
+            "[red]error[/red]: --auto-merge requires --create-pr"
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        rendered_prompt = _resolve_prompt(prompt, prompt_file, focus, ctx.spec.name)
+    except typer.BadParameter as exc:
+        err_console.print(f"[red]error[/red]: {exc}")
+        raise typer.Exit(code=2) from None
+
     if rendered_prompt is None:
         err_console.print(
             "[red]error[/red]: provide --prompt, --prompt-file, or --focus to render a default prompt"
         )
         raise typer.Exit(code=2)
 
+    outcome = execute_run(
+        ctx=ctx,
+        rendered_prompt=rendered_prompt,
+        prompt_template_id=prompt_template_id,
+        trigger=trigger,
+        focus=focus,
+        base_ref=base_ref,
+        max_iterations=max_iterations,
+        max_turns=max_turns,
+        eval_suite=eval_suite,
+        model=model,
+        issue_number=issue_number,
+        pr_number=pr_number,
+        dry_run=dry_run,
+        claude_bin=claude_bin,
+        multi_agent=multi_agent,
+        create_pr=create_pr,
+        pr_base=pr_base,
+        extra_labels=pr_label or [],
+        pr_draft=pr_draft,
+        auto_merge=auto_merge,
+        announce=True,
+    )
+
+    _print_post_run_summary(outcome)
+
+    # Exit-Code: 0 wenn ein PR-würdiger Stand entstand, 1 sonst.
+    raise typer.Exit(code=0 if outcome.result.decision == "pr_created" else 1)
+
+
+# --- Pure-Python entry point (no Typer) -------------------------------
+
+
+def execute_run(
+    *,
+    ctx: ForgeContext,
+    rendered_prompt: str,
+    prompt_template_id: str,
+    trigger: str,
+    focus: str | None,
+    base_ref: str,
+    max_iterations: int,
+    max_turns: int,
+    eval_suite: str,
+    model: str | None,
+    issue_number: int | None,
+    pr_number: int | None,
+    dry_run: bool,
+    claude_bin: str,
+    multi_agent: bool,
+    create_pr: bool,
+    pr_base: str,
+    extra_labels: list[str],
+    pr_draft: bool,
+    auto_merge: bool,
+    announce: bool = False,
+) -> RunOutcome:
+    """Wie ``run_command``, aber ohne Typer-Layer und mit RunOutcome-Return.
+
+    Wird sowohl von ``run_command`` als auch von ``board_loop_command``
+    benutzt. ``announce=True`` lässt die Pre-Run-Summary auf der Konsole
+    erscheinen; im board-loop-Kontext ist das stiller (False), weil
+    board_loop seine eigene Tabelle pro Iteration druckt.
+    """
     if dry_run:
-        console.print("[yellow]dry-run[/yellow]: using MockCodingAgent (no Claude calls)")
+        if announce:
+            console.print(
+                "[yellow]dry-run[/yellow]: using MockCodingAgent (no Claude calls)"
+            )
         agent = MockCodingAgent(callable_=lambda wt, prompt: None)
     else:
-        if multi_agent:
-            console.print("[cyan]multi-agent[/cyan]: architect -> developer -> tester via Claude Code subagents")
+        if multi_agent and announce:
+            console.print(
+                "[cyan]multi-agent[/cyan]: architect -> developer -> tester via Claude Code subagents"
+            )
         agent = ClaudeCodeCLIAgent(
             claude_bin=claude_bin,
             default_model=model,
@@ -174,32 +294,38 @@ def run_command(
         pr_number=pr_number,
     )
 
-    _print_pre_run_summary(config, ctx)
+    if announce:
+        _print_pre_run_summary(config, ctx)
 
     store = ctx.open_store()
     blobs = ctx.open_blobs()
-    pr_outcome: str | None = None
+    outcome = RunOutcome(result=None)  # type: ignore[arg-type]
     try:
         runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
-        result = runner.run()
+        outcome.result = runner.run()
 
-        if create_pr and result.decision == "pr_created":
-            pr_outcome = _create_pr_for_result(
+        if create_pr and outcome.result.decision == "pr_created":
+            _create_pr_into_outcome(
                 ctx=ctx,
                 config=config,
-                result=result,
+                result=outcome.result,
                 pr_base=pr_base,
-                extra_labels=pr_label or [],
+                extra_labels=extra_labels,
                 draft=pr_draft,
                 store=store,
+                outcome=outcome,
             )
+
+            if auto_merge and outcome.pr_number is not None:
+                try:
+                    queue_auto_merge(repo=ctx.repo_root, pr_number=outcome.pr_number)
+                    outcome.auto_merge_queued = True
+                except GitHubError as exc:
+                    outcome.auto_merge_error = str(exc)
     finally:
         store.close()
 
-    _print_post_run_summary(result, pr_outcome=pr_outcome)
-
-    # Exit-Code: 0 wenn ein PR-würdiger Stand entstand, 1 sonst.
-    raise typer.Exit(code=0 if result.decision == "pr_created" else 1)
+    return outcome
 
 
 # --- Helpers ----------------------------------------------------------
@@ -266,7 +392,7 @@ def _print_pre_run_summary(config: RunConfig, ctx) -> None:
     table.add_row("[bold]project[/bold]", config.project)
     table.add_row("[bold]factory[/bold]", ctx.factory_version)
     table.add_row("[bold]trigger[/bold]", config.trigger)
-    table.add_row("[bold]focus[/bold]", config.focus or "—")
+    table.add_row("[bold]focus[/bold]", config.focus or "-")
     table.add_row("[bold]eval_suite[/bold]", config.eval_suite)
     table.add_row("[bold]max_iter[/bold]", str(config.max_iterations))
     table.add_row("[bold]base_ref[/bold]", config.base_ref)
@@ -275,17 +401,23 @@ def _print_pre_run_summary(config: RunConfig, ctx) -> None:
     console.print(Panel(table, title="forge run", border_style="cyan"))
 
 
-def _create_pr_for_result(
+def _create_pr_into_outcome(
     *,
-    ctx,
-    config,
-    result,
+    ctx: ForgeContext,
+    config: RunConfig,
+    result: RunResult,
     pr_base: str,
     extra_labels: list[str],
     draft: bool,
     store,
-) -> str:
-    """Pusht den Run-Branch und erzeugt einen PR. Liefert URL oder Fehlermeldung."""
+    outcome: RunOutcome,
+) -> None:
+    """Pusht den Run-Branch + erzeugt PR; schreibt URL/Number/Error in ``outcome``.
+
+    Ersetzt das ältere ``_create_pr_for_result``-Helper, das nur einen
+    String zurückgab. Der ``RunOutcome``-basierte Pfad lässt sich von
+    ``board_loop`` mitbenutzen.
+    """
     files_changed = []
     if result.final_diff:
         from forge_execute.mutators.code import extract_changed_paths
@@ -306,7 +438,7 @@ def _create_pr_for_result(
     )
     labels = ["forge:auto", *extra_labels]
     try:
-        outcome = create_pr_for_run(
+        pr = create_pr_for_run(
             repo=ctx.repo_root,
             branch=result.branch,
             title=title,
@@ -322,8 +454,10 @@ def _create_pr_for_result(
             spec_version=ctx.spec.spec_version,
         )
     except GitHubError as exc:
-        return f"PR creation failed: {exc}"
-    return outcome.url
+        outcome.pr_error = f"PR creation failed: {exc}"
+        return
+    outcome.pr_url = pr.url
+    outcome.pr_number = pr.pr_number
 
 
 def _format_pr_title(focus: str | None, score_delta: float | None) -> str:
@@ -336,7 +470,8 @@ def _format_pr_title(focus: str | None, score_delta: float | None) -> str:
     return f"forge: {focus_part} ({delta_part})"
 
 
-def _print_post_run_summary(result, *, pr_outcome: str | None = None) -> None:
+def _print_post_run_summary(outcome: RunOutcome) -> None:
+    result = outcome.result
     color = {
         "pr_created": "green",
         "no_improvement": "yellow",
@@ -360,6 +495,14 @@ def _print_post_run_summary(result, *, pr_outcome: str | None = None) -> None:
         table.add_row("[bold]branch[/bold]", result.branch)
     if result.final_commit:
         table.add_row("[bold]commit[/bold]", result.final_commit[:12])
-    if pr_outcome:
-        table.add_row("[bold]PR[/bold]", pr_outcome)
+    if outcome.pr_url:
+        table.add_row("[bold]PR[/bold]", outcome.pr_url)
+    if outcome.pr_error:
+        table.add_row("[bold]PR error[/bold]", f"[red]{outcome.pr_error}[/red]")
+    if outcome.auto_merge_queued:
+        table.add_row("[bold]auto-merge[/bold]", "[green]queued[/green]")
+    if outcome.auto_merge_error:
+        table.add_row(
+            "[bold]auto-merge error[/bold]", f"[red]{outcome.auto_merge_error}[/red]"
+        )
     console.print(Panel(table, title="run summary", border_style=color))

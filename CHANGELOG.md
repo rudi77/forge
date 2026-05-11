@@ -2,6 +2,72 @@
 
 Alle bemerkenswerten Änderungen an forge werden hier dokumentiert. Format: [Keep a Changelog](https://keepachangelog.com/), Versionierung: [SemVer](https://semver.org/).
 
+## [Unreleased] — v0.4: Board-driven Trigger Source
+
+261 Tests grün, ruff clean.
+
+### Hinzugefügt
+
+#### `forge board-loop` — aktive Board-Trigger-Quelle
+
+- **`forge board-loop`** — neuer CLI-Command in `forge-cli`. Pollt ein
+  GitHub Project, filtert ready-Items (Status + Labels + Idempotenz),
+  dispatched bis zu N Issues sequenziell durch die unveränderte 5-Phasen-
+  Pipeline. Stoppt bei Backlog-leer, max-Limit oder hartem Run-Abort.
+  Optionen: `--max N`, `--dry-run`, `--auto-merge`, `--issue 42 43`
+  (override), `--multi-agent`, `--max-iterations`, `--max-turns`.
+- **`BoardConfig`** in `forge-core/spec.py` — optionaler `board:`-Block
+  in `project.yaml`. Felder: `provider`, `owner`, `project_number`,
+  `filter_status`, `filter_labels`, `default_focus_template`,
+  `default_template_id`. Strict-validated, additiv (kein Breaking
+  Change auf bestehende Specs).
+- **`forge_adapters.github.board`** — `list_ready_items`, `ReadyIssue`,
+  `wrap_issue_body`, `BoardError`. Wrappt `gh project item-list` +
+  `gh pr list`-Idempotenz-Check (kein Re-Dispatch bei offenem
+  ``Closes #N``-PR). subprocess-DI für Tests.
+
+#### Auto-Merge — Spec-konforme Grauzone
+
+- **`queue_auto_merge`** in `forge_adapters.github.pr` — ruft
+  `gh pr merge --auto --squash --delete-branch` auf, sodass GitHub
+  **server-seitig** mergt sobald required Checks grün sind. forge
+  selbst führt **keinen** synchronen `merge`-Subprozess aus — die
+  ``merge_pr``-Capability bleibt typed ``Literal[False]``. Vor dem
+  ersten Aufruf ``repo_supports_auto_merge``-Probe via
+  ``gh repo view --json autoMergeAllowed`` mit klarer Remediation-
+  Meldung wenn das Feature im Repo aus ist.
+- **`forge run --auto-merge`** — neues Flag, durchgereicht zum PR-
+  Erzeugungs-Pfad.
+- **`forge board-loop --auto-merge`** — pro dispatched PR.
+
+#### Refactoring
+
+- `forge_cli.run.execute_run` — Body von `run_command` extrahiert
+  als pure-Python-Funktion mit `RunOutcome`-Return. `board-loop`
+  benutzt sie ohne Typer-Layer-Duplikation. Bestehende `forge run`-
+  CLI-Semantik unverändert.
+- `forge_cli.run.RunOutcome` — neues Dataclass kapselt
+  ``RunResult`` + PR-URL/Number/Error + Auto-Merge-Status.
+
+#### Tests
+
+- **39 neue Tests** (222 → 261): `test_spec.py` +8 (BoardConfig),
+  `test_board.py` +14 (Filter, Idempotenz, Error-Paths, wrap_issue_body),
+  `test_pr.py` +7 (queue_auto_merge, repo_supports_auto_merge),
+  `test_cli.py` +8 (board-loop dry-run, --auto-merge guards,
+  remote-URL-Parser, "Backlog leer").
+
+### Boundaries — was bewusst NICHT geändert wurde
+
+- Die 5-Phasen-Pipeline (Propose → Mutate → Preflight → Eval → Decide)
+  bleibt 1:1 unverändert. `board-loop` ist reine Orchestrations-Schicht
+  darüber, nicht Loop-Logik.
+- Capabilities (``merge_pr``, ``push_to_main``, ``push_force``) bleiben
+  typed ``Literal[False]``.
+- Score-Logic, Gates, Decision, alle 16 EventKinds: unangetastet.
+- Self-Modification (Prinzip 3) bleibt verboten — `board-loop` fasst
+  nichts in `forge/` an, nur in den Target-Repos.
+
 ## [Unreleased] — M1 in progress
 
 163 Tests grün, ruff clean. Loop-1-Kernpfad funktioniert End-to-End:

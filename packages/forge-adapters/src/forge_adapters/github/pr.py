@@ -8,14 +8,24 @@ auf. Die Funktion:
    Run-Summary)
 3. Ruft `gh pr create` mit Title, Body, Labels
 4. Schreibt einen `PRCreated`-Event in den Store
+
+Optional kann der Caller anschließend ``queue_auto_merge()`` aufrufen,
+um GitHubs **server-seitiges** Auto-Merge für den frisch erzeugten PR
+zu aktivieren. Wichtig: forge führt selbst keinen ``merge``-Subprozess
+aus — die ``merge_pr``-Capability bleibt typed ``Literal[False]``. Wir
+ziehen GitHubs Auto-Merge-Server-Feature an; den eigentlichen Merge
+macht GitHub, nicht forge. Damit bleibt der Spec-Vertrag formal intakt.
+Operatoren, die das nicht wollen, lassen ``--auto-merge`` weg.
 """
 
 from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from forge_core.events import (
     EventKind,
@@ -23,6 +33,9 @@ from forge_core.events import (
     build_event,
 )
 from forge_core.store import EventStore
+
+# Injizierbar für Tests; produktiv ``subprocess.run``.
+SubprocessRunner = Callable[..., subprocess.CompletedProcess]
 
 
 class GitHubError(RuntimeError):
@@ -239,3 +252,145 @@ def gh_repo_default_branch(*, repo: Path, gh_bin: str = "gh") -> str:
     if result.returncode != 0:
         raise GitHubError(f"gh repo view failed: {result.stderr.strip()}")
     return result.stdout.strip() or "main"
+
+
+# --- Auto-Merge (Spec-Grauzone, dokumentiert) ---------------------------
+
+
+MergeMethod = Literal["squash", "merge", "rebase"]
+
+
+def repo_supports_auto_merge(
+    *,
+    repo: Path,
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> bool:
+    """Prüft via GraphQL, ob das Repo GitHubs Auto-Merge-Feature aktiviert hat.
+
+    Achtung: ``gh repo view --json`` exposed ``autoMergeAllowed``
+    NICHT (Stand gh 2.x); das Feld lebt nur in der GraphQL-API.
+    Daher gehen wir direkt über ``gh api graphql``. Der Owner/Repo wird
+    via ``gh repo view --json nameWithOwner`` ermittelt, damit wir nicht
+    auf den Git-Remote-Parser angewiesen sind.
+
+    Wird vor dem ersten ``queue_auto_merge``-Aufruf gerufen, damit ein
+    Repo ohne aktiviertes Feature nicht mit kryptischer ``gh pr merge
+    --auto``-Fehlermeldung crasht. Returns ``False`` wenn das Feature
+    aus ist (Operator muss in Settings → General → "Allow auto-merge"
+    einschalten); raised ``GitHubError`` bei gh-Fehlern.
+    """
+    slug_result = run_subprocess(
+        [gh_bin, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if slug_result.returncode != 0:
+        raise GitHubError(
+            f"gh repo view --json nameWithOwner failed (exit "
+            f"{slug_result.returncode}): "
+            f"{slug_result.stderr.strip() or '<no stderr>'}"
+        )
+    slug = slug_result.stdout.strip()
+    if "/" not in slug:
+        raise GitHubError(
+            f"unexpected nameWithOwner shape: {slug!r}"
+        )
+    owner, name = slug.split("/", 1)
+
+    query = (
+        "query($owner: String!, $name: String!) { "
+        "repository(owner: $owner, name: $name) { autoMergeAllowed } }"
+    )
+    cmd = [
+        gh_bin, "api", "graphql",
+        "-f", f"query={query}",
+        "-F", f"owner={owner}",
+        "-F", f"name={name}",
+        "--jq", ".data.repository.autoMergeAllowed",
+    ]
+    result = run_subprocess(
+        cmd,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise GitHubError(
+            f"gh api graphql autoMergeAllowed failed (exit "
+            f"{result.returncode}): {result.stderr.strip() or '<no stderr>'}"
+        )
+    return result.stdout.strip().lower() == "true"
+
+
+def queue_auto_merge(
+    *,
+    repo: Path,
+    pr_number: int,
+    method: MergeMethod = "squash",
+    delete_branch: bool = True,
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> None:
+    """Aktiviert GitHubs server-seitiges Auto-Merge für den PR.
+
+    forge führt **nicht** selbst ``gh pr merge <N>`` synchron aus — das
+    würde die ``merge_pr``-Capability (typed ``Literal[False]``)
+    verletzen. Stattdessen queuen wir den Merge: ``gh pr merge --auto``
+    sagt GitHub "merge automatisch sobald alle required Checks grün
+    sind". Der Merge passiert server-seitig, asynchron, von GitHubs
+    Bots — nicht von forge.
+
+    Args:
+        repo: Repository-Pfad (cwd für gh).
+        pr_number: PR-Nummer aus ``create_pr_for_run`` Result.
+        method: Squash (default) / merge / rebase.
+        delete_branch: ``--delete-branch`` an gh durchreichen.
+        gh_bin: gh-Binary-Pfad.
+        run_subprocess: Injektabel für Tests.
+
+    Raises:
+        GitHubError: Wenn das Repo Auto-Merge nicht aktiviert hat oder
+            der gh-Aufruf scheitert. Der Caller bricht in diesem Fall
+            sauber ab; der PR bleibt offen für manuelles Mergen.
+    """
+    if not repo_supports_auto_merge(
+        repo=repo, gh_bin=gh_bin, run_subprocess=run_subprocess
+    ):
+        raise GitHubError(
+            "Repository has auto-merge disabled. Enable in Settings → "
+            "General → 'Allow auto-merge', or run without --auto-merge."
+        )
+
+    method_flag = {
+        "squash": "--squash",
+        "merge": "--merge",
+        "rebase": "--rebase",
+    }[method]
+
+    cmd = [
+        gh_bin, "pr", "merge", str(pr_number),
+        "--auto",
+        method_flag,
+    ]
+    if delete_branch:
+        cmd.append("--delete-branch")
+
+    result = run_subprocess(
+        cmd,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise GitHubError(
+            f"gh pr merge --auto failed (exit {result.returncode}): "
+            f"{result.stderr.strip() or '<no stderr>'}"
+        )

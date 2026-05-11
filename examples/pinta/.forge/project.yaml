@@ -203,3 +203,18 @@ release:
   conventional_commits: true
   on_main_green: "off"     # Tag erst, wenn die ersten 5 Auto-PRs sauber durch sind
   changelog: "CHANGELOG.md"
+
+# === BOARD (v0.4 — `forge board-loop`) ===
+# Optionaler Block. Wenn gesetzt: `forge board-loop` zieht aktiv ready-
+# Items vom GitHub Project und dispatcht sie als reguläre issue_label-
+# Trigger durch die unveränderte 5-Phasen-Pipeline. PINTA hat (noch)
+# kein Project — Block bleibt auskommentiert als Referenz.
+#
+# board:
+#   provider: github           # nur "github" in v1
+#   owner: rudi77              # Project-Owner (User oder Org)
+#   project_number: 4          # aus `gh project list --owner rudi77`
+#   filter_status: "Todo"      # Status-Field-Wert für ready
+#   filter_labels: ["bug"]     # AND — Issue muss alle Labels tragen
+#   default_focus_template: "issue-{number}"
+#   default_template_id: "board_loop_v1"

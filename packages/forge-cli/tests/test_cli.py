@@ -232,6 +232,25 @@ def test_run_replay_after_dry_run(mini_repo: Path, monkeypatch) -> None:
     assert "RunFinished" in replay.stdout
 
 
+def test_run_auto_merge_requires_create_pr(mini_repo: Path, monkeypatch) -> None:
+    """``--auto-merge`` ohne ``--create-pr`` muss früh abbrechen statt fail-late."""
+    monkeypatch.chdir(mini_repo)
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--dry-run",
+            "--focus",
+            "x",
+            "--max-iterations",
+            "1",
+            "--auto-merge",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "auto-merge" in result.output.lower() or "create-pr" in result.output.lower()
+
+
 def test_run_invalid_trigger(mini_repo: Path, monkeypatch) -> None:
     monkeypatch.chdir(mini_repo)
     result = runner.invoke(
@@ -257,3 +276,119 @@ def test_run_requires_prompt_or_focus(mini_repo: Path, monkeypatch) -> None:
         app, ["run", "--dry-run", "--max-iterations", "1"]
     )
     assert result.exit_code == 2
+
+
+# --- forge board-loop --------------------------------------------------
+
+
+def test_board_loop_help_works() -> None:
+    result = runner.invoke(app, ["board-loop", "--help"])
+    assert result.exit_code == 0
+    assert "board" in result.stdout.lower()
+    assert "--auto-merge" in result.stdout
+    assert "--max" in result.stdout
+
+
+def test_board_loop_errors_without_board_block(mini_repo: Path, monkeypatch) -> None:
+    """mini_repo hat keinen `board:`-Block — board-loop muss klar abbrechen."""
+    # Origin-Remote dazu, damit _detect_repo_slug funktioniert (sonst
+    # bricht es davor ab).
+    _git(mini_repo, "remote", "add", "origin", "https://github.com/rudi77/test.git")
+    monkeypatch.chdir(mini_repo)
+    result = runner.invoke(app, ["board-loop", "--max", "1"])
+    assert result.exit_code == 2
+    assert "board" in result.output.lower()
+
+
+def test_detect_repo_slug_https() -> None:
+    from forge_cli.board_loop import _REMOTE_RE
+    m = _REMOTE_RE.search("https://github.com/rudi77/pytaskforce.git")
+    assert m is not None
+    assert m.group("owner") == "rudi77"
+    assert m.group("repo") == "pytaskforce"
+
+
+def test_detect_repo_slug_ssh() -> None:
+    from forge_cli.board_loop import _REMOTE_RE
+    m = _REMOTE_RE.search("git@github.com:rudi77/pytaskforce.git")
+    assert m is not None
+    assert m.group("owner") == "rudi77"
+    assert m.group("repo") == "pytaskforce"
+
+
+def test_detect_repo_slug_https_no_dotgit() -> None:
+    from forge_cli.board_loop import _REMOTE_RE
+    m = _REMOTE_RE.search("https://github.com/rudi77/pytaskforce")
+    assert m is not None
+    assert m.group("repo") == "pytaskforce"
+
+
+def test_board_loop_backlog_empty_message(
+    mini_repo: Path, monkeypatch
+) -> None:
+    """Wenn list_ready_items leere Liste liefert, sagt board-loop sauber
+    'Backlog leer' und exit 0."""
+    # spec mit board: erweitern
+    spec_path = mini_repo / ".forge" / "project.yaml"
+    spec_path.write_text(
+        spec_path.read_text(encoding="utf-8")
+        + "\nboard:\n  owner: rudi77\n  project_number: 999\n",
+        encoding="utf-8",
+    )
+    _git(mini_repo, "add", ".")
+    _git(mini_repo, "commit", "-m", "add board")
+    _git(mini_repo, "remote", "add", "origin", "https://github.com/rudi77/test.git")
+
+    # Patch list_ready_items global, damit kein gh aufgerufen wird.
+    import forge_cli.board_loop as bl
+
+    monkeypatch.setattr(bl, "list_ready_items", lambda *a, **kw: [])
+    monkeypatch.chdir(mini_repo)
+
+    result = runner.invoke(app, ["board-loop", "--max", "1"])
+    assert result.exit_code == 0
+    assert "leer" in result.output.lower() or "no ready" in result.output.lower()
+
+
+def test_board_loop_dry_run_lists_items(mini_repo: Path, monkeypatch) -> None:
+    """Dry-run druckt die Tabelle und beendet mit Exit 0, ohne irgendeinen
+    Run zu starten."""
+    spec_path = mini_repo / ".forge" / "project.yaml"
+    spec_path.write_text(
+        spec_path.read_text(encoding="utf-8")
+        + "\nboard:\n  owner: rudi77\n  project_number: 999\n",
+        encoding="utf-8",
+    )
+    _git(mini_repo, "add", ".")
+    _git(mini_repo, "commit", "-m", "add board")
+    _git(mini_repo, "remote", "add", "origin", "https://github.com/rudi77/test.git")
+
+    from forge_adapters.github.board import ReadyIssue
+
+    fake_items = [
+        ReadyIssue(
+            number=42,
+            title="Bug X",
+            body="repro",
+            labels=["bug"],
+            project_status="Todo",
+            url="https://github.com/rudi77/test/issues/42",
+        )
+    ]
+    import forge_cli.board_loop as bl
+
+    monkeypatch.setattr(bl, "list_ready_items", lambda *a, **kw: fake_items)
+
+    # Dispatch-Pfad muss NICHT aufgerufen werden — execute_run patchen
+    # damit ein Test-Bypass-Crash sichtbar würde, falls der Code es doch
+    # aufruft.
+    def _should_not_be_called(**kwargs):
+        raise AssertionError("execute_run was called during dry-run")
+
+    monkeypatch.setattr(bl, "execute_run", _should_not_be_called)
+    monkeypatch.chdir(mini_repo)
+
+    result = runner.invoke(app, ["board-loop", "--dry-run", "--max", "5"])
+    assert result.exit_code == 0
+    assert "42" in result.output
+    assert "Bug X" in result.output

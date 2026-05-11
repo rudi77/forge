@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import subprocess
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from forge_adapters.github.pr import (
     GitHubError,
     _extract_pr_number,
+    queue_auto_merge,
     render_pr_body,
+    repo_supports_auto_merge,
 )
 
 
@@ -94,3 +98,120 @@ def test_extract_pr_number_from_url() -> None:
 def test_extract_pr_number_invalid() -> None:
     with pytest.raises(GitHubError):
         _extract_pr_number("no number here")
+
+
+# --- queue_auto_merge --------------------------------------------------
+
+
+def _ok(stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=stdout, stderr=stderr
+    )
+
+
+def _fail(stderr: str, code: int = 1) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        args=[], returncode=code, stdout="", stderr=stderr
+    )
+
+
+def _stub_runner(*responses: subprocess.CompletedProcess):
+    iterator = iter(responses)
+    calls: list[list[str]] = []
+
+    def runner(cmd, **kwargs):
+        calls.append(list(cmd))
+        return next(iterator)
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+def test_repo_supports_auto_merge_true(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(stdout="rudi77/pinta\n"),  # nameWithOwner lookup
+        _ok(stdout="true\n"),  # graphql autoMergeAllowed
+    )
+    assert (
+        repo_supports_auto_merge(repo=tmp_path, run_subprocess=runner) is True
+    )
+    # Verify GraphQL flow used
+    assert "graphql" in runner.calls[1]  # type: ignore[attr-defined]
+
+
+def test_repo_supports_auto_merge_false(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(stdout="rudi77/pinta\n"),
+        _ok(stdout="false\n"),
+    )
+    assert (
+        repo_supports_auto_merge(repo=tmp_path, run_subprocess=runner) is False
+    )
+
+
+def test_repo_supports_auto_merge_slug_lookup_failure_raises(tmp_path: Path) -> None:
+    runner = _stub_runner(_fail("HTTP 401: Bad credentials"))
+    with pytest.raises(GitHubError, match="nameWithOwner failed"):
+        repo_supports_auto_merge(repo=tmp_path, run_subprocess=runner)
+
+
+def test_repo_supports_auto_merge_graphql_failure_raises(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(stdout="rudi77/pinta\n"),
+        _fail("rate limit exceeded"),
+    )
+    with pytest.raises(GitHubError, match="autoMergeAllowed failed"):
+        repo_supports_auto_merge(repo=tmp_path, run_subprocess=runner)
+
+
+def test_queue_auto_merge_happy_path_squash(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(stdout="rudi77/pinta\n"),  # nameWithOwner
+        _ok(stdout="true\n"),           # graphql autoMergeAllowed
+        _ok(),                           # gh pr merge --auto --squash --delete-branch
+    )
+    queue_auto_merge(repo=tmp_path, pr_number=42, run_subprocess=runner)
+
+    merge_cmd = runner.calls[2]  # type: ignore[attr-defined]
+    assert "merge" in merge_cmd
+    assert "42" in merge_cmd
+    assert "--auto" in merge_cmd
+    assert "--squash" in merge_cmd
+    assert "--delete-branch" in merge_cmd
+
+
+def test_queue_auto_merge_supports_method_override(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(stdout="rudi77/pinta\n"),
+        _ok(stdout="true\n"),
+        _ok(),
+    )
+    queue_auto_merge(
+        repo=tmp_path,
+        pr_number=7,
+        method="rebase",
+        delete_branch=False,
+        run_subprocess=runner,
+    )
+    merge_cmd = runner.calls[2]  # type: ignore[attr-defined]
+    assert "--rebase" in merge_cmd
+    assert "--delete-branch" not in merge_cmd
+
+
+def test_queue_auto_merge_raises_when_feature_disabled(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(stdout="rudi77/pinta\n"),
+        _ok(stdout="false\n"),
+    )
+    with pytest.raises(GitHubError, match="auto-merge disabled"):
+        queue_auto_merge(repo=tmp_path, pr_number=42, run_subprocess=runner)
+
+
+def test_queue_auto_merge_raises_on_gh_merge_failure(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(stdout="rudi77/pinta\n"),
+        _ok(stdout="true\n"),
+        _fail("Pull request not found"),
+    )
+    with pytest.raises(GitHubError, match="gh pr merge --auto failed"):
+        queue_auto_merge(repo=tmp_path, pr_number=999, run_subprocess=runner)

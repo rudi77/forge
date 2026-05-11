@@ -13,6 +13,7 @@ from __future__ import annotations
 import typer
 
 from forge_cli import analyze as analyze_mod
+from forge_cli import board_loop as board_loop_mod
 from forge_cli import doctor as doctor_mod
 from forge_cli import plan as plan_mod
 from forge_cli import replay as replay_mod
@@ -49,6 +50,14 @@ app.command(
     name="plan",
     help="Generiert einen Plan für eine Aufgabe (architect-only, kein Code).",
 )(plan_mod.plan_command)
+
+app.command(
+    name="board-loop",
+    help=(
+        "Pull ready bug-issues vom GitHub Project Board, dispatche jedes "
+        "via issue_label-Trigger, optional mit --auto-merge."
+    ),
+)(board_loop_mod.board_loop_command)
 
 
 def main() -> None:

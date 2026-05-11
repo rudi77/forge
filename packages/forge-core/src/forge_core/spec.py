@@ -278,6 +278,48 @@ class ReleaseConfig(BaseModel):
     changelog: NonEmptyStr | None = None
 
 
+class BoardConfig(BaseModel):
+    """GitHub Project board als aktive Trigger-Quelle (Spec v0.4).
+
+    Wird von `forge board-loop` konsumiert: poll das Board, filtere nach
+    Status + Labels, dispatche pro ready-Issue einen normalen
+    `forge run --trigger issue_label`. Forges 5-Phasen-Pipeline und
+    Capabilities-Vertrag bleiben unangetastet — `BoardConfig` ist reine
+    Trigger-Source-Konfiguration, nicht Loop-Logik.
+
+    Idempotenz wird im Adapter gemacht (Skip wenn offener PR mit
+    `Closes #N` existiert), nicht hier.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["github"] = "github"
+    """In v1 nur github. ``provider`` ist explizit, damit spätere GitLab-/
+    Linear-Adapter additiv werden statt breaking."""
+
+    owner: NonEmptyStr
+    """GitHub user oder org, der das Project besitzt."""
+
+    project_number: int = Field(gt=0)
+    """Project (v2) Nummer — die ID aus ``gh project list``."""
+
+    filter_status: NonEmptyStr = "Todo"
+    """Status-Field-Wert, der als 'ready to dispatch' zählt. Case-sensitiv,
+    muss exakt einem Status-Field-Optionsnamen im Project entsprechen."""
+
+    filter_labels: list[NonEmptyStr] = Field(default_factory=lambda: ["bug"])
+    """Issue muss ALLE gelisteten Labels tragen (AND). Leere Liste = kein
+    Label-Filter (alle Labels akzeptiert)."""
+
+    default_focus_template: NonEmptyStr = "issue-{number}"
+    """Focus-Tag pro dispatched Run. ``{number}`` wird durch issue.number
+    substituiert. Wirkt als Telemetrie-Schlüssel in den Events."""
+
+    default_template_id: NonEmptyStr = "board_loop_v1"
+    """``prompt_template_id`` für jeden vom board-loop dispatched Run.
+    Macht in `forge analyze`-Reports board-loop-Runs unterscheidbar."""
+
+
 # --- Top-Level ----------------------------------------------------------
 
 
@@ -307,6 +349,8 @@ class ProjectSpec(BaseModel):
     cost_caps: CostCapsConfig
     triggers: TriggersConfig = Field(default_factory=TriggersConfig)
     release: ReleaseConfig = Field(default_factory=ReleaseConfig)
+    board: BoardConfig | None = None
+    """Optionaler Project-Board-Config; aktiviert ``forge board-loop`` (v0.4)."""
 
     # --- Cross-field validation ----------------------------------------
 

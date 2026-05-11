@@ -29,6 +29,7 @@ from forge_core.events.kinds.proposal import (
     ProposalRequestedPayload,
 )
 from forge_core.events.kinds.run import RunFinishedPayload, RunStartedPayload
+from forge_core.events.kinds.triage import IssueTriagedPayload, TriageDecision
 
 __all__ = [
     "CostCapHitPayload",
@@ -38,6 +39,7 @@ __all__ = [
     "GenerationFinishedPayload",
     "GenerationStartedPayload",
     "GuardrailViolationPayload",
+    "IssueTriagedPayload",
     "MutationAppliedPayload",
     "PRCreatedPayload",
     "PRMergedPayload",
@@ -49,4 +51,5 @@ __all__ = [
     "RiskLevel",
     "RunFinishedPayload",
     "RunStartedPayload",
+    "TriageDecision",
 ]

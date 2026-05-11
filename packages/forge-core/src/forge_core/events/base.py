@@ -41,6 +41,7 @@ class EventKind(StrEnum):
     PR_REVERTED = "PRReverted"
     COST_CAP_HIT = "CostCapHit"
     GUARDRAIL_VIOLATION = "GuardrailViolation"
+    ISSUE_TRIAGED = "IssueTriaged"
 
 
 class EventValidationError(ValueError):

@@ -3,7 +3,9 @@ and dispatch each as a normal ``forge run --trigger issue_label`` (Spec v0.4).
 
 Architektur:
 * Reine Orchestrations-Schicht über :func:`forge_cli.run.execute_run`.
-* Keine Änderung an der 5-Phasen-Pipeline, keine neuen EventKinds.
+* Optionale Pre-Phase ``IssueTriage`` (Spec v0.4 Teil 6.3), die per
+  ``triage.enabled`` aktiviert wird — emittiert genau ein
+  ``IssueTriaged``-Event pro Issue.
 * Idempotenz + Filter im Adapter (``forge_adapters.github.board``).
 * ``--auto-merge`` durchgereicht an jeden dispatched Run; Spec-Vertrag
   bleibt intakt (forge ruft selbst kein ``gh pr merge`` synchron auf,
@@ -27,12 +29,29 @@ from forge_adapters.github import (
     list_ready_items,
     wrap_issue_body,
 )
+from forge_core.events import (
+    EventKind,
+    IssueTriagedPayload,
+    build_event,
+)
+from forge_execute.capabilities import Capabilities
+from forge_execute.triage import (
+    IssueTriager,
+    LLMTriager,
+    TriageError,
+    TriageResult,
+    close_issue,
+    comment_issue,
+)
+from forge_execute.triage.gh import GHTriageError
 from forge_execute.worktrees import GitError, WorktreeManager
 from rich.table import Table
+from ulid import ULID
 
 from forge_cli.run import RunOutcome, execute_run
 from forge_cli.runtime import (
     ContextError,
+    ForgeContext,
     console,
     err_console,
     load_context,
@@ -199,6 +218,15 @@ def board_loop_command(
         _print_dry_run_table(ready, repo_owner, repo_name)
         raise typer.Exit(code=0)
 
+    # ---- Triage-Setup (optional) ------------------------------------
+    triage_cfg = ctx.spec.triage
+    triager: IssueTriager | None = (
+        _build_triager(claude_bin=claude_bin, model=model, ctx=ctx)
+        if triage_cfg.enabled
+        else None
+    )
+    capabilities = Capabilities(ctx.spec) if triage_cfg.enabled else None
+
     # ---- Dispatch ----------------------------------------------------
     summaries: list[_LoopSummaryRow] = []
     bailed = False
@@ -211,6 +239,17 @@ def board_loop_command(
     )
 
     for issue in ready:
+        if triager is not None and capabilities is not None:
+            triage_outcome = _run_triage(
+                ctx=ctx,
+                issue=issue,
+                triager=triager,
+                capabilities=capabilities,
+            )
+            if not triage_outcome.dispatch:
+                summaries.append(triage_outcome.summary_row)
+                continue
+
         focus = focus_template.format(number=issue.number)
         prompt = wrap_issue_body(title=issue.title, body=issue.body)
         console.print(
@@ -275,6 +314,208 @@ def board_loop_command(
 
 
 # --- Helpers -----------------------------------------------------------
+
+
+@dataclass
+class _TriageOutcome:
+    """Was eine Triage-Iteration dem Loop-Body mitteilt."""
+
+    dispatch: bool
+    """``True`` = normaler ``execute_run`` für dieses Issue. ``False`` =
+    überspringen, Summary-Row direkt einfügen."""
+
+    summary_row: _LoopSummaryRow
+    """Wird nur ausgewertet, wenn ``dispatch`` False ist."""
+
+
+def _build_triager(
+    *, claude_bin: str, model: str | None, ctx: ForgeContext
+) -> IssueTriager:
+    """Factory für den produktiven Triager.
+
+    Tests monkeypatchen diese Funktion, um einen ``FakeTriager``
+    einzuschleusen, ohne dass dafür ein typer-Flag exposed werden muss.
+    """
+    triage_cfg = ctx.spec.triage
+    return LLMTriager(
+        claude_bin=claude_bin,
+        model=triage_cfg.model or model,
+        max_turns=triage_cfg.max_turns,
+    )
+
+
+def _run_triage(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    triager: IssueTriager,
+    capabilities: Capabilities,
+) -> _TriageOutcome:
+    """Triagiert ein Issue, emittiert das Event und führt optionale
+    Side-Effects (Kommentar/Close) aus.
+
+    Bei TriageError oder Triager-Crash wird mit ``relevant`` weitergemacht
+    — der Hauptpfad darf nicht hängen, weil das Vorab-Klassifikat
+    daneben lag.
+    """
+    triage_cfg = ctx.spec.triage
+    console.print(
+        f"[dim]triage:[/dim] classifying issue "
+        f"#{issue.number} [italic]{issue.title}[/italic]"
+    )
+    try:
+        result = triager.triage(issue=issue, repo_root=ctx.repo_root)
+    except TriageError as exc:
+        err_console.print(
+            f"[yellow]triage failed for #{issue.number}[/yellow]: {exc}"
+        )
+        result = TriageResult(
+            decision="relevant", reason=f"triage error fallback: {exc}"
+        )
+
+    run_id = str(ULID())
+    _emit_triage_event(ctx=ctx, issue=issue, result=result, run_id=run_id)
+
+    if result.is_relevant:
+        console.print(
+            f"[dim]triage:[/dim] #{issue.number} → relevant "
+            f"({_short(result.reason)})"
+        )
+        return _TriageOutcome(
+            dispatch=True,
+            summary_row=_LoopSummaryRow(
+                issue_number=issue.number,
+                issue_title=issue.title,
+                decision="triaged_relevant",
+                pr_url=None,
+                auto_merge="-",
+            ),
+        )
+
+    # Nicht relevant: side-effects + skip
+    console.print(
+        f"[yellow]triage:[/yellow] #{issue.number} → {result.decision} "
+        f"({_short(result.reason)})"
+    )
+    if triage_cfg.auto_comment:
+        if capabilities.check_action("comment_issue").allowed:
+            try:
+                comment_issue(
+                    repo=ctx.repo_root,
+                    issue_number=issue.number,
+                    body=_format_triage_comment(result),
+                )
+            except GHTriageError as exc:
+                err_console.print(
+                    f"[yellow]triage comment failed for #{issue.number}[/yellow]: {exc}"
+                )
+        else:
+            err_console.print(
+                f"[yellow]triage[/yellow]: comment_issue capability denied, "
+                f"skipping comment on #{issue.number}"
+            )
+
+    if triage_cfg.auto_close:
+        if capabilities.check_action("close_issue").allowed:
+            close_reason = (
+                "completed" if result.decision == "already_solved" else "not planned"
+            )
+            try:
+                close_issue(
+                    repo=ctx.repo_root,
+                    issue_number=issue.number,
+                    reason=close_reason,
+                )
+            except GHTriageError as exc:
+                err_console.print(
+                    f"[yellow]triage close failed for #{issue.number}[/yellow]: {exc}"
+                )
+        else:
+            err_console.print(
+                f"[yellow]triage[/yellow]: close_issue capability denied, "
+                f"keeping #{issue.number} open"
+            )
+
+    return _TriageOutcome(
+        dispatch=False,
+        summary_row=_LoopSummaryRow(
+            issue_number=issue.number,
+            issue_title=issue.title,
+            decision=f"triaged_{result.decision}",
+            pr_url=None,
+            auto_merge="-",
+        ),
+    )
+
+
+def _emit_triage_event(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    result: TriageResult,
+    run_id: str,
+) -> None:
+    """Schreibt genau ein ``IssueTriaged``-Event in den Store.
+
+    Eigene ``run_id`` pro Triage — Triage und nachgelagerter Dispatch
+    sind separate logische Runs (auch wenn der Dispatch ausbleibt).
+    Korrelations-Anker zwischen beiden ist ``issue_number`` im Payload.
+    """
+    payload = IssueTriagedPayload(
+        issue_number=issue.number,
+        decision=result.decision,
+        reason=result.reason,
+        related_pr=result.related_pr,
+        related_commit=result.related_commit,
+        turns_used=result.turns_used,
+    )
+    evt = build_event(
+        kind=EventKind.ISSUE_TRIAGED,
+        run_id=run_id,
+        project=ctx.spec.name,
+        project_fingerprint=ctx.project_fingerprint,
+        factory_version=ctx.factory_version,
+        spec_version=ctx.spec.spec_version,
+        payload=payload,
+        cost_usd=result.cost_usd,
+        model=result.model,
+    )
+    store = ctx.open_store()
+    try:
+        store.append(evt)
+    finally:
+        store.close()
+
+
+def _format_triage_comment(result: TriageResult) -> str:
+    """Baut den Issue-Kommentar zusammen, der beim Auto-Close gespiegelt wird."""
+    label = {
+        "stale": "veraltet",
+        "duplicate": "Duplikat",
+        "already_solved": "bereits gelöst",
+        "relevant": "relevant",  # praktisch nie aufgerufen
+    }[result.decision]
+    parts = [
+        f"_forge triage: **{label}**_",
+        "",
+        result.reason or "_(keine Begründung)_",
+    ]
+    if result.related_pr is not None:
+        parts.append(f"\nVerwandter PR/Issue: #{result.related_pr}")
+    if result.related_commit:
+        parts.append(f"\nVerwandter Commit: `{result.related_commit}`")
+    parts.append("")
+    parts.append(
+        "Falls die Einschätzung daneben liegt, einfach erneut öffnen — "
+        "forge triagiert beim nächsten board-loop wieder."
+    )
+    return "\n".join(parts)
+
+
+def _short(text: str, limit: int = 80) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _run_garbage_collection(repo_root: Path) -> None:

@@ -4,7 +4,7 @@
 
 ## Einordnung
 
-forge ist die **messbare, replay-fähige Auto-PR-Maschine** aus `docs/forge-spec-v0.2.md`. Die Spec ist Vertrag: wenn dein Vorschlag einem der drei Mantras widerspricht, ist es kein Bug, sondern eine Designentscheidung.
+forge ist die **messbare, replay-fähige Auto-PR-Maschine** aus `docs/forge-spec-v0.4.md` (Diff-Doku gegenüber v0.3 und v0.2, die als historische Snapshots im Repo bleiben). Die Spec ist Vertrag: wenn dein Vorschlag einem der drei Mantras widerspricht, ist es kein Bug, sondern eine Designentscheidung.
 
 Die drei Mantras:
 
@@ -148,7 +148,7 @@ Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
 - Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
 - Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
 
-Vor jeder Schema-Änderung: `len(EventKind) == 16` und `len(_PAYLOAD_REGISTRY) == 16` testen.
+Vor jeder Schema-Änderung: `len(EventKind) == 18` und `len(_PAYLOAD_REGISTRY) == 18` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED`).
 
 ## CodingAgent ist Plug-in, nicht Fundament
 

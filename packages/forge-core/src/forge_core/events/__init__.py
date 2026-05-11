@@ -38,6 +38,7 @@ from forge_core.events.kinds import (
     GenerationFinishedPayload,
     GenerationStartedPayload,
     GuardrailViolationPayload,
+    IssueTriagedPayload,
     MutationAppliedPayload,
     PlanProposedPayload,
     PRCreatedPayload,
@@ -49,6 +50,7 @@ from forge_core.events.kinds import (
     RiskLevel,
     RunFinishedPayload,
     RunStartedPayload,
+    TriageDecision,
 )
 
 __all__ = [
@@ -62,6 +64,7 @@ __all__ = [
     "GenerationFinishedPayload",
     "GenerationStartedPayload",
     "GuardrailViolationPayload",
+    "IssueTriagedPayload",
     "MutationAppliedPayload",
     "PRCreatedPayload",
     "PRMergedPayload",
@@ -73,5 +76,6 @@ __all__ = [
     "RiskLevel",
     "RunFinishedPayload",
     "RunStartedPayload",
+    "TriageDecision",
     "build_event",
 ]

@@ -29,6 +29,8 @@ from pathspec import GitIgnoreSpec
 CapabilityAction = Literal[
     "commit",
     "open_pr",
+    "comment_issue",
+    "close_issue",
     "merge_pr",
     "push_to_main",
     "push_force",

@@ -116,6 +116,13 @@ class CapabilitiesConfig(BaseModel):
 
     commit: bool = True
     open_pr: bool = True
+    comment_issue: bool = True
+    """Erlaubt ``gh issue comment`` (z.B. für Triage-Begründungen).
+    Default ``True`` — Kommentare sind weniger invasiv als ein PR-Open."""
+    close_issue: bool = True
+    """Erlaubt ``gh issue close`` (z.B. um veraltete Issues per Triage
+    zu schließen). Default ``True``, aber praktisch nur wirksam, wenn
+    ``spec.triage.enabled`` opt-in aktiviert ist."""
     merge_pr: Literal[False] = False
     push_to_main: Literal[False] = False
     push_force: Literal[False] = False
@@ -278,6 +285,52 @@ class ReleaseConfig(BaseModel):
     changelog: NonEmptyStr | None = None
 
 
+class TriageConfig(BaseModel):
+    """LLM-gestützte Pre-Phase im board-loop (Spec v0.4 Teil 6.3).
+
+    Bevor forge einen Worktree öffnet und den vollen 5-Phasen-Zyklus
+    durchläuft, klassifiziert der Triager jedes ready-Issue gegen den
+    aktuellen ``main``-Stand und die offenen PRs/Issues. Mögliche
+    Outcomes:
+
+    * ``relevant`` — normaler Dispatch, kein Side-Effect.
+    * ``stale`` — das Issue beschreibt einen längst behobenen Zustand
+      oder bezieht sich auf Code, der nicht mehr existiert.
+    * ``duplicate`` — ein offenes Issue/PR adressiert dasselbe Problem.
+    * ``already_solved`` — der Fix ist bereits im ``main`` gelandet.
+
+    In allen "nicht relevant"-Fällen werden — wenn aktiviert — Begründung
+    als Kommentar gespiegelt und das Issue geschlossen. Genau eine
+    ``IssueTriaged``-Event-Zeile fällt pro Issue an, sodass spätere
+    Loop-3-Auswertungen Trefferrate und Drift messen können.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    """Schaltet die Pre-Phase im board-loop ein. Default ``False`` —
+    Triage ist Opt-in, weil sie zusätzliche LLM-Kosten pro Issue
+    produziert (kleiner Call, aber nicht null)."""
+
+    model: str | None = None
+    """Claude-Modell für den Triage-Call. ``None`` = nutze das Modell
+    aus dem ``issue_label``-Trigger der Spec. Ein kleines Modell
+    reicht hier oft (Klassifikation, kein Code)."""
+
+    max_turns: int = Field(default=4, gt=0)
+    """Cap auf Tool-Turns im Triage-Aufruf. Default 4 reicht für
+    ``gh issue list`` + ``gh pr list`` + ``git log`` + Decision."""
+
+    auto_comment: bool = True
+    """Bei ``decision != relevant``: Begründung als Issue-Kommentar
+    posten. Benötigt ``capabilities.comment_issue``."""
+
+    auto_close: bool = True
+    """Bei ``decision != relevant``: Issue schließen. Benötigt
+    ``capabilities.close_issue``. Auf ``False`` setzen, wenn man
+    nur den Kommentar will und manuell schließen möchte."""
+
+
 class BoardConfig(BaseModel):
     """GitHub Project board als aktive Trigger-Quelle (Spec v0.4).
 
@@ -351,6 +404,8 @@ class ProjectSpec(BaseModel):
     release: ReleaseConfig = Field(default_factory=ReleaseConfig)
     board: BoardConfig | None = None
     """Optionaler Project-Board-Config; aktiviert ``forge board-loop`` (v0.4)."""
+    triage: TriageConfig = Field(default_factory=TriageConfig)
+    """Pre-Phase im board-loop. Default: disabled. Siehe :class:`TriageConfig`."""
 
     # --- Cross-field validation ----------------------------------------
 

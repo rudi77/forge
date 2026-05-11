@@ -126,6 +126,25 @@ def test_action_commit_open_pr_allowed_by_default() -> None:
     assert caps.check_action("open_pr").allowed is True
 
 
+def test_triage_actions_allowed_by_default() -> None:
+    """Triage-Actions sind in der Default-Spec erlaubt — der eigentliche
+    Switch ist ``triage.enabled``, nicht die Capability."""
+    caps = Capabilities(_spec())
+    assert caps.check_action("comment_issue").allowed is True
+    assert caps.check_action("close_issue").allowed is True
+
+
+def test_triage_actions_denyable_via_spec() -> None:
+    """Operator kann Triage-Side-Effects explizit verbieten, auch wenn
+    Triage aktiviert ist."""
+    spec = _spec()
+    spec.capabilities.comment_issue = False
+    spec.capabilities.close_issue = False
+    caps = Capabilities(spec)
+    assert caps.check_action("comment_issue").allowed is False
+    assert caps.check_action("close_issue").allowed is False
+
+
 def test_merge_pr_categorically_disabled() -> None:
     caps = Capabilities(_spec())
     r = caps.check_action("merge_pr")

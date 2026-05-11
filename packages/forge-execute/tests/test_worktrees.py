@@ -195,6 +195,105 @@ def test_create_rejects_existing_path(repo: Path) -> None:
         wm.cleanup(wt)
 
 
+def test_list_forge_worktrees_filters_prefix(repo: Path) -> None:
+    """Nur forge/* Worktrees zählen — fremde Branches ignoriert."""
+    wm = WorktreeManager(repo)
+    # Operator-eigener Worktree (kein forge/-Prefix) — soll ignoriert werden.
+    other_path = repo.parent / "other"
+    _git(repo, "worktree", "add", "-b", "feature/foo", str(other_path))
+    try:
+        wt = wm.create(run_id="r1")
+        try:
+            entries = wm.list_forge_worktrees()
+            branches = {e["branch"] for e in entries}
+            assert "forge/r1" in branches
+            assert "feature/foo" not in branches
+        finally:
+            wm.cleanup(wt)
+    finally:
+        _git(repo, "worktree", "remove", "--force", str(other_path), check=False)
+
+
+def test_gc_stale_removes_dangling_directory(repo: Path) -> None:
+    """Worktree-Verzeichnis manuell weglöschen → gc_stale räumt den Eintrag."""
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="r1")
+    # Verzeichnis hart entfernen, ohne git Bescheid zu sagen → prunable.
+    import shutil as _shutil
+    _shutil.rmtree(wt.path)
+    removed = wm.gc_stale()
+    assert any("r1" in p for p in removed)
+    # Eintrag ist weg.
+    entries = wm.list_forge_worktrees()
+    assert not any("r1" in str(e.get("branch", "")) for e in entries)
+
+
+def test_gc_stale_removes_orphaned_pool_directory(repo: Path) -> None:
+    """Verzeichnis existiert + Eintrag existiert, aber kein Run aktiv → entfernt."""
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="r1")
+    assert wt.path.is_dir()
+    # Wir simulieren "Crash mid-run": keinen cleanup() aufrufen, gc_stale räumt.
+    removed = wm.gc_stale()
+    assert any("r1" in p for p in removed)
+    assert not wt.path.exists()
+
+
+def test_gc_stale_leaves_external_worktrees_alone(repo: Path) -> None:
+    """forge/* Worktrees außerhalb des Pools werden nicht angefasst —
+    falls ein Operator manuell einen forge-Branch in seinem eigenen
+    Verzeichnis auscheckt."""
+    wm = WorktreeManager(repo)
+    external = repo.parent / "external-forge"
+    _git(repo, "worktree", "add", "-b", "forge/manual", str(external))
+    try:
+        removed = wm.gc_stale()
+        assert not any("external-forge" in p for p in removed)
+        assert external.exists()
+    finally:
+        _git(repo, "worktree", "remove", "--force", str(external), check=False)
+        _git(repo, "branch", "-D", "forge/manual", check=False)
+
+
+def test_prune_merged_branches_skips_active_branch(repo: Path) -> None:
+    """Branch mit aktivem Worktree wird übersprungen, auch wenn upstream gone."""
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="r1")
+    try:
+        # Kein Remote vorhanden → upstream ist auch nicht "gone" sondern leer
+        # → Branch wird übersprungen. Wichtig: kein Crash.
+        deleted = wm.prune_merged_branches()
+        assert "forge/r1" not in deleted
+    finally:
+        wm.cleanup(wt)
+
+
+def test_prune_merged_branches_deletes_gone_upstream(repo: Path, tmp_path: Path) -> None:
+    """Wenn der Branch ein Remote-Tracking hat das auf [gone] steht, wird er gelöscht."""
+    # Bare-Repo als Remote.
+    remote = tmp_path / "remote.git"
+    _git(repo, "init", "--bare", str(remote))
+    _git(repo, "remote", "add", "origin", str(remote))
+
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="rgone")
+    # Wenigstens einen Commit im Worktree, damit push klappt.
+    (wt.path / "src" / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8"
+    )
+    sha = wm.commit(wt, "forge: stub")
+    assert sha
+    _git(wt.path, "push", "-u", "origin", "forge/rgone")
+    # Worktree weg, damit der Branch nicht mehr "checked out" ist.
+    wm.cleanup(wt)
+    # Remote-Branch hart entfernen → tracking wird auf [gone] gesetzt
+    # nachdem fetch --prune lief.
+    _git(repo, "push", "origin", "--delete", "forge/rgone")
+
+    deleted = wm.prune_merged_branches()
+    assert "forge/rgone" in deleted
+
+
 def test_revert_with_explicit_to_commit(repo: Path) -> None:
     """Revert kann auf einen anderen Commit als base zurücksetzen — wichtig
     für KEEP→DISCARD-Sequenz, damit DISCARD nicht KEPT-commits wegblasten.

@@ -110,6 +110,175 @@ class WorktreeManager:
             check=False,
         )
 
+    # --- Garbage collection --------------------------------------------
+
+    def list_forge_worktrees(self) -> list[dict[str, str | bool]]:
+        """Liefert alle bei git registrierten Worktrees mit Branch-Prefix
+        ``forge/`` (das sind unsere; alles andere ist Operator-eigen).
+
+        Jeder Eintrag enthält ``path`` (str), ``branch`` (str, ohne
+        ``refs/heads/``-Prefix) und ``prunable`` (bool — git markiert
+        Worktrees als prunable, wenn das Verzeichnis fehlt o.ä.).
+        """
+        result = self._run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=self.repo_root,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git worktree list --porcelain failed: {result.stderr.strip()}"
+            )
+
+        entries: list[dict[str, str | bool]] = []
+        current: dict[str, str | bool] = {}
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                if current:
+                    self._maybe_record_forge_worktree(current, entries)
+                    current = {}
+                continue
+            if line.startswith("worktree "):
+                current["path"] = line[len("worktree ") :].strip()
+            elif line.startswith("branch "):
+                ref = line[len("branch ") :].strip()
+                current["branch"] = ref.removeprefix("refs/heads/")
+            elif line.startswith("prunable"):
+                current["prunable"] = True
+        if current:
+            self._maybe_record_forge_worktree(current, entries)
+        return entries
+
+    @staticmethod
+    def _maybe_record_forge_worktree(
+        entry: dict[str, str | bool],
+        out: list[dict[str, str | bool]],
+    ) -> None:
+        branch = entry.get("branch", "")
+        if isinstance(branch, str) and branch.startswith("forge/"):
+            entry.setdefault("prunable", False)
+            out.append(entry)
+
+    def gc_stale(self) -> list[str]:
+        """Räumt verwaiste ``forge/*``-Worktrees auf.
+
+        Zwei Klassen werden entfernt:
+
+        * **Prunable**: git selbst hat sie als kaputt markiert (Verzeichnis
+          weg, aber Eintrag in ``.git/worktrees/`` noch da). ``git worktree
+          prune`` fasst die zusammen.
+        * **Verzeichnis existiert noch**, aber kein Run hält das Lock —
+          typisch nach einem Crash mitten in einer Iteration. Wir entfernen
+          per ``git worktree remove --force``.
+
+        Branches werden hier **nicht** gelöscht; das macht
+        :meth:`prune_merged_branches` getrennt, weil dort die GitHub-
+        Sicht über Merge-Status reinkommt.
+
+        Returns: Liste der entfernten Worktree-Pfade (für Logging).
+        """
+        removed: list[str] = []
+        for entry in self.list_forge_worktrees():
+            path_str = str(entry.get("path", ""))
+            if not path_str:
+                continue
+            path = Path(path_str)
+            try:
+                inside_pool = path.resolve().is_relative_to(self.worktree_root)
+            except (OSError, ValueError):
+                inside_pool = False
+            # Nur unsere Pool-Worktrees anfassen — falls ein Operator
+            # manuell einen forge/* Branch in einem fremden Worktree
+            # auscheckt, fummeln wir da nicht rein.
+            if not inside_pool:
+                continue
+            prunable = bool(entry.get("prunable", False))
+            if prunable or not path.exists():
+                # Eintrag verwaist — `git worktree prune` räumt den
+                # gesamten Stapel weg.
+                self._run(["git", "worktree", "prune"], cwd=self.repo_root)
+                removed.append(path_str)
+                continue
+            # Verzeichnis existiert, aber kein aktiver Run greift —
+            # forciert entfernen.
+            result = self._run(
+                ["git", "worktree", "remove", "--force", path_str],
+                cwd=self.repo_root,
+            )
+            if result.returncode == 0:
+                removed.append(path_str)
+                continue
+            # Fallback: rmtree + prune. Selbst wenn rmtree teilweise
+            # fehlschlägt (Windows-File-Lock), markiert prune den
+            # git-internen Eintrag als entfernbar.
+            shutil.rmtree(path, ignore_errors=True)
+            self._run(["git", "worktree", "prune"], cwd=self.repo_root)
+            removed.append(path_str)
+        return removed
+
+    def prune_merged_branches(self) -> list[str]:
+        """Löscht lokale ``forge/*``-Branches ohne Remote-Tracking.
+
+        Hintergrund: ``gh pr merge --auto --delete-branch`` löscht
+        beim Auto-Merge den Remote-Branch. ``git fetch --prune``
+        entfernt anschließend den lokalen Tracking-Ref unter
+        ``refs/remotes/origin/forge/<id>``. Was bleibt, ist der lokale
+        ``refs/heads/forge/<id>`` — der zeigt jetzt ins Leere und
+        wir können ihn lokal verwerfen.
+
+        Diese Methode ruft erst ``git fetch --prune origin`` (best-
+        effort; ignoriert Fehler, falls offline) und löscht dann alle
+        ``forge/*``-Branches, deren upstream ``[gone]`` ist. Branches
+        mit aktivem Worktree werden übersprungen — git verweigert sie
+        sowieso, aber wir wollen die Fehlermeldung gar nicht erst.
+
+        Returns: Liste der gelöschten Branch-Namen.
+        """
+        # Best-effort: prune Tracking-Refs.
+        self._run(
+            ["git", "fetch", "--prune", "origin"],
+            cwd=self.repo_root,
+            check=False,
+        )
+
+        # `git for-each-ref` mit upstream:track liefert "[gone]" für
+        # Branches, deren Remote-Counterpart gelöscht wurde.
+        result = self._run(
+            [
+                "git",
+                "for-each-ref",
+                "--format=%(refname:short)%09%(upstream:track)",
+                "refs/heads/forge/",
+            ],
+            cwd=self.repo_root,
+        )
+        if result.returncode != 0:
+            return []
+
+        active_branches = {
+            str(entry.get("branch", ""))
+            for entry in self.list_forge_worktrees()
+        }
+
+        deleted: list[str] = []
+        for line in result.stdout.splitlines():
+            if "\t" not in line:
+                continue
+            branch, track = line.split("\t", 1)
+            if not branch.startswith("forge/"):
+                continue
+            if branch in active_branches:
+                continue
+            if "[gone]" not in track:
+                continue
+            delete = self._run(
+                ["git", "branch", "-D", branch],
+                cwd=self.repo_root,
+                check=False,
+            )
+            if delete.returncode == 0:
+                deleted.append(branch)
+        return deleted
+
     # --- Mutationen -----------------------------------------------------
 
     def apply_patch(self, worktree: Worktree, diff: str) -> None:

@@ -27,6 +27,7 @@ from forge_adapters.github import (
     list_ready_items,
     wrap_issue_body,
 )
+from forge_execute.worktrees import GitError, WorktreeManager
 from rich.table import Table
 
 from forge_cli.run import RunOutcome, execute_run
@@ -132,6 +133,16 @@ def board_loop_command(
             ),
         ),
     ] = None,
+    no_gc: Annotated[
+        bool,
+        typer.Option(
+            "--no-gc",
+            help=(
+                "Skipt das Garbage-Collection (verwaiste forge/* Worktrees "
+                "und lokale Branches ohne Remote). Default: GC läuft."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Pull ready issues from the configured GitHub Project, dispatch each
     via the standard issue_label trigger pipeline."""
@@ -142,6 +153,13 @@ def board_loop_command(
         raise typer.Exit(code=2) from None
 
     repo_owner, repo_name = _detect_repo_slug(ctx.repo_root)
+
+    # ---- Garbage-Collection vor Loop-Start --------------------------
+    # Verwaiste forge/* Worktrees (frühere Crashes) und lokale Branches,
+    # deren Remote-Tracking [gone] ist (Auto-Merge mit --delete-branch),
+    # werden hier aufgeräumt. Operator kann das mit --no-gc abschalten.
+    if not no_gc:
+        _run_garbage_collection(ctx.repo_root)
 
     # ---- Issue-Liste bestimmen --------------------------------------
     if issue_overrides:
@@ -257,6 +275,31 @@ def board_loop_command(
 
 
 # --- Helpers -----------------------------------------------------------
+
+
+def _run_garbage_collection(repo_root: Path) -> None:
+    """Räumt verwaiste Worktrees + lokale forge/* Branches auf.
+
+    Best-effort: bei Git-Problemen warnt die Funktion auf stderr, lässt
+    den board-loop aber weiterlaufen. Eine kaputte GC darf nicht den
+    Hauptpfad blockieren.
+    """
+    wm = WorktreeManager(repo_root)
+    try:
+        removed_worktrees = wm.gc_stale()
+    except GitError as exc:
+        err_console.print(f"[yellow]gc warning[/yellow]: worktree cleanup failed: {exc}")
+        removed_worktrees = []
+    try:
+        removed_branches = wm.prune_merged_branches()
+    except GitError as exc:
+        err_console.print(f"[yellow]gc warning[/yellow]: branch cleanup failed: {exc}")
+        removed_branches = []
+    if removed_worktrees or removed_branches:
+        console.print(
+            f"[dim]gc:[/dim] pruned {len(removed_worktrees)} stale worktree(s), "
+            f"{len(removed_branches)} merged branch(es)"
+        )
 
 
 _REMOTE_RE = re.compile(

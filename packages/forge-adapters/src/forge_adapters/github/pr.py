@@ -171,11 +171,18 @@ def render_pr_body(
     generations_count: int,
     factory_version: str,
     diff_excerpt: str | None = None,
+    plan_md: str | None = None,
 ) -> str:
     """Generiert einen strukturierten PR-Body.
 
     Format soll für menschliche Reviewer schnell scannbar sein und gleichzeitig
     Telemetrie-Anker enthalten, an denen Loop 3 später Pattern erkennen kann.
+
+    Args:
+        plan_md: Optionaler Markdown-Plan aus dem PlanProposed-Event. Wird
+            als eigene Sektion in den Body eingebettet, sodass der Reviewer
+            sieht, *was forge zu tun gedachte*, bevor er den Diff liest.
+            Pläne >2 KB werden in ein ``<details>``-Element eingeklappt.
     """
     delta_str = (
         f"{'+' if score_delta is not None and score_delta >= 0 else ''}{score_delta:.4f}"
@@ -195,6 +202,20 @@ def render_pr_body(
     lines.append(f"- **total_cost:** ${total_cost_usd}")
     lines.append(f"- **factory_version:** `{factory_version}`")
     lines.append("")
+
+    if plan_md and plan_md.strip():
+        plan_text = plan_md.strip()
+        lines.append("### Plan")
+        lines.append("")
+        if len(plan_text) <= 2000:
+            lines.append(plan_text)
+        else:
+            lines.append("<details><summary>Plan (full)</summary>")
+            lines.append("")
+            lines.append(plan_text)
+            lines.append("")
+            lines.append("</details>")
+        lines.append("")
 
     if files_changed:
         lines.append("### Files changed")

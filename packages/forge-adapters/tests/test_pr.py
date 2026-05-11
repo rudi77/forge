@@ -88,6 +88,76 @@ def test_render_pr_body_includes_diff_excerpt() -> None:
     assert "+++ b/a.py" in body
 
 
+def test_render_pr_body_includes_short_plan_inline() -> None:
+    body = render_pr_body(
+        run_id="r1",
+        focus="x",
+        decision="pr_created",
+        final_score=0.5,
+        score_delta=0.01,
+        total_cost_usd=Decimal("0"),
+        files_changed=["a.py"],
+        generations_count=1,
+        factory_version="git:abc",
+        plan_md="## Plan\n\n1. Fix the bug in a.py\n2. Add regression test",
+    )
+    assert "### Plan" in body
+    assert "Fix the bug in a.py" in body
+    # Kurze Pläne werden NICHT eingeklappt.
+    assert "<details><summary>Plan (full)</summary>" not in body
+
+
+def test_render_pr_body_collapses_long_plan() -> None:
+    long_plan = "## Plan\n\n" + "- step description that drags on\n" * 200
+    assert len(long_plan) > 2000
+    body = render_pr_body(
+        run_id="r1",
+        focus="x",
+        decision="pr_created",
+        final_score=0.5,
+        score_delta=0.01,
+        total_cost_usd=Decimal("0"),
+        files_changed=["a.py"],
+        generations_count=1,
+        factory_version="git:abc",
+        plan_md=long_plan,
+    )
+    assert "### Plan" in body
+    assert "<details><summary>Plan (full)</summary>" in body
+    assert "</details>" in body
+
+
+def test_render_pr_body_omits_plan_section_when_absent() -> None:
+    body = render_pr_body(
+        run_id="r1",
+        focus="x",
+        decision="pr_created",
+        final_score=0.5,
+        score_delta=0.01,
+        total_cost_usd=Decimal("0"),
+        files_changed=["a.py"],
+        generations_count=1,
+        factory_version="git:abc",
+    )
+    assert "### Plan" not in body
+
+
+def test_render_pr_body_omits_plan_section_for_whitespace_only() -> None:
+    body = render_pr_body(
+        run_id="r1",
+        focus="x",
+        decision="pr_created",
+        final_score=0.5,
+        score_delta=0.01,
+        total_cost_usd=Decimal("0"),
+        files_changed=["a.py"],
+        generations_count=1,
+        factory_version="git:abc",
+        plan_md="   \n\n  \t  \n",
+    )
+    assert "### Plan" not in body
+
+
 def test_extract_pr_number_from_url() -> None:
     assert _extract_pr_number("https://github.com/owner/repo/pull/42") == 42
     assert _extract_pr_number(

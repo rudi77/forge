@@ -423,6 +423,8 @@ def _create_pr_into_outcome(
         from forge_execute.mutators.code import extract_changed_paths
         files_changed = extract_changed_paths(result.final_diff)
 
+    plan_md = _load_latest_plan(store, ctx, run_id=result.run_id)
+
     title = _format_pr_title(config.focus, result.score_delta)
     body = render_pr_body(
         run_id=result.run_id,
@@ -435,6 +437,7 @@ def _create_pr_into_outcome(
         generations_count=len(result.generations),
         factory_version=ctx.factory_version,
         diff_excerpt=result.final_diff,
+        plan_md=plan_md,
     )
     labels = ["forge:auto", *extra_labels]
     try:
@@ -458,6 +461,36 @@ def _create_pr_into_outcome(
         return
     outcome.pr_url = pr.url
     outcome.pr_number = pr.pr_number
+
+
+def _load_latest_plan(store, ctx: ForgeContext, *, run_id: str) -> str | None:
+    """Lädt den jüngsten ``PlanProposed``-Plan-Markdown dieses Runs.
+
+    Pläne werden pro Generation emittiert; für den PR-Body interessiert
+    der letzte (der zur KEEP-Generation gehört, deren Diff in den PR
+    fließt). Bei fehlendem Plan, fehlendem Blob oder Lesefehler wird
+    None zurückgegeben — kein Plan im PR-Body ist sauberer als
+    halbgar geladene Reste.
+    """
+    from forge_core.events import EventKind
+
+    try:
+        events = store.events_for_run(run_id)
+    except Exception:
+        return None
+    plan_hash: str | None = None
+    for evt in events:
+        if evt.kind == EventKind.PLAN_PROPOSED:
+            artifact = evt.artifacts.get("plan") if evt.artifacts else None
+            if artifact:
+                plan_hash = artifact
+    if plan_hash is None:
+        return None
+    try:
+        blobs = ctx.open_blobs()
+        return blobs.get_text(plan_hash)
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def _format_pr_title(focus: str | None, score_delta: float | None) -> str:

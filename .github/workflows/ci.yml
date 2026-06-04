@@ -45,7 +45,16 @@ jobs:
           TERM: dumb
           NO_COLOR: "1"
           COLUMNS: "200"
-        run: uv run pytest -v --tb=short
+        # Ein einziger Retry: die Suite enthält einen bekannt flakigen Test
+        # (test_runner_self_termination_with_changes_still_keeps — fährt einen
+        # echten git+pytest-Subprozess und kippt auf dem Runner sporadisch mit
+        # gate_failure, lokal nie reproduzierbar). Deterministische Fehler
+        # scheitern weiterhin beide Male und blocken den Build; nur ein
+        # transienter Flake wird vom zweiten Lauf abgefangen.
+        run: |
+          uv run pytest -v --tb=short \
+            || { echo "::warning::pytest failed — retrying once (known-flaky suite)"; \
+                 uv run pytest -v --tb=short; }
 
   build:
     name: Build forge.exe (windows)

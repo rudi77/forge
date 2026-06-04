@@ -158,6 +158,18 @@ def run_command(
             ),
         ),
     ] = False,
+    agents: Annotated[
+        str | None,
+        typer.Option(
+            "--agents",
+            help=(
+                "Explizites Subagent-Roster, komma-separiert "
+                "(z.B. 'architect,developer,tester' oder 'developer'). "
+                "Überschreibt --multi-agent. Bekannte Rollen: "
+                "architect, developer, tester."
+            ),
+        ),
+    ] = None,
     auto_merge: Annotated[
         bool,
         typer.Option(
@@ -228,6 +240,7 @@ def run_command(
         dry_run=dry_run,
         claude_bin=claude_bin,
         multi_agent=multi_agent,
+        agents=_split_agents(agents),
         create_pr=create_pr,
         pr_base=pr_base,
         extra_labels=pr_label or [],
@@ -269,6 +282,7 @@ def execute_run(
     pr_draft: bool,
     auto_merge: bool,
     announce: bool = False,
+    agents: list[str] | None = None,
 ) -> RunOutcome:
     """Wie ``run_command``, aber ohne Typer-Layer und mit RunOutcome-Return.
 
@@ -277,6 +291,18 @@ def execute_run(
     erscheinen; im board-loop-Kontext ist das stiller (False), weil
     board_loop seine eigene Tabelle pro Iteration druckt.
     """
+    # Roster auflösen: explizite --agents-Liste hat Vorrang, sonst bildet das
+    # multi_agent-Flag den Alt-Pfad ab (True = volles Default-Roster,
+    # False = einsamer developer / klassischer Single-Agent-Run).
+    from forge_execute.agents.templates import DEFAULT_AGENTS, normalize_agents
+
+    if agents:
+        roster = normalize_agents(agents)
+    elif multi_agent:
+        roster = list(DEFAULT_AGENTS)
+    else:
+        roster = ["developer"]
+
     if dry_run:
         if announce:
             console.print(
@@ -284,14 +310,15 @@ def execute_run(
             )
         agent = MockCodingAgent(callable_=lambda wt, prompt: None)
     else:
-        if multi_agent and announce:
+        if len(roster) > 1 and announce:
             console.print(
-                "[cyan]multi-agent[/cyan]: architect -> developer -> tester via Claude Code subagents"
+                f"[cyan]multi-agent[/cyan]: {' -> '.join(roster)} "
+                "via Claude Code subagents"
             )
         agent = ClaudeCodeCLIAgent(
             claude_bin=claude_bin,
             default_model=model,
-            multi_agent=multi_agent,
+            agents=roster,
         )
 
     config = RunConfig(
@@ -312,6 +339,7 @@ def execute_run(
         model=model,
         issue_number=issue_number,
         pr_number=pr_number,
+        agents=roster,
     )
 
     if announce:
@@ -349,6 +377,17 @@ def execute_run(
 
 
 # --- Helpers ----------------------------------------------------------
+
+
+def _split_agents(agents: str | None) -> list[str] | None:
+    """Parst die komma-separierte `--agents`-Option in eine Liste.
+
+    Leerer/None-Input → None (Roster wird dann aus `--multi-agent` abgeleitet).
+    """
+    if not agents:
+        return None
+    parsed = [a.strip() for a in agents.split(",") if a.strip()]
+    return parsed or None
 
 
 def _resolve_prompt(

@@ -32,9 +32,12 @@ from forge_execute.agents.base import (
     ReviewResult,
 )
 from forge_execute.agents.templates import (
-    ORCHESTRATOR_SYSTEM_PROMPT,
+    DEFAULT_AGENTS,
+    build_orchestrator_prompt,
     extract_plan_from_master_output,
     list_templates,
+    normalize_agents,
+    roster_needs_orchestration,
 )
 from forge_execute.evaluators.command import _kill_tree
 
@@ -125,15 +128,28 @@ class ClaudeCodeCLIAgent:
         permission_mode: str = "bypassPermissions",
         timeout_s: int | None = None,
         multi_agent: bool = False,
+        agents: list[str] | None = None,
     ) -> None:
         self.claude_bin = claude_bin
         self.default_model = default_model
         self.permission_mode = permission_mode
-        self.multi_agent = multi_agent
+
+        # Roster-Auflösung (Spec v0.3 Teil 5.1): `agents` ist die Quelle der
+        # Wahrheit, sobald gesetzt. Sonst bildet das `multi_agent`-Flag den
+        # Alt-Pfad ab — True = volles Default-Roster, False = einsamer
+        # developer (klassischer Single-Agent-Run, kein Plan, kein Task-Tool).
+        if agents is not None:
+            self.agents = normalize_agents(agents)
+        elif multi_agent:
+            self.agents = list(DEFAULT_AGENTS)
+        else:
+            self.agents = ["developer"]
+        self.multi_agent = roster_needs_orchestration(self.agents)
+
         # Multi-Agent-Runs spawnen Subagents (architect/developer/tester),
         # daher mehr Wallclock-Budget. Single-Agent-Runs reichen 10 Min.
         if timeout_s is None:
-            self.timeout_s = 1500 if multi_agent else DEFAULT_TIMEOUT_S
+            self.timeout_s = 1500 if self.multi_agent else DEFAULT_TIMEOUT_S
         else:
             self.timeout_s = timeout_s
 
@@ -148,10 +164,11 @@ class ClaudeCodeCLIAgent:
         allowed_tools: str | None = None,
         env: dict[str, str] | None = None,
     ) -> ProposalResult:
-        # Multi-Agent: Subagent-Markdowns in den Worktree kopieren, bevor
-        # Claude Code startet — dann werden sie via .claude/agents/ entdeckt.
+        # Multi-Agent: nur die Subagent-Markdowns des aktiven Rosters in den
+        # Worktree kopieren, bevor Claude Code startet — dann werden sie via
+        # .claude/agents/ entdeckt.
         if self.multi_agent:
-            _install_subagents(worktree)
+            _install_subagents(worktree, agents=self.agents)
             allowed_tools = _augment_tools_for_multi_agent(allowed_tools)
 
         cmd = [
@@ -166,7 +183,9 @@ class ClaudeCodeCLIAgent:
             self.permission_mode,
         ]
         if self.multi_agent:
-            cmd.extend(["--append-system-prompt", ORCHESTRATOR_SYSTEM_PROMPT])
+            cmd.extend(
+                ["--append-system-prompt", build_orchestrator_prompt(self.agents)]
+            )
         if allowed_tools:
             cmd.extend(["--allowedTools", allowed_tools])
         chosen_model = model or self.default_model
@@ -267,10 +286,10 @@ class ClaudeCodeCLIAgent:
         else:
             stop_reason = str(raw.get("stop_reason") or "unknown")
 
-        # Plan-Extraktion: nur im multi_agent-Modus, aus result-Text der
-        # Master-claude-Antwort. Single-agent → kein architect, kein Plan.
+        # Plan-Extraktion: nur wenn der architect im Roster ist, aus dem
+        # result-Text der Master-claude-Antwort. Ohne architect → kein Plan.
         plan_md: str | None = None
-        if self.multi_agent:
+        if "architect" in self.agents:
             result_text = str(raw.get("result") or "")
             plan_md = extract_plan_from_master_output(result_text)
 
@@ -414,7 +433,7 @@ class ClaudeCodeCLIAgent:
 # --- Helpers ----------------------------------------------------------
 
 
-def _install_subagents(worktree: Path) -> None:
+def _install_subagents(worktree: Path, agents: list[str] | None = None) -> None:
     """Kopiert die Subagent-Markdowns nach `<worktree>/.claude/agents/`.
 
     Hybrid-Lookup (Spec v0.3 Teil 6.5, Designentscheidung 5.1):
@@ -426,10 +445,21 @@ def _install_subagents(worktree: Path) -> None:
     Identifikation per Datei-Basename: `architect.md` aus dem Projekt
     überschreibt `architect.md` aus den Defaults, andere Defaults bleiben.
 
+    `agents` begrenzt, welche Rollen installiert werden — nur die im Roster
+    aktivierten Arbeitspferde landen im Worktree. `None` installiert alle
+    (Rückwärtskompatibilität). Der Filter gilt auch für Projekt-Overrides.
+
     Idempotent: existierende Files in `.claude/agents/` werden überschrieben.
     """
     target = worktree / ".claude" / "agents"
     target.mkdir(parents=True, exist_ok=True)
+
+    wanted: set[str] | None = (
+        {a.strip().lower() for a in agents} if agents is not None else None
+    )
+
+    def _in_roster(filename: str) -> bool:
+        return wanted is None or Path(filename).stem.lower() in wanted
 
     # Projekt-Override-Verzeichnis aufwärts vom Worktree finden — analog
     # zur venv-Auto-Detection. forge-Worktrees liegen unter
@@ -439,11 +469,12 @@ def _install_subagents(worktree: Path) -> None:
         candidate = ancestor / ".forge" / "agents"
         if candidate.is_dir():
             for md in candidate.glob("*.md"):
-                project_overrides.setdefault(md.name, md)
+                if _in_roster(md.name):
+                    project_overrides.setdefault(md.name, md)
             break  # ersten Treffer aufwärts nehmen — kein Suchen weiter
 
     # Erst Defaults legen, dann Projekt-Overrides drüberkopieren.
-    for src in list_templates():
+    for src in list_templates(agents):
         shutil.copyfile(src, target / src.name)
     for name, src in project_overrides.items():
         shutil.copyfile(src, target / name)

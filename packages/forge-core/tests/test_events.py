@@ -44,6 +44,42 @@ def test_build_event_stamps_payload_schema_version() -> None:
     assert evt.kind is EventKind.RUN_STARTED
 
 
+def test_plan_proposed_schema_is_v1_1_with_additive_fields() -> None:
+    """PlanProposed wurde additiv auf 1.1 erweitert (subtasks + agents_used).
+
+    Alte 1.0-Events (ohne die neuen Felder) müssen weiterhin laden — die
+    neuen Felder haben Defaults."""
+    from forge_core.events.kinds.plan import PlanProposedPayload, PlanSubtask
+
+    # Stamp: Registry führt 1.1.
+    evt = build_event(
+        kind=EventKind.PLAN_PROPOSED,
+        run_id="r1",
+        generation_id="g1",
+        payload=PlanProposedPayload(
+            architect_turns=8,
+            subtask_count=2,
+            subtasks=[
+                PlanSubtask(index=1, title="A", status="done"),
+                PlanSubtask(index=2, title="B"),
+            ],
+            agents_used=["architect", "developer", "tester"],
+        ),
+        **COMMON,
+    )
+    assert evt.payload_schema_version == "1.1"
+    assert evt.payload["subtasks"][0]["status"] == "done"
+    assert evt.payload["subtasks"][1]["status"] == "unknown"
+    assert evt.payload["agents_used"] == ["architect", "developer", "tester"]
+
+    # Alt-Event (Schema 1.0, nur Altfelder) lädt via Modell mit Defaults.
+    legacy = PlanProposedPayload.model_validate(
+        {"architect_turns": 4, "subtask_count": 1, "risk_level": "low"}
+    )
+    assert legacy.subtasks == []
+    assert legacy.agents_used == []
+
+
 def test_build_event_validates_dict_payload() -> None:
     evt = build_event(
         kind=EventKind.RUN_FINISHED,

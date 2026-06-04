@@ -149,3 +149,65 @@ low
     parsed = parse_plan(md)
     assert parsed.subtask_count == 0
     assert parsed.risk_level == "low"
+
+
+def test_subtasks_structured_title_and_index() -> None:
+    md = """# Plan
+## Subtasks
+1. **Image-Import** — file: `x.py` — change: ergänze Image — verified by: pytest
+2. **Logo-Block** — file: `x.py` — change: vor letterhead — verified by: test
+"""
+    parsed = parse_plan(md)
+    assert parsed.subtask_count == 2
+    assert [s.index for s in parsed.subtasks] == [1, 2]
+    assert [s.title for s in parsed.subtasks] == ["Image-Import", "Logo-Block"]
+    # Ohne Status-Marker → unknown.
+    assert all(s.status == "unknown" for s in parsed.subtasks)
+
+
+def test_subtasks_title_fallback_without_bold() -> None:
+    """Ohne **bold** wird der Text bis zum ersten Trennzeichen genommen."""
+    md = """# Plan
+## Subtasks
+1. Add import — file: `x.py`
+2) Plain title with no separator
+"""
+    parsed = parse_plan(md)
+    assert parsed.subtasks[0].title == "Add import"
+    assert parsed.subtasks[1].title == "Plain title with no separator"
+
+
+def test_subtasks_status_checkboxes() -> None:
+    md = """# Plan
+## Subtasks
+1. [x] **Done one** — file: `x.py`
+2. [ ] **Open two** — file: `y.py`
+3. [!] **Failed three** — file: `z.py`
+"""
+    parsed = parse_plan(md)
+    assert [s.status for s in parsed.subtasks] == ["done", "open", "failed"]
+    # Checkbox wird aus dem Titel entfernt.
+    assert [s.title for s in parsed.subtasks] == [
+        "Done one",
+        "Open two",
+        "Failed three",
+    ]
+
+
+def test_subtask_count_matches_structured_len() -> None:
+    """subtask_count folgt der strukturierten Liste, wenn parsbar."""
+    md = """# Plan
+## Subtasks
+1. **A** — x
+2. **B** — y
+3. **C** — z
+"""
+    parsed = parse_plan(md)
+    assert parsed.subtask_count == 3
+    assert len(parsed.subtasks) == 3
+
+
+def test_insufficient_context_has_no_subtasks() -> None:
+    md = "# Insufficient context\n\n1. Welche Library?\n"
+    parsed = parse_plan(md)
+    assert parsed.subtasks == []

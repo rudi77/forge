@@ -94,6 +94,13 @@ class RunConfig:
     issue_number: int | None = None
     pr_number: int | None = None
 
+    agents: list[str] = field(
+        default_factory=lambda: ["architect", "developer", "tester"]
+    )
+    """Aktiviertes Subagent-Roster (Spec v0.3 Teil 5.1). Wird in das
+    PlanProposed-Event als `agents_used` gespiegelt — der Record, welche
+    Arbeitspferde am Run mitwirkten."""
+
 
 @dataclass
 class GenerationOutcome:
@@ -670,7 +677,7 @@ class SequentialRunner:
         feinkörniges Subagent-Turn-Tracking. Spec v0.3 erlaubt das (das
         Feld ist informativ, nicht semantisch).
         """
-        from forge_core.events.kinds.plan import PlanProposedPayload
+        from forge_core.events.kinds.plan import PlanProposedPayload, PlanSubtask
 
         from forge_execute._plan_parser import parse_plan
 
@@ -684,6 +691,11 @@ class SequentialRunner:
                 risk_level=parsed.risk_level,
                 out_of_scope=parsed.out_of_scope,
                 insufficient_context=parsed.insufficient_context,
+                subtasks=[
+                    PlanSubtask(index=s.index, title=s.title, status=s.status)
+                    for s in parsed.subtasks
+                ],
+                agents_used=list(self.config.agents),
             ),
             generation_id=gen_id,
             artifacts={"plan": plan_hash},

@@ -7,72 +7,201 @@ damit Claude Code sie als verfügbare Subagents erkennt.
 from importlib.resources import files
 from pathlib import Path
 
+# Subagent-Rollen, die forge als Arbeitspferde kennt. Reihenfolge ist die
+# kanonische Pipeline-Ordnung (architect plant, developer baut, tester prüft).
+KNOWN_AGENTS: tuple[str, ...] = ("architect", "developer", "tester")
+
+# Default-Roster, wenn der Operator nichts anderes konfiguriert.
+DEFAULT_AGENTS: tuple[str, ...] = ("architect", "developer", "tester")
+
 
 def templates_dir() -> Path:
     """Liefert den Pfad zum Templates-Verzeichnis."""
     return Path(str(files("forge_execute.agents.templates")))
 
 
-def list_templates() -> list[Path]:
-    """Alle .md-Files in Templates-Verzeichnis (sortiert)."""
-    return sorted(templates_dir().glob("*.md"))
+def list_templates(agents: list[str] | None = None) -> list[Path]:
+    """`.md`-Templates im Verzeichnis (sortiert).
+
+    `agents=None` liefert ALLE Templates (Rückwärtskompatibilität). Wird eine
+    Roster-Liste übergeben, werden nur die Templates der enthaltenen Rollen
+    zurückgegeben — so installiert forge nur die Arbeitspferde, die der Run
+    laut Spec-Config tatsächlich nutzt.
+    """
+    all_templates = sorted(templates_dir().glob("*.md"))
+    if agents is None:
+        return all_templates
+    wanted = {a.strip().lower() for a in agents}
+    return [p for p in all_templates if p.stem.lower() in wanted]
 
 
-# Default-Orchestrator-Prompt, der den Haupt-Claude anweist, die Subagents
-# zu nutzen. Wird von ClaudeCodeCLIAgent als --append-system-prompt
-# weitergereicht.
-ORCHESTRATOR_SYSTEM_PROMPT = """\
-You are the lead engineer in a forge software factory. You have specialised \
-subagents available — use them via the Task tool:
+def normalize_agents(agents: list[str] | None) -> list[str]:
+    """Normalisiert eine Roster-Liste auf bekannte Rollen in Pipeline-Ordnung.
 
-- **architect** (read-only): produces a structured plan in Markdown given a \
-  task description. Always invoke FIRST for any non-trivial task.
-- **developer**: implements exactly ONE subtask from the architect's plan. \
-  Invoke once per subtask, in order.
-- **tester**: writes failing tests OR runs the test suite to verify a subtask's \
-  acceptance criteria. Invoke before AND after a developer run when the plan \
-  requires new tests.
+    Unbekannte/leere Einträge werden verworfen. `None` oder leer → Default.
+    Duplikate werden zusammengefasst. Die Ausgabe-Reihenfolge folgt
+    `KNOWN_AGENTS`, damit der Orchestrator-Prompt deterministisch ist.
+    """
+    if not agents:
+        return list(DEFAULT_AGENTS)
+    present = {a.strip().lower() for a in agents if a and a.strip()}
+    ordered = [a for a in KNOWN_AGENTS if a in present]
+    return ordered or list(DEFAULT_AGENTS)
 
-## Your workflow
 
-1. Read the user's task and the project's `CLAUDE.md` + `.forge/project.yaml`.
-2. Call the **architect** subagent with the task. Read its plan output.
-3. If the plan reports "Insufficient context", relay that to the user and stop.
-4. For each subtask in the plan, in order:
-   a. If the subtask requires a test, call the **tester** subagent first.
-   b. Call the **developer** subagent with the subtask number.
-   c. If the developer reports "Plan needs revision", call the architect \
-      again with the new context and update the plan.
-5. After all subtasks, call the **tester** one more time to run the full \
-   verification suite from the plan.
-6. Stop. Output a final short summary AND the verbatim plan, formatted exactly \
-   as below (forge parses this — do not reformat or omit the markers):
+def roster_needs_orchestration(agents: list[str]) -> bool:
+    """True, wenn der Roster echte Mehr-Agenten-Orchestrierung braucht.
 
-```
----FORGE-PLAN-BEGIN---
-<verbatim plan markdown from the architect subagent, unchanged>
----FORGE-PLAN-END---
+    Ein einsamer ``developer`` braucht keinen Orchestrator (= klassischer
+    Single-Agent-Run): kein Plan, kein Task-Tool, keine Subagent-Installation.
+    Sobald architect oder tester mitwirken, orchestriert der Master.
+    """
+    return bool(set(agents) - {"developer"})
 
-## Run summary
-<2-4 bullets: which subtasks done, anything still open, any caveats>
-```
 
-   The `---FORGE-PLAN-BEGIN---` / `---FORGE-PLAN-END---` markers are MANDATORY \
-   and must appear on their own lines. The block between them must be the \
-   architect's plan text, byte-for-byte if possible.
+def build_orchestrator_prompt(agents: list[str]) -> str:
+    """Baut den `--append-system-prompt` aus dem aktivierten Roster.
 
-## What you NEVER do
+    Nur die Rollen aus `agents` werden beschrieben und in den Workflow
+    eingewoben. Ohne ``architect`` entfällt der Plan-Schritt (und die
+    ``---FORGE-PLAN-...---``-Marker); ohne ``tester`` entfallen die
+    Verifikations-Schritte.
+    """
+    roster = normalize_agents(agents)
+    has_architect = "architect" in roster
+    has_tester = "tester" in roster
 
-- Edit files yourself. Delegate to the developer subagent.
-- Skip the architect step, even for tasks that look simple. The plan is \
-  proof that you understood the constraints.
-- Continue past a failed verification. If the tester reports red, hand back \
-  to the developer with the failure detail and let them fix it. Two retries \
-  max — then stop and report.
-- Touch any file matching a pattern in `.forge/project.yaml` `forbidden` list.
-- Omit the `---FORGE-PLAN-...---` markers. forge needs them to persist the \
-  plan as a first-class artefact.
-"""
+    # --- Rollenbeschreibungen (nur aktivierte) ----------------------
+    descriptions: list[str] = []
+    if has_architect:
+        descriptions.append(
+            "- **architect** (read-only): produces a structured plan in "
+            "Markdown given a task description. Always invoke FIRST for any "
+            "non-trivial task."
+        )
+    descriptions.append(
+        "- **developer**: implements exactly ONE subtask"
+        + (" from the architect's plan" if has_architect else "")
+        + ". Invoke once per subtask, in order."
+    )
+    if has_tester:
+        descriptions.append(
+            "- **tester**: writes failing tests OR runs the test suite to "
+            "verify a subtask's acceptance criteria. Invoke before AND after "
+            "a developer run when the task requires new tests."
+        )
+
+    # --- Workflow-Schritte (konditional) ----------------------------
+    steps: list[str] = [
+        "1. Read the user's task and the project's `CLAUDE.md` + "
+        "`.forge/project.yaml`."
+    ]
+    n = 2
+    if has_architect:
+        steps.append(
+            f"{n}. Call the **architect** subagent with the task. Read its "
+            "plan output."
+        )
+        n += 1
+        steps.append(
+            f"{n}. If the plan reports \"Insufficient context\", relay that to "
+            "the user and stop."
+        )
+        n += 1
+        subtask_src = "the plan"
+    else:
+        subtask_src = "the task"
+
+    sub_lines = [f"{n}. For each subtask in {subtask_src}, in order:"]
+    letter = ord("a")
+    if has_tester:
+        sub_lines.append(
+            f"   {chr(letter)}. If the subtask requires a test, call the "
+            "**tester** subagent first."
+        )
+        letter += 1
+    sub_lines.append(
+        f"   {chr(letter)}. Call the **developer** subagent"
+        + (" with the subtask number" if has_architect else "")
+        + "."
+    )
+    letter += 1
+    if has_architect:
+        sub_lines.append(
+            f"   {chr(letter)}. If the developer reports \"Plan needs "
+            "revision\", call the architect again with the new context and "
+            "update the plan."
+        )
+    steps.append("\n".join(sub_lines))
+    n += 1
+
+    if has_tester:
+        steps.append(
+            f"{n}. After all subtasks, call the **tester** one more time to "
+            "run the full verification suite."
+        )
+        n += 1
+
+    # --- Abschluss-Output -------------------------------------------
+    if has_architect:
+        steps.append(
+            f"{n}. Stop. Output a final short summary AND the verbatim plan, "
+            "formatted exactly as below (forge parses this — do not reformat "
+            "or omit the markers):\n\n"
+            "```\n"
+            f"{PLAN_BEGIN_MARKER}\n"
+            "<the architect's plan markdown. You MAY prepend a status "
+            "checkbox to each subtask line — `[x]` done, `[ ]` not done, "
+            "`[!]` failed — but change nothing else.>\n"
+            f"{PLAN_END_MARKER}\n\n"
+            "## Run summary\n"
+            "<2-4 bullets: which subtasks done, anything still open, any "
+            "caveats>\n"
+            "```\n\n"
+            f"   The `{PLAN_BEGIN_MARKER}` / `{PLAN_END_MARKER}` markers are "
+            "MANDATORY and must appear on their own lines."
+        )
+    else:
+        steps.append(
+            f"{n}. Stop. Output a short summary: which subtask(s) you "
+            "implemented and the verification result."
+        )
+
+    # --- Verbote (konditional) --------------------------------------
+    nevers = ["- Edit files yourself. Delegate to the developer subagent."]
+    if has_architect:
+        nevers.append(
+            "- Skip the architect step, even for tasks that look simple. The "
+            "plan is proof that you understood the constraints."
+        )
+    if has_tester:
+        nevers.append(
+            "- Continue past a failed verification. If the tester reports "
+            "red, hand back to the developer with the failure detail and let "
+            "them fix it. Two retries max — then stop and report."
+        )
+    nevers.append(
+        "- Touch any file matching a pattern in `.forge/project.yaml` "
+        "`forbidden` list."
+    )
+    if has_architect:
+        nevers.append(
+            f"- Omit the `{PLAN_BEGIN_MARKER}` / `{PLAN_END_MARKER}` markers. "
+            "forge needs them to persist the plan as a first-class artefact."
+        )
+
+    roster_str = ", ".join(roster)
+    return (
+        "You are the lead engineer in a forge software factory. Your active "
+        f"subagent team for this task is: {roster_str}. Use them via the Task "
+        "tool:\n\n"
+        + "\n".join(descriptions)
+        + "\n\n## Your workflow\n\n"
+        + "\n".join(steps)
+        + "\n\n## What you NEVER do\n\n"
+        + "\n".join(nevers)
+        + "\n"
+    )
 
 
 # Markers used by ClaudeCodeCLIAgent to extract the architect's plan from
@@ -93,3 +222,8 @@ def extract_plan_from_master_output(text: str) -> str | None:
         return None
     plan = text[begin + len(PLAN_BEGIN_MARKER) : end].strip()
     return plan or None
+
+
+# Rückwärtskompatibler Default-Prompt (volles Roster). Neuer Code soll
+# `build_orchestrator_prompt(agents)` mit dem konkreten Roster nutzen.
+ORCHESTRATOR_SYSTEM_PROMPT = build_orchestrator_prompt(list(DEFAULT_AGENTS))

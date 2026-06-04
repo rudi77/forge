@@ -35,6 +35,11 @@ jobs:
         run: uv run ruff check packages/
 
       - name: Pytest
+        # COLUMNS erzwingt eine feste Terminalbreite — sonst meldet der
+        # Runner Breite 0, Rich/Typer schneidet die `--help`-Tabelle ab und
+        # der board-loop-Help-Test sieht `--auto-merge` nicht.
+        env:
+          COLUMNS: "200"
         run: uv run pytest -v --tb=short
 
   build:

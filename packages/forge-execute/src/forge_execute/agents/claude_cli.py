@@ -34,6 +34,7 @@ from forge_execute.agents.base import (
 from forge_execute.agents.templates import (
     DEFAULT_AGENTS,
     build_orchestrator_prompt,
+    extract_agents_from_master_output,
     extract_plan_from_master_output,
     list_templates,
     normalize_agents,
@@ -286,12 +287,17 @@ class ClaudeCodeCLIAgent:
         else:
             stop_reason = str(raw.get("stop_reason") or "unknown")
 
-        # Plan-Extraktion: nur wenn der architect im Roster ist, aus dem
-        # result-Text der Master-claude-Antwort. Ohne architect → kein Plan.
+        # Plan- und Agents-Extraktion aus dem result-Text der Master-claude-
+        # Antwort. Plan nur, wenn der architect im Roster ist (ohne architect
+        # kein Plan). Die tatsächlich gerufenen Rollen meldet der Master in
+        # jedem orchestrierten Run zurück.
         plan_md: str | None = None
-        if "architect" in self.agents:
+        agents_invoked: list[str] | None = None
+        if self.multi_agent:
             result_text = str(raw.get("result") or "")
-            plan_md = extract_plan_from_master_output(result_text)
+            if "architect" in self.agents:
+                plan_md = extract_plan_from_master_output(result_text)
+            agents_invoked = extract_agents_from_master_output(result_text)
 
         return ProposalResult(
             diff=diff,
@@ -306,6 +312,7 @@ class ClaudeCodeCLIAgent:
             raw_response=raw,
             error=None if proc.returncode == 0 else f"exit {proc.returncode}, subtype={raw.get('subtype')}",
             plan_md=plan_md,
+            agents_invoked=agents_invoked,
         )
 
     def review(

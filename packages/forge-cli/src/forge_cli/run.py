@@ -294,9 +294,23 @@ def execute_run(
     # Roster auflösen: explizite --agents-Liste hat Vorrang, sonst bildet das
     # multi_agent-Flag den Alt-Pfad ab (True = volles Default-Roster,
     # False = einsamer developer / klassischer Single-Agent-Run).
-    from forge_execute.agents.templates import DEFAULT_AGENTS, normalize_agents
+    from forge_execute.agents.templates import (
+        DEFAULT_AGENTS,
+        normalize_agents,
+        unknown_agents,
+    )
 
     if agents:
+        # Tippfehler oder noch nicht implementierte (aber spec-reservierte)
+        # Rollen werden von normalize_agents still verworfen — sichtbar machen,
+        # damit der Operator nicht glaubt, eine Rolle laufe mit, die fehlt.
+        dropped = unknown_agents(agents)
+        if dropped and announce:
+            console.print(
+                "[yellow]warning[/yellow]: unbekannte/nicht-ausführbare Rollen "
+                f"ignoriert: {', '.join(dropped)} "
+                "(bekannt: architect, developer, tester, reviewer)"
+            )
         roster = normalize_agents(agents)
     elif multi_agent:
         roster = list(DEFAULT_AGENTS)

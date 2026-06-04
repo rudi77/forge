@@ -341,6 +341,62 @@ def test_build_orchestrator_prompt_without_reviewer_omits_review() -> None:
     assert "BLOCKING" not in prompt
 
 
+def test_unknown_agents_flags_dropped_roles() -> None:
+    from forge_execute.agents.templates import unknown_agents
+
+    assert unknown_agents(None) == []
+    assert unknown_agents(["architect", "developer", "tester", "reviewer"]) == []
+    # Tippfehler und spec-reservierte-aber-nicht-implementierte Rollen werden
+    # sichtbar (Input-Reihenfolge), bekannte fallen raus.
+    assert unknown_agents(["architect", "operations", "typo"]) == [
+        "operations",
+        "typo",
+    ]
+
+
+def test_build_orchestrator_prompt_requests_agents_marker() -> None:
+    from forge_execute.agents.templates import (
+        AGENTS_BEGIN_MARKER,
+        build_orchestrator_prompt,
+    )
+
+    # Beide Roster-Varianten (mit/ohne architect) fordern den Agents-Block an.
+    assert AGENTS_BEGIN_MARKER in build_orchestrator_prompt(
+        ["architect", "developer", "tester"]
+    )
+    assert AGENTS_BEGIN_MARKER in build_orchestrator_prompt(["developer", "tester"])
+
+
+def test_extract_agents_from_master_output_roundtrip() -> None:
+    from forge_execute.agents.templates import (
+        AGENTS_BEGIN_MARKER,
+        AGENTS_END_MARKER,
+        extract_agents_from_master_output,
+    )
+
+    blob = (
+        f"summary text\n{AGENTS_BEGIN_MARKER}\n"
+        "tester, developer, bogus, tester\n"
+        f"{AGENTS_END_MARKER}\ntrailing"
+    )
+    # Bekannte Rollen in Pipeline-Ordnung, Garbage + Duplikate gefiltert.
+    assert extract_agents_from_master_output(blob) == ["developer", "tester"]
+
+
+def test_extract_agents_from_master_output_absent_returns_none() -> None:
+    from forge_execute.agents.templates import extract_agents_from_master_output
+
+    assert extract_agents_from_master_output("no markers anywhere") is None
+    # Marker da, aber nur Unbekanntes drin → None (Caller fällt auf Config).
+    from forge_execute.agents.templates import (
+        AGENTS_BEGIN_MARKER,
+        AGENTS_END_MARKER,
+    )
+
+    empty = f"{AGENTS_BEGIN_MARKER}\nbogus only\n{AGENTS_END_MARKER}"
+    assert extract_agents_from_master_output(empty) is None
+
+
 def test_claude_agent_roster_derives_multi_agent() -> None:
     """`agents`-Roster ist die Quelle der Wahrheit für multi_agent."""
     lone = ClaudeCodeCLIAgent(agents=["developer"])

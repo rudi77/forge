@@ -170,7 +170,16 @@ Der **reviewer** ist das opt-in 4. Arbeitspferd (`KNOWN_AGENTS`, aber **nicht** 
 
 Welche Rollen mitwirken, steuert die `agents:[...]`-Roster aus der Trigger-Config (`spec.triggers.on_issue_label[label].agents`). Der board-loop löst das Roster pro Issue-Label auf (`_roster_for_issue`), `forge run` nimmt `--agents a,b,c` (oder `--multi-agent` als Shortcut fürs Default-Roster). Das Roster fließt in:
 - `ClaudeCodeCLIAgent(agents=...)` → `build_orchestrator_prompt(roster)` baut den `--append-system-prompt` aus genau den aktiven Rollen; ohne `architect` entfallen Plan-Schritt + `---FORGE-PLAN-...---`-Marker, ohne `tester` die Verifikations-Schritte, ohne `reviewer` der Review-Schritt + die BLOCKING-Findings-Schleife. `_install_subagents(wt, agents=roster)` kopiert nur die Roster-`.md`s in den Worktree.
-- `RunConfig.agents` → `PlanProposed.agents_used` (Record, welche Arbeitspferde liefen).
+- `RunConfig.agents` ist das **konfigurierte** Roster. `PlanProposed.agents_used` trägt dagegen die **tatsächlich gerufenen** Rollen: der Master meldet sie im `---FORGE-AGENTS-BEGIN/END---`-Block (`extract_agents_from_master_output`), der Runner setzt `agents_used = agents_invoked or list(config.agents)` — Selbstauskunft gewinnt, Config ist nur Fallback. Gleicher Trust-Model wie die Plan-Checkboxen: best-effort, aber misst Wirklichkeit statt Absicht (Mantra 1). Kein Schema-Bump — das Feld bedeutete schon immer „mitgewirkt".
+
+### Modell pro Rolle: via Projekt-Override
+
+Die `.md`-Templates tragen `model: sonnet` im Frontmatter. Wer eine Rolle auf ein anderes Modell heben will (z.B. `architect` auf opus), legt ein Projekt-Override unter `<repo>/.forge/agents/<role>.md` mit eigenem Frontmatter ab — `_install_subagents` kopiert die ganze Datei (inkl. `model:`-Zeile) über den Default. Das funktioniert in BEIDEN Pfaden (`forge run` + board-loop), weil beide durch denselben Hybrid-Lookup gehen. Kein Spec-Feld nötig, kein zweiter Konfig-Ort.
+
+### Was die Orchestrierung (noch) NICHT misst
+
+- **Per-Subagent-Telemetrie** (Cost/Tokens/Turns pro Rolle): `--output-format json` liefert nur Master-Totals. Eine echte Aufschlüsselung bräuchte `--output-format stream-json` + Stream-Parser — ein separater, gegen echtes `claude` zu verifizierender Change, kein blinder Umbau des funktionierenden propose-Pfads.
+- **„Zwei Runden max"** bei roter Verifikation/BLOCKING-Findings ist bewusst eine Prompt-Instruktion, **kein** vom Runner gezähltes Limit: die harte Ressourcen-Grenze sind Cost-Caps + `max_turns` (`_check_run_cost_cap`). Würde der Runner die Retry-Runden zählen, müsste er die Orchestrierungs-Schritte kennen → Mantra-3-Bruch.
 
 Ein einsamer `["developer"]` braucht keine Orchestrierung (`roster_needs_orchestration`) — das ist der klassische Single-Agent-Run (kein Task-Tool, kein Plan). Das alte `multi_agent: bool` bleibt rückwärtskompatibel (`True` = Default-Roster, `False` = `["developer"]`).
 

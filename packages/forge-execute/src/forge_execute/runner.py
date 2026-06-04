@@ -51,6 +51,7 @@ from forge_execute.agents.base import (
 )
 from forge_execute.capabilities import Capabilities
 from forge_execute.evaluators.command import CommandEvaluator, EvalRunResult
+from forge_execute.evaluators.judge import JudgeEvaluator, JudgeOutcome
 from forge_execute.gates import GateBaseline, evaluate_gates
 from forge_execute.mutators.code import CodeMutator, MutationResult
 from forge_execute.scoring import ScoreBaseline, compute_composite, keep_or_discard
@@ -76,6 +77,11 @@ class RunConfig:
 
     prompt_template_id: str
     initial_prompt: str
+
+    acceptance_criteria: str | None = None
+    """Kriterien, gegen die der LLM-Judge den Diff bewertet (Spec v0.5).
+    ``None`` = nutze ``initial_prompt`` (der Issue-Text ist das Kriterium).
+    Nur relevant, wenn ``spec.judge.enabled``."""
 
     trigger: TriggerKind = "manual"
     focus: str | None = None
@@ -149,6 +155,11 @@ class SequentialRunner:
             worktrees=self.worktrees, capabilities=self.capabilities
         )
         self.evaluator = CommandEvaluator()
+        # Judge-Phase (Spec v0.5): opt-in via spec.judge.enabled. Wenn aus,
+        # bleibt der Pfad exakt wie vorher — kein Judge-Call, keine Kosten.
+        self._judge = (
+            JudgeEvaluator(agent) if config.spec.judge.enabled else None
+        )
 
         self.run_id = str(ULID())
         self._spec_version = config.spec.spec_version
@@ -400,15 +411,27 @@ class SequentialRunner:
 
         # --- Phase 4: Eval --------------------------------------------
         eval_result = self._eval(worktree, gen_id)
+        measurements = dict(eval_result.measurements)
+
+        # --- Phase 4b: Judge (opt-in, Spec v0.5) ----------------------
+        # Verifiziert den Diff gegen die Akzeptanzkriterien. Der Score
+        # wird als llm_judge_score in die Measurements gemerged, BEVOR die
+        # Gates ausgewertet werden — ein llm_judge_score-Gate macht ihn
+        # damit in der unveränderten Decide-Logik bindend (rot→grün-
+        # Revival, sobald der Judge das Feature bestätigt).
+        judge_outcome: JudgeOutcome | None = None
+        if self._judge is not None:
+            judge_outcome = self._run_judge(worktree, gen_id, proposal.diff)
+            measurements.update(judge_outcome.measurement)
 
         gates_passed, gate_results = evaluate_gates(
-            measurements=eval_result.measurements,
+            measurements=measurements,
             spec=self.config.spec,
             baseline=self._gate_baseline,
         )
         composite = (
             compute_composite(
-                measurements=eval_result.measurements,
+                measurements=measurements,
                 spec=self.config.spec,
                 baseline=self._score_baseline,
             )
@@ -416,7 +439,7 @@ class SequentialRunner:
             else None
         )
 
-        # EvalFinished mit allem
+        # EvalFinished mit allem (Gates inkl. judge, falls aktiviert)
         eval_payload = EvalFinishedPayload(
             eval_mode="quick",
             suite_id=self.config.eval_suite,
@@ -424,13 +447,13 @@ class SequentialRunner:
             gates=gate_results,
             scores={
                 k: v
-                for k, v in eval_result.measurements.items()
+                for k, v in measurements.items()
                 if any(s.kind == k for s in self.config.spec.scores)
             },
             composite_value=composite,
             diagnostics={
                 k: v
-                for k, v in eval_result.measurements.items()
+                for k, v in measurements.items()
                 if any(d.kind == k for d in self.config.spec.diagnostics)
             },
         )
@@ -497,18 +520,23 @@ class SequentialRunner:
             # Revert-Anker aktualisieren, damit DISCARD in einer späteren
             # Generation NICHT diesen KEPT-Commit wegblastet.
             self._current_base_commit = new_sha
-            # Baseline für nächste Generation aktualisieren
-            self._update_baselines_from_eval(eval_result, composite, gate_results)
+            # Baseline für nächste Generation aktualisieren — mit den
+            # gemergten Measurements (inkl. judge), damit die nächste
+            # Generation den Judge-Score korrekt als grüne Baseline kennt.
+            self._update_baselines_from_eval(measurements, composite, gate_results)
         else:
             self.worktrees.revert(worktree, to_commit=self._current_base_commit)
 
+        gen_cost = proposal.cost_usd + (
+            judge_outcome.cost_usd if judge_outcome is not None else Decimal("0")
+        )
         outcome = GenerationOutcome(
             idx=gen_idx,
             kept=kept,
             reason=reason,
             composite=composite,
             score_delta=score_delta,
-            cost_usd=proposal.cost_usd,
+            cost_usd=gen_cost,
             # Self-Termination wird am Generation-Outcome durchgereicht,
             # damit der Run-Loop danach abbricht — das Generation-Outcome
             # selbst (kept/reason) reflektiert aber das echte Eval-Resultat.
@@ -833,6 +861,70 @@ class SequentialRunner:
             cwd=worktree.path,
         )
 
+    def _run_judge(
+        self,
+        worktree: Worktree,
+        gen_id: str,
+        diff: str,
+    ) -> JudgeOutcome:
+        """Führt die Judge-Phase aus und emittiert das Eventpaar.
+
+        Eigenes ``EVAL_STARTED``/``EVAL_FINISHED``-Paar mit
+        ``eval_mode="judge"`` (Mantra 2: jeder Schritt ein Event). Das
+        autoritative Gate-Resultat steht im nachfolgenden
+        ``EVAL_FINISHED(eval_mode="quick")``; dieses Event hier ist die
+        Judge-Ökonomie + Begründung für den Replay. Fail-closed liegt
+        im :class:`JudgeEvaluator`.
+        """
+        assert self._judge is not None
+        judge_cfg = self.config.spec.judge
+        self._emit(
+            EventKind.EVAL_STARTED,
+            EvalStartedPayload(
+                eval_mode="judge",
+                suite_id="judge",
+                budget_s=judge_cfg.budget_s,
+            ),
+            generation_id=gen_id,
+        )
+
+        acceptance = self.config.acceptance_criteria or self.config.initial_prompt
+        outcome = self._judge.run(
+            worktree=worktree.path,
+            acceptance_criteria=acceptance,
+            diff=diff,
+            max_turns=judge_cfg.max_turns,
+            budget_usd=self.config.spec.cost_caps.per_generation_usd,
+            model=judge_cfg.model or self.config.model,
+        )
+        self._total_cost += outcome.cost_usd
+
+        artifacts: dict[str, str] = {}
+        if outcome.reasoning:
+            artifacts["judge_reasoning"] = self.blobs.put_text(outcome.reasoning)
+
+        self._emit(
+            EventKind.EVAL_FINISHED,
+            EvalFinishedPayload(
+                eval_mode="judge",
+                suite_id="judge",
+                gates_passed=outcome.verdict == "pass",
+                gates=[],
+                scores={},
+                composite_value=None,
+                diagnostics=dict(outcome.measurement),
+            ),
+            generation_id=gen_id,
+            artifacts=artifacts,
+            cost_usd=outcome.cost_usd,
+            model=outcome.model,
+            duration_ms=outcome.duration_ms or None,
+            success=outcome.error is None,
+            error_class="JudgeError" if outcome.error else None,
+            error_msg=outcome.error,
+        )
+        return outcome
+
     # --- Bookkeeping -----------------------------------------------------
 
     def _update_baselines(self, eval_result: EvalRunResult) -> None:
@@ -857,12 +949,12 @@ class SequentialRunner:
 
     def _update_baselines_from_eval(
         self,
-        eval_result: EvalRunResult,
+        measurements: dict[str, float],
         composite: float | None,
         gate_results: list | None = None,
     ) -> None:
-        self._gate_baseline = GateBaseline(values=dict(eval_result.measurements))
-        self._score_baseline = ScoreBaseline(values=dict(eval_result.measurements))
+        self._gate_baseline = GateBaseline(values=dict(measurements))
+        self._score_baseline = ScoreBaseline(values=dict(measurements))
         # Wenn wir KEEP gemacht haben, sind die Gates per Definition grün.
         self._baseline_gates_passed = True
         if gate_results is not None:

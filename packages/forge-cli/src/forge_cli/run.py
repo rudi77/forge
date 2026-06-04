@@ -67,6 +67,17 @@ def run_command(
             help="Stabile ID des Prompt-Templates (für Telemetrie).",
         ),
     ] = "manual_run_v1",
+    acceptance_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--acceptance-file",
+            help=(
+                "Datei mit Akzeptanzkriterien für den LLM-Judge "
+                "(spec.judge.enabled). Default: der Prompt selbst dient "
+                "als Kriterium."
+            ),
+        ),
+    ] = None,
     spec_path: Annotated[
         Path | None,
         typer.Option("--spec", help="Pfad zur project.yaml. Default: <repo>/.forge/project.yaml"),
@@ -194,6 +205,12 @@ def run_command(
         )
         raise typer.Exit(code=2)
 
+    acceptance_criteria = (
+        acceptance_file.read_text(encoding="utf-8")
+        if acceptance_file is not None
+        else None
+    )
+
     outcome = execute_run(
         ctx=ctx,
         rendered_prompt=rendered_prompt,
@@ -201,6 +218,7 @@ def run_command(
         trigger=trigger,
         focus=focus,
         base_ref=base_ref,
+        acceptance_criteria=acceptance_criteria,
         max_iterations=max_iterations,
         max_turns=max_turns,
         eval_suite=eval_suite,
@@ -235,6 +253,7 @@ def execute_run(
     trigger: str,
     focus: str | None,
     base_ref: str,
+    acceptance_criteria: str | None = None,
     max_iterations: int,
     max_turns: int,
     eval_suite: str,
@@ -283,6 +302,7 @@ def execute_run(
         repo_root=ctx.repo_root,
         prompt_template_id=prompt_template_id,
         initial_prompt=rendered_prompt,
+        acceptance_criteria=acceptance_criteria,
         trigger=trigger,  # type: ignore[arg-type]
         focus=focus,
         base_ref=base_ref,

@@ -252,6 +252,12 @@ def board_loop_command(
 
         focus = focus_template.format(number=issue.number)
         prompt = wrap_issue_body(title=issue.title, body=issue.body)
+        # Der vom Menschen geschriebene Issue-Text IST das Akzeptanz-
+        # kriterium für den LLM-Judge (spec.judge.enabled). Wir geben den
+        # rohen Titel+Body durch, nicht den UNTRUSTED-gewrappten Prompt —
+        # der Judge bewertet gegen die Anforderung, nicht gegen die
+        # Sicherheits-Hülle.
+        acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
         console.print(
             f"\n[bold cyan]>>> board-loop[/bold cyan] dispatching issue "
             f"#{issue.number} [italic]{issue.title}[/italic]"
@@ -264,6 +270,7 @@ def board_loop_command(
                 trigger="issue_label",
                 focus=focus,
                 base_ref=base_ref,
+                acceptance_criteria=acceptance,
                 max_iterations=max_iterations,
                 max_turns=max_turns,
                 eval_suite=eval_suite,

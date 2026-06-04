@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 
 class CodingAgentError(RuntimeError):
@@ -23,6 +23,30 @@ class CodingAgentError(RuntimeError):
 
 class CodingAgentTimeout(CodingAgentError):
     """Agent-Aufruf hat Budget oder Wallclock überschritten."""
+
+
+@dataclass(frozen=True)
+class ReviewResult:
+    """Ergebnis eines ``review``-Aufrufs (LLM-Judge, Spec v0.5).
+
+    Der Judge bewertet einen Diff gegen die Akzeptanzkriterien (= Issue-
+    Text) und liefert einen kontinuierlichen ``judge_score`` ∈ [0, 1]
+    plus eine binäre ``verdict``-Zusammenfassung und eine kurze
+    Begründung. ``judge_score`` ist der Wert, der als ``llm_judge_score``
+    in den Eval-Output gemerged wird; ``reasoning`` wird als Blob-
+    Artefakt persistiert, damit der Replay nachvollziehbar bleibt.
+    """
+
+    judge_score: float
+    verdict: Literal["pass", "fail"]
+    reasoning: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: Decimal = Decimal("0")
+    turns_used: int = 0
+    duration_ms: int = 0
+    model: str | None = None
+    raw_response: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -60,9 +84,10 @@ class ProposalResult:
 class CodingAgent(Protocol):
     """Was der Runner von einem Coding-Agent erwartet.
 
-    Nur eine Methode in v1: `propose`. `review` und `estimate_cost` aus dem
-    Spec-Entwurf sind v2/v3 — werden nachgezogen, sobald der Trigger
-    `on_pr_opened` aktiv genutzt wird.
+    Zwei Methoden: ``propose`` (modifiziert den Worktree) und ``review``
+    (read-only Bewertung eines Diffs gegen Akzeptanzkriterien — der
+    LLM-Judge, Spec v0.5). ``estimate_cost`` aus dem Spec-Entwurf bleibt
+    v2/v3.
     """
 
     def propose(
@@ -77,4 +102,25 @@ class CodingAgent(Protocol):
         env: dict[str, str] | None = None,
     ) -> ProposalResult:
         """Schickt einen Vorschlag an den Agent. Modifiziert den Worktree."""
+        ...
+
+    def review(
+        self,
+        *,
+        worktree: Path,
+        acceptance_criteria: str,
+        diff: str,
+        max_turns: int,
+        budget_usd: Decimal,
+        model: str | None = None,
+        allowed_tools: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> ReviewResult:
+        """Bewertet den Diff gegen die Akzeptanzkriterien (read-only).
+
+        Modifiziert den Worktree **nicht**. Bei Subprozess-Fehler oder
+        unparsbarer Antwort wird ``CodingAgentError`` (bzw.
+        ``CodingAgentTimeout``) geworfen — der Caller behandelt das
+        fail-closed (Score 0.0 / fail).
+        """
         ...

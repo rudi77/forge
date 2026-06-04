@@ -50,6 +50,7 @@ GateKind = Literal[
     "eslint_errors",
     "coverage_pct",
     "build_success",
+    "llm_judge_score",
 ]
 
 ScoreKind = Literal[
@@ -331,6 +332,51 @@ class TriageConfig(BaseModel):
     nur den Kommentar will und manuell schließen möchte."""
 
 
+class JudgeConfig(BaseModel):
+    """LLM-Judge als opt-in Verifikations-Phase (Spec v0.5 Teil 6.x).
+
+    Für Feature-Issues, die der Mensch in Prosa beschreibt, gibt es keine
+    natürliche numerische Metrik, die "Feature korrekt implementiert" misst.
+    Die rein Composite-getriebene Decide-Phase würde eine reine
+    Feature-Implementierung mangels Score-Verbesserung verwerfen.
+
+    Der Judge schließt diese Lücke: ein read-only ``claude -p``-Aufruf
+    bewertet den Diff gegen die Akzeptanzkriterien (= Issue-Text) und
+    liefert einen ``llm_judge_score`` ∈ [0, 1]. Dieser Messwert wird in
+    den Eval-Output gemerged, sodass ein gewöhnliches Gate
+    (``kind: llm_judge_score``) ihn in der **unveränderten** Decide-Logik
+    bindend macht. Vor der Implementierung ist der Score 0 (Gate rot),
+    nach erfolgreicher Implementierung grün → der bestehende
+    ``gate_revival``-Pfad behält die Änderung.
+
+    Fail-closed: scheitert der Judge (claude-Crash, JSON-Garbage,
+    Timeout), gilt ``score = 0.0`` / ``fail`` → das Gate bleibt rot →
+    DISCARD. Nichts wird ohne bestätigte Verifikation behalten.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    """Schaltet die Judge-Phase pro Generation ein. Default ``False`` —
+    opt-in, weil sie zusätzliche LLM-Kosten pro Generation produziert."""
+
+    model: str | None = None
+    """Claude-Modell für den Judge-Call. ``None`` = nutze das Run-Modell.
+    Ein kleines Modell reicht oft (Bewertung, kein Code)."""
+
+    max_turns: int = Field(default=6, gt=0)
+    """Cap auf Tool-Turns im Judge-Aufruf. Default 6 reicht für
+    ``git diff`` + ``Read`` betroffener Files + Bewertung."""
+
+    threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    """Dokumentations-Default für die passende Gate-Schwelle. Das
+    *wirksame* Gate steht in ``gates:`` (``kind: llm_judge_score``);
+    dieses Feld dient nur als Referenz und für ``forge doctor``."""
+
+    budget_s: int = Field(default=300, gt=0)
+    """Wallclock-Budget für den Judge-Subprozess."""
+
+
 class BoardConfig(BaseModel):
     """GitHub Project board als aktive Trigger-Quelle (Spec v0.4).
 
@@ -406,6 +452,9 @@ class ProjectSpec(BaseModel):
     """Optionaler Project-Board-Config; aktiviert ``forge board-loop`` (v0.4)."""
     triage: TriageConfig = Field(default_factory=TriageConfig)
     """Pre-Phase im board-loop. Default: disabled. Siehe :class:`TriageConfig`."""
+    judge: JudgeConfig = Field(default_factory=JudgeConfig)
+    """LLM-Judge-Verifikationsphase pro Generation. Default: disabled.
+    Siehe :class:`JudgeConfig`."""
 
     # --- Cross-field validation ----------------------------------------
 
@@ -480,6 +529,28 @@ class ProjectSpec(BaseModel):
             for s in self.scores:
                 # Pydantic v2: model is mutable until validation completes
                 object.__setattr__(s, "weight", s.weight / total)
+        return self
+
+    @model_validator(mode="after")
+    def _judge_has_binding_gate(self) -> ProjectSpec:
+        """Warnt, wenn der Judge aktiviert ist, aber kein Gate ihn bindet.
+
+        Ohne ein ``kind: llm_judge_score``-Gate fließt der Judge-Score nur
+        als Diagnose mit und beeinflusst die Decide-Phase nicht — die
+        Verifikation wäre zahnlos. Wir lehnen das nicht hart ab (der
+        Operator könnte den Score absichtlich nur beobachten wollen),
+        aber wir warnen sichtbar.
+        """
+        if self.judge.enabled and not any(
+            g.kind == "llm_judge_score" for g in self.gates
+        ):
+            warnings.warn(
+                "judge.enabled is True but no gate of kind 'llm_judge_score' is "
+                "defined — the judge score will be recorded but cannot block a "
+                "DISCARD/KEEP decision. Add a gate "
+                "`{kind: llm_judge_score, threshold: 0.8}` to make it binding.",
+                stacklevel=2,
+            )
         return self
 
     @model_validator(mode="after")

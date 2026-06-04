@@ -28,9 +28,11 @@ Der Mensch ist Operator: er definiert Ziele, Constraints und Erfolgskriterien. D
 | 3 | `forge-execute` — Loop 1 mit allen 5 Phasen | ✅ |
 | 4 | `forge-cli` + `forge-adapters/github` | ✅ |
 | 5 | PINTA-Integration | ⏳ |
+| v0.4 | Board-Trigger + Issue-Triage + Auto-Merge-Queue | ✅ |
+| v0.5 | LLM-Judge — Verifikation gegen Akzeptanzkriterien (opt-in) | ✅ |
 
 Detailierter Fortschritt: [`docs/progress.md`](docs/progress.md).
-Vollständige Spec: [`docs/forge-spec-v0.2.md`](docs/forge-spec-v0.2.md).
+Aktuelle Spec: [`docs/forge-spec-v0.5.md`](docs/forge-spec-v0.5.md) (Diff-Doku; ältere Versionen bleiben als Snapshots).
 
 ## Packages
 

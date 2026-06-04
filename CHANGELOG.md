@@ -2,6 +2,66 @@
 
 Alle bemerkenswerten Änderungen an forge werden hier dokumentiert. Format: [Keep a Changelog](https://keepachangelog.com/), Versionierung: [SemVer](https://semver.org/).
 
+## [Unreleased] — v0.5: LLM-Judge Verifikationsphase
+
+322 Tests grün, ruff clean.
+
+### Hinzugefügt
+
+#### Judge — opt-in Verifikation gegen Akzeptanzkriterien
+
+Schließt die Lücke zwischen "messbare Wartung" und "Feature-Implementierung":
+Für Feature-Issues, die der Mensch in Prosa beschreibt, gibt es keine
+natürliche numerische Metrik. Die rein Composite-getriebene Decide-Phase
+würde eine reine Feature-Implementierung mangels Score-Verbesserung
+verwerfen. Der Judge bewertet den Diff gegen die Akzeptanzkriterien
+(= Issue-Text) und liefert einen ``llm_judge_score`` ∈ [0, 1].
+
+- **`JudgeConfig`** (`forge-core/spec.py`) — neuer ``judge:``-Block in
+  `project.yaml`, default-konstruiert (opt-in, ``enabled: false``).
+  Felder: ``enabled``, ``model``, ``max_turns``, ``threshold``,
+  ``budget_s``. Strict-validated, additiv (kein Breaking Change).
+- **`llm_judge_score` als `GateKind`** — additive Literal-Erweiterung.
+  War bereits `DiagnosticKind`; jetzt auch als Gate nutzbar, wodurch der
+  Judge-Score die **unveränderte** keep/discard-Logik bindet. Vor der
+  Implementierung fehlt der Messwert → Gate rot; nach Bestätigung durch
+  den Judge → grün → bestehender ``gate_revival``-Pfad behält die Änderung.
+- **`CodingAgent.review()` + `ReviewResult`** (`agents/base.py`) — neue
+  read-only Protocol-Methode. Implementiert in `ClaudeCodeCLIAgent`
+  (eigener `claude -p`-Aufruf, read-only Tool-Set, JSON-Verdict) und
+  `MockCodingAgent` (static/sequence/callable + default-pass).
+- **`JudgeEvaluator`** (`evaluators/judge.py`) — dünne, **fail-closed**
+  Schicht über `agent.review()`: bei Crash/Timeout/JSON-Garbage gilt
+  ``score=0.0`` / ``fail`` → Gate bleibt rot → DISCARD. Der Judge darf
+  ein KEEP nie erzwingen, nur erlauben.
+- **Runner-Phase 4b** (`runner.py`) — opt-in Judge zwischen Eval und
+  Gate-Auswertung. Mergt ``llm_judge_score`` in die Measurements, bevor
+  Gates/Composite ausgewertet werden. Eigenes
+  ``EVAL_STARTED``/``EVAL_FINISHED``-Paar mit ``eval_mode="judge"``
+  (kein neuer EventKind — `EvalMode` enthielt "judge" bereits),
+  Begründung als Blob-Artefakt, Kosten in Cost-Caps.
+- **CLI** — `forge run --acceptance-file`, `board-loop` reicht den
+  Issue-Text als Akzeptanzkriterium durch, `forge doctor` warnt bei
+  ``judge.enabled`` ohne bindendes ``llm_judge_score``-Gate.
+
+#### Tests
+
+- **+13 Tests** (309 → 322): `test_judge.py` (+9: fail-closed, Mock-Modi,
+  End-to-End rot→grün-KEEP via Judge-Gate + DISCARD bei Judge-fail),
+  `test_spec.py` (+5: JudgeConfig, Gate-Kind, Warnung), `test_cli.py`
+  (+1: doctor judge-check).
+
+### Boundaries — was bewusst NICHT geändert wurde
+
+- **Decide-Logik unangetastet**: `scoring.py`, `gates.py`,
+  `keep_or_discard` — kein Diff. Der Judge füttert nur einen neuen
+  Messwert ein; die Loop-Logik bleibt unberührt (Mantra 3).
+- **EventKind-Set bleibt 18**, alle `payload_schema_version` bleiben
+  ``"1.0"``. `eval_mode="judge"` war im Schema bereits vorgesehen.
+- Capabilities ``merge_pr``/``push_to_main``/``push_force`` bleiben
+  ``Literal[False]``. Self-Improvement-Verbot unangetastet — der Judge
+  läuft nur gegen Target-Repos.
+
 ## [Unreleased] — v0.4: Board-driven Trigger Source
 
 261 Tests grün, ruff clean.

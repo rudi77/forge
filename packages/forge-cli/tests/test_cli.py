@@ -128,6 +128,43 @@ def test_doctor_on_valid_spec(mini_repo: Path, monkeypatch) -> None:
     assert "ok" in result.stdout
 
 
+def test_doctor_judge_check() -> None:
+    """`_check_judge`: ok wenn disabled, warn wenn enabled ohne Gate, ok mit Gate."""
+    from forge_cli.doctor import _check_judge
+    from forge_core.spec import ProjectSpec
+
+    base = {
+        "spec_version": "1.0",
+        "name": "t",
+        "cost_caps": {
+            "per_generation_usd": "0.5",
+            "per_run_usd": "5",
+            "per_project_per_day_usd": "30",
+            "per_project_per_month_usd": "500",
+        },
+    }
+    disabled = ProjectSpec.model_validate(base)
+    assert _check_judge(disabled).level == "ok"
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # die fehlende-Gate-Warnung ist hier erwartet
+        enabled_no_gate = ProjectSpec.model_validate({**base, "judge": {"enabled": True}})
+    finding = _check_judge(enabled_no_gate)
+    assert finding.level == "warn"
+    assert "llm_judge_score" in finding.detail
+
+    enabled_with_gate = ProjectSpec.model_validate(
+        {
+            **base,
+            "judge": {"enabled": True},
+            "gates": [{"kind": "llm_judge_score", "threshold": 0.8}],
+        }
+    )
+    assert _check_judge(enabled_with_gate).level == "ok"
+
+
 def test_doctor_fails_without_api_key(mini_repo: Path, monkeypatch) -> None:
     monkeypatch.chdir(mini_repo)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

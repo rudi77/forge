@@ -29,6 +29,7 @@ from forge_execute.agents.base import (
     CodingAgentError,
     CodingAgentTimeout,
     ProposalResult,
+    ReviewResult,
 )
 from forge_execute.agents.templates import (
     ORCHESTRATOR_SYSTEM_PROMPT,
@@ -43,6 +44,62 @@ _IS_WINDOWS = platform.system() == "Windows"
 # Default-Wallclock-Limit: ein Vielfaches der LLM-Latenz, falls budget_usd
 # nicht limitiert. Cost-Caps machen das eigentliche Limit aus.
 DEFAULT_TIMEOUT_S = 600
+
+# Read-only Tool-Set für den Judge — niemals Edit/Write. Der Judge
+# bewertet nur, er ändert nichts.
+JUDGE_ALLOWED_TOOLS = ",".join([
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(git diff:*)",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+    "Bash(git status:*)",
+])
+
+
+_JUDGE_PROMPT_TEMPLATE = """\
+Du bist forges Judge. Du bewertest, ob ein Code-Diff die Akzeptanz-
+kriterien eines Issues erfüllt. Du änderst NICHTS — du liest und urteilst.
+
+## Akzeptanzkriterien (vom Menschen geschrieben)
+
+{acceptance}
+
+## Der zu bewertende Diff
+
+```diff
+{diff}
+```
+
+---
+
+Aufgabe: Bewerte, wie vollständig und korrekt der Diff die
+Akzeptanzkriterien erfüllt. Nutze die read-only Tools (Read, Grep,
+git diff/log/show), um den Kontext der geänderten Stellen zu prüfen,
+falls der Diff allein nicht reicht. Bleibe unter {max_turns} Turns.
+
+Bewertungsmaßstab für ``judge_score`` (0.0 - 1.0):
+- 1.0 — alle Kriterien vollständig und korrekt erfüllt.
+- 0.7-0.9 — im Kern erfüllt, kleinere Lücken oder Stilfragen.
+- 0.4-0.6 — teilweise erfüllt, wesentliche Aspekte fehlen.
+- 0.0-0.3 — Kriterien nicht erfüllt, falsch, oder am Thema vorbei.
+
+``verdict`` ist ``"pass"`` ab dem Schwellwert, den der Operator als Gate
+gesetzt hat — gib im Zweifel ``"fail"`` (besser eine ehrliche
+Ablehnung als ein unverdientes Durchwinken).
+
+Antworte am Ende mit GENAU einem JSON-Block in einem ```json...```
+Code-Fence:
+
+```json
+{{
+  "judge_score": 0.0 bis 1.0,
+  "verdict": "pass" | "fail",
+  "reasoning": "kurze Begründung, max 800 Zeichen, deutsch"
+}}
+```
+"""
 
 
 class ClaudeCodeCLIAgent:
@@ -232,6 +289,127 @@ class ClaudeCodeCLIAgent:
             plan_md=plan_md,
         )
 
+    def review(
+        self,
+        *,
+        worktree: Path,
+        acceptance_criteria: str,
+        diff: str,
+        max_turns: int,
+        budget_usd: Decimal,
+        model: str | None = None,
+        allowed_tools: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> ReviewResult:
+        """Bewertet den Diff gegen die Akzeptanzkriterien (read-only).
+
+        Ein einziger ``claude -p``-Aufruf mit einem read-only Tool-Set.
+        Bei Subprozess-Fehler, Timeout oder unparsbarem JSON wird
+        ``CodingAgentError``/``CodingAgentTimeout`` geworfen — der Caller
+        (JudgeEvaluator) behandelt das fail-closed.
+        """
+        prompt = _JUDGE_PROMPT_TEMPLATE.format(
+            acceptance=acceptance_criteria.strip() or "(keine Kriterien angegeben)",
+            diff=_truncate_diff(diff),
+            max_turns=max_turns,
+        )
+        tools = allowed_tools or JUDGE_ALLOWED_TOOLS
+
+        cmd = [
+            self.claude_bin,
+            "-p",
+            prompt,
+            "--output-format", "json",
+            "--max-turns", str(max_turns),
+            "--permission-mode", self.permission_mode,
+            "--allowedTools", tools,
+        ]
+        chosen_model = model or self.default_model
+        if chosen_model:
+            cmd.extend(["--model", chosen_model])
+
+        run_env: dict[str, str] = dict(os.environ)
+        if env:
+            run_env.update(env)
+        run_env = venv_aware_env(Path(worktree), run_env)
+
+        popen_kwargs: dict = dict(
+            cwd=str(worktree),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=run_env,
+        )
+        if _IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        start = time.monotonic()
+        try:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except FileNotFoundError as exc:
+            raise CodingAgentError(
+                f"claude binary not found: {self.claude_bin!r}. "
+                "Install Claude Code CLI or set claude_bin to a valid path."
+            ) from exc
+
+        try:
+            stdout, stderr = proc.communicate(timeout=self.timeout_s)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc.pid)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+            raise CodingAgentTimeout(
+                f"claude exceeded {self.timeout_s}s wallclock budget during review"
+            ) from None
+        duration_ms = int((time.monotonic() - start) * 1000)
+
+        if proc.returncode != 0:
+            stderr_clean = (stderr or "").strip()
+            raise CodingAgentError(
+                f"claude exited {proc.returncode} during review: "
+                f"{stderr_clean[:400] or '<no stderr>'}"
+            )
+
+        raw = _parse_json_output(stdout)
+        result_text = str(raw.get("result") or "")
+        verdict_blob = _extract_json_block(result_text)
+        if verdict_blob is None:
+            raise CodingAgentError(
+                "judge output did not contain a parseable JSON verdict block"
+            )
+
+        score = _clamp_unit(verdict_blob.get("judge_score"))
+        if score is None:
+            raise CodingAgentError(
+                f"judge returned no usable judge_score: {verdict_blob.get('judge_score')!r}"
+            )
+        verdict = verdict_blob.get("verdict")
+        if verdict not in {"pass", "fail"}:
+            # Verdict ableiten ist unsicher — wir verlassen uns auf das Gate,
+            # nicht auf das Self-Verdict. Normalisiere defensiv.
+            verdict = "pass" if score >= 0.8 else "fail"
+
+        usage = raw.get("usage") or {}
+        return ReviewResult(
+            judge_score=score,
+            verdict=verdict,  # type: ignore[arg-type]
+            reasoning=str(verdict_blob.get("reasoning") or "")[:2000],
+            tokens_in=int(usage.get("input_tokens", 0) or 0),
+            tokens_out=int(usage.get("output_tokens", 0) or 0),
+            cost_usd=_extract_cost(raw),
+            turns_used=int(raw.get("num_turns", 0) or 0),
+            duration_ms=duration_ms,
+            model=str(raw.get("model") or chosen_model or ""),
+            raw_response=raw,
+        )
+
 
 # --- Helpers ----------------------------------------------------------
 
@@ -334,6 +512,55 @@ def _extract_cost(raw: dict[str, Any]) -> Decimal:
             except (ValueError, TypeError):
                 continue
     return Decimal("0")
+
+
+def _extract_json_block(result_text: str) -> dict[str, Any] | None:
+    """Findet den letzten ```json…```-Block im Claude-Output und parst ihn.
+
+    Fällt auf ein nacktes letztes ``{…}`` zurück, falls kein Code-Fence
+    da ist — manche Modelle vergessen den Fence."""
+    needle = "```json"
+    last = result_text.rfind(needle)
+    if last != -1:
+        after = result_text[last + len(needle) :]
+        end = after.find("```")
+        if end != -1:
+            try:
+                parsed = json.loads(after[:end].strip())
+                return parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                pass
+    # Fallback: letztes {…}
+    last_open = result_text.rfind("{")
+    last_close = result_text.rfind("}")
+    if last_open == -1 or last_close <= last_open:
+        return None
+    try:
+        parsed = json.loads(result_text[last_open : last_close + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _clamp_unit(value: Any) -> float | None:
+    """Parst einen Wert nach float und klemmt ihn auf [0, 1]. None bei Garbage."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, f))
+
+
+def _truncate_diff(diff: str, *, max_chars: int = 24000) -> str:
+    """Begrenzt den Diff für den Judge-Prompt, damit große Diffs das
+    Token-Budget nicht sprengen. Mitte wird elidiert, Anfang+Ende bleiben."""
+    if len(diff) <= max_chars:
+        return diff
+    head = diff[: max_chars * 2 // 3]
+    tail = diff[-max_chars // 3 :]
+    return f"{head}\n\n... [Diff gekürzt, {len(diff)} Zeichen gesamt] ...\n\n{tail}"
 
 
 # Type-Check: sicherstellen, dass die Klasse das Protocol erfüllt

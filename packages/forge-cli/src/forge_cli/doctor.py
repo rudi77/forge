@@ -66,6 +66,9 @@ def doctor_command(
     # forbidden paths sanity (Spec Teil 7.4: forge selbst muss in forbidden sein)
     findings.append(_check_forge_self_protection(ctx.spec))
 
+    # Judge-Konsistenz (Spec v0.5)
+    findings.append(_check_judge(ctx.spec))
+
     has_error = any(f.level == "error" for f in findings)
     _render(findings)
     raise typer.Exit(code=1 if has_error else 0)
@@ -132,6 +135,27 @@ def _check_forge_self_protection(spec) -> Finding:
         "guardrail",
         "warn",
         f"forbidden missing recommended entries: {missing}",
+    )
+
+
+def _check_judge(spec) -> Finding:
+    """Judge-Phase: wenn aktiviert, muss ein ``llm_judge_score``-Gate sie
+    binden — sonst läuft der Judge (kostet Geld) ohne Wirkung auf die
+    Decide-Phase."""
+    if not spec.judge.enabled:
+        return Finding("judge", "ok", "judge disabled (default)")
+    has_gate = any(g.kind == "llm_judge_score" for g in spec.gates)
+    if has_gate:
+        return Finding(
+            "judge",
+            "ok",
+            f"judge enabled, bound by llm_judge_score gate (threshold {spec.judge.threshold})",
+        )
+    return Finding(
+        "judge",
+        "warn",
+        "judge.enabled but no llm_judge_score gate — judge runs but cannot "
+        "block a decision; add `{kind: llm_judge_score, threshold: 0.8}` to gates",
     )
 
 

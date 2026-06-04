@@ -35,10 +35,15 @@ jobs:
         run: uv run ruff check packages/
 
       - name: Pytest
-        # COLUMNS erzwingt eine feste Terminalbreite — sonst meldet der
-        # Runner Breite 0, Rich/Typer schneidet die `--help`-Tabelle ab und
-        # der board-loop-Help-Test sieht `--auto-merge` nicht.
+        # Der board-loop-Help-Test sucht `--auto-merge` als Literal im
+        # `--help`-Output. Auf dem Runner ist FORCE_COLOR gesetzt, wodurch
+        # Rich/Typer ANSI-Codes mitten in den Optionsnamen einstreut
+        # (`-`,`-auto`,`-merge` separat eingefärbt) — die Teilkette existiert
+        # dann nicht mehr. TERM=dumb + NO_COLOR erzwingen Plain-Text-Rendering,
+        # COLUMNS=200 verhindert zusätzlich breitenbedingtes Abschneiden.
         env:
+          TERM: dumb
+          NO_COLOR: "1"
           COLUMNS: "200"
         run: uv run pytest -v --tb=short
 

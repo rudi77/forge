@@ -1,0 +1,202 @@
+"""Tests für den Conductor-Watch-Modus (Phase C Integration) im board-loop.
+
+Board (list_stage_items / set_issue_stage_label) und Dispatch (_dispatch_issues)
+werden gestubbt — die State-Machine + plan_tick sind separat unit-getestet.
+Hier interessiert die Verdrahtung: werden Übergänge effektiert, wird dispatcht,
+landen WorkItemStageChanged/WorkItemBlocked + ConductorTickCompleted im Store?
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+
+from forge_adapters.github import ReadyIssue
+from forge_cli import board_loop as bl
+from forge_cli.runtime import ForgeContext
+from forge_core.spec import (
+    BoardConfig,
+    CapabilitiesConfig,
+    CostCapsConfig,
+    ProjectSpec,
+    TriageConfig,
+)
+
+
+def _make_ctx(tmp_path: Path) -> ForgeContext:
+    spec = ProjectSpec(
+        spec_version="1.0",
+        name="testproj",
+        cost_caps=CostCapsConfig(
+            per_generation_usd=Decimal("0.5"),
+            per_run_usd=Decimal("2.0"),
+            per_project_per_day_usd=Decimal("10.0"),
+            per_project_per_month_usd=Decimal("50.0"),
+        ),
+        capabilities=CapabilitiesConfig(),
+        board=BoardConfig(owner="x", project_number=1),
+        triage=TriageConfig(enabled=False),
+    )
+    return ForgeContext(
+        repo_root=tmp_path,
+        forge_dir=tmp_path / ".forge",
+        spec=spec,
+        spec_path=tmp_path / ".forge" / "project.yaml",
+        factory_version="git:test",
+        project_fingerprint="sha256:test",
+        store_path=tmp_path / "events.duckdb",
+        blobs_path=tmp_path / "blobs",
+    )
+
+
+def _issue(n: int, labels: list[str], body: str = "") -> ReadyIssue:
+    return ReadyIssue(
+        number=n,
+        title=f"issue {n}",
+        body=body,
+        labels=labels,
+        project_status="",
+        url=f"https://github.com/x/y/issues/{n}",
+    )
+
+
+def _params() -> bl._DispatchParams:
+    return bl._DispatchParams(
+        template_id="t",
+        focus_template="issue-{number}",
+        base_ref="HEAD",
+        max_iterations=1,
+        max_turns=4,
+        eval_suite="quick",
+        model=None,
+        claude_bin="claude",
+        multi_agent=False,
+        auto_merge=False,
+        pr_base="main",
+        pr_label=None,
+    )
+
+
+def _run(ctx: ForgeContext, max_ticks: int = 1) -> bl.HeartbeatStats:
+    return bl._run_conductor_watch(
+        ctx=ctx,
+        repo_owner="x",
+        repo_name="y",
+        max_issues=3,
+        interval_s=0,
+        params=_params(),
+        triager=None,
+        capabilities=None,
+        max_ticks=max_ticks,
+    )
+
+
+def _events_of_kind(ctx: ForgeContext, kind: str) -> int:
+    store = ctx.open_store()
+    try:
+        rows = store.query(
+            "SELECT count(*) AS n FROM events WHERE kind = ?", [kind]
+        )
+    finally:
+        store.close()
+    return rows[0]["n"]
+
+
+def test_conductor_dispatches_ready_item_and_records_transition(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    ctx = _make_ctx(tmp_path)
+    monkeypatch.setattr(
+        bl, "list_stage_items", lambda **k: [_issue(5, ["forge:ready"])]
+    )
+    set_label = MagicMock()
+    monkeypatch.setattr(bl, "set_issue_stage_label", set_label)
+    dispatched: list[int] = []
+
+    def fake_dispatch(*, ctx, issues, params, triager, capabilities):
+        dispatched.extend(i.number for i in issues)
+        return bl._PassResult(
+            summaries=[], bailed=False, dispatched=len(issues), skipped=0
+        )
+
+    monkeypatch.setattr(bl, "_dispatch_issues", fake_dispatch)
+
+    stats = _run(ctx)
+    assert stats.ticks == 1
+    assert stats.total_dispatched == 1
+    assert dispatched == [5]
+    # ready→in-dev wurde via gh effektiert.
+    _, kwargs = set_label.call_args
+    assert kwargs["add"] == "forge:in-dev"
+    assert kwargs["remove"] == "forge:ready"
+    # Events: ein Stage-Übergang + ein Tick.
+    assert _events_of_kind(ctx, "WorkItemStageChanged") == 1
+    assert _events_of_kind(ctx, "ConductorTickCompleted") == 1
+
+
+def test_conductor_blocks_item_with_unmet_dependency(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    ctx = _make_ctx(tmp_path)
+    # #2 (ready) hängt von #1 ab, das nirgends als done sichtbar ist → blocked.
+    monkeypatch.setattr(
+        bl,
+        "list_stage_items",
+        lambda **k: [_issue(2, ["forge:ready"], body="Depends-On: #1")],
+    )
+    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+    dispatched: list[int] = []
+    monkeypatch.setattr(
+        bl,
+        "_dispatch_issues",
+        lambda **k: dispatched.append(1)
+        or bl._PassResult(summaries=[], bailed=False, dispatched=1, skipped=0),
+    )
+
+    stats = _run(ctx)
+    assert stats.total_dispatched == 0
+    assert dispatched == []
+    assert _events_of_kind(ctx, "WorkItemBlocked") == 1
+
+
+def test_conductor_dispatches_when_dependency_done(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    ctx = _make_ctx(tmp_path)
+    # #1 done (sichtbar via state=all), #2 ready depends on #1 → dispatch #2.
+    monkeypatch.setattr(
+        bl,
+        "list_stage_items",
+        lambda **k: [
+            _issue(1, ["forge:done"]),
+            _issue(2, ["forge:ready"], body="Depends-On: #1"),
+        ],
+    )
+    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+    dispatched: list[int] = []
+
+    def fake_dispatch(*, ctx, issues, params, triager, capabilities):
+        dispatched.extend(i.number for i in issues)
+        return bl._PassResult(
+            summaries=[], bailed=False, dispatched=len(issues), skipped=0
+        )
+
+    monkeypatch.setattr(bl, "_dispatch_issues", fake_dispatch)
+
+    _run(ctx)
+    assert dispatched == [2]
+
+
+def test_conductor_empty_board_emits_tick_only(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    ctx = _make_ctx(tmp_path)
+    monkeypatch.setattr(bl, "list_stage_items", lambda **k: [])
+    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+
+    stats = _run(ctx, max_ticks=2)
+    assert stats.total_dispatched == 0
+    assert _events_of_kind(ctx, "ConductorTickCompleted") == 2
+    assert _events_of_kind(ctx, "WorkItemStageChanged") == 0

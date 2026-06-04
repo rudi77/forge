@@ -12,6 +12,8 @@ from forge_adapters.github.board import (
     BoardError,
     ReadyIssue,
     list_ready_items,
+    list_stage_items,
+    set_issue_stage_label,
     wrap_issue_body,
 )
 from forge_adapters.github.pr import (
@@ -36,10 +38,12 @@ __all__ = [
     "WebhookEvent",
     "create_pr_for_run",
     "list_ready_items",
+    "list_stage_items",
     "push_branch",
     "queue_auto_merge",
     "record_pr_merged",
     "record_pr_reverted",
     "render_pr_body",
+    "set_issue_stage_label",
     "wrap_issue_body",
 ]

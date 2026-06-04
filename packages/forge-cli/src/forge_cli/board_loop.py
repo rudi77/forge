@@ -23,19 +23,23 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from forge_adapters.github import (
     BoardError,
     ReadyIssue,
     list_ready_items,
+    list_stage_items,
+    set_issue_stage_label,
     wrap_issue_body,
 )
 from forge_core.events import (
     ConductorTickCompletedPayload,
     EventKind,
     IssueTriagedPayload,
+    WorkItemBlockedPayload,
+    WorkItemStageChangedPayload,
     build_event,
 )
 from forge_execute.capabilities import Capabilities
@@ -52,6 +56,14 @@ from forge_execute.worktrees import GitError, WorktreeManager
 from rich.table import Table
 from ulid import ULID
 
+from forge_cli.conductor import (
+    Blocked,
+    StageTransition,
+    WorkItem,
+    derive_signals,
+    run_conductor_tick,
+)
+from forge_cli.dependencies import parse_depends_on
 from forge_cli.heartbeat import HeartbeatStats, TickResult, run_heartbeat
 from forge_cli.run import RunOutcome, execute_run
 from forge_cli.runtime import (
@@ -61,6 +73,7 @@ from forge_cli.runtime import (
     err_console,
     load_context,
 )
+from forge_cli.stages import Stage, stage_of
 
 # Wir teilen denselben SubprocessRunner-DI-Pattern wie pr.py / board.py,
 # damit Tests gh-Aufrufe stubben können.
@@ -187,6 +200,19 @@ def board_loop_command(
             min=1.0,
         ),
     ] = 300.0,
+    conductor: Annotated[
+        bool,
+        typer.Option(
+            "--conductor",
+            help=(
+                "Conductor-Modus (nur --watch): statt nur board-ready Bugs "
+                "abzuarbeiten, fährt forge die Stage-State-Machine über alle "
+                "`forge:`-Stage-Labels — Übergänge (design→ready→in-dev→qa→"
+                "release), Dependency-Reihenfolge (`Depends-On: #N` im Body) "
+                "und Dispatch mit Kapazität 1."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Pull ready issues from the configured GitHub Project, dispatch each
     via the standard issue_label trigger pipeline."""
@@ -249,7 +275,8 @@ def board_loop_command(
                 "Spec."
             )
             raise typer.Exit(code=2)
-        stats = _run_watch(
+        watch_fn = _run_conductor_watch if conductor else _run_watch
+        stats = watch_fn(
             ctx=ctx,
             repo_owner=repo_owner,
             repo_name=repo_name,
@@ -458,25 +485,20 @@ def _dispatch_issues(
     )
 
 
-def _run_watch(
+def _heartbeat_session(
     *,
     ctx: ForgeContext,
-    repo_owner: str,
-    repo_name: str,
-    max_issues: int,
     interval_s: float,
-    params: _DispatchParams,
-    triager: IssueTriager | None,
-    capabilities: Capabilities | None,
+    make_tick: Callable[[Any, str], Callable[[int], TickResult]],
     max_ticks: int | None = None,
 ) -> HeartbeatStats:
-    """Dauerbetrieb: pollt das Board in Intervallen und arbeitet es ab.
+    """Gemeinsame Heartbeat-Mechanik für board-watch UND conductor-watch.
 
-    Jeder Tick ist ein Board-Pass; das Ergebnis wird als
-    ``ConductorTickCompleted``-Event unter einer Session-ULID persistiert
+    Vergibt die Session-ULID, öffnet den Store, installiert die Signal-Handler
+    (Graceful-Shutdown), emittiert pro Tick ein ``ConductorTickCompleted``
     (Loop 2 steht über den Runs — die Session-ULID ist die ``run_id`` dieser
-    Fabrik-Events). Ctrl-C/SIGTERM beenden sauber: das Stop-Flag wird zwischen
-    den Ticks geprüft, ein laufender Run wird nicht unterbrochen.
+    Fabrik-Events) und räumt am Ende auf. Der konkrete Tick (Board-Pass vs.
+    State-Machine) kommt als ``make_tick(store, session_id)`` herein.
     """
     session_id = str(ULID())
     store = ctx.open_store()
@@ -495,49 +517,27 @@ def _run_watch(
         with contextlib.suppress(ValueError, OSError):
             prev_handlers.append((sig, signal.signal(sig, _request_stop)))
 
-    def tick_fn(tick_index: int) -> TickResult:
-        try:
-            ready = list_ready_items(
-                ctx.spec.board, repo_owner=repo_owner, repo_name=repo_name
-            )[:max_issues]
-        except BoardError as exc:
-            err_console.print(f"[red]board error[/red] (tick {tick_index}): {exc}")
-            return TickResult(bailed=False)
-        if not ready:
-            console.print(
-                f"[dim]tick {tick_index}: Backlog leer — warte {interval_s:.0f}s[/dim]"
-            )
-            return TickResult()
-        res = _dispatch_issues(
-            ctx=ctx,
-            issues=ready,
-            params=params,
-            triager=triager,
-            capabilities=capabilities,
-        )
-        _print_loop_summary(res.summaries, bailed=res.bailed)
-        return TickResult(
-            dispatched=res.dispatched, skipped=res.skipped, bailed=res.bailed
-        )
+    tick_fn = make_tick(store, session_id)
 
     def emit(tick_index: int, result: TickResult) -> None:
-        evt = build_event(
-            kind=EventKind.CONDUCTOR_TICK_COMPLETED,
-            run_id=session_id,
-            project=ctx.spec.name,
-            project_fingerprint=ctx.project_fingerprint,
-            factory_version=ctx.factory_version,
-            spec_version=ctx.spec.spec_version,
-            payload=ConductorTickCompletedPayload(
-                tick_index=tick_index,
-                dispatched=result.dispatched,
-                scheduled=result.scheduled,
-                blocked=result.blocked,
-                skipped=result.skipped,
-                bailed=result.bailed,
-            ),
+        store.append(
+            build_event(
+                kind=EventKind.CONDUCTOR_TICK_COMPLETED,
+                run_id=session_id,
+                project=ctx.spec.name,
+                project_fingerprint=ctx.project_fingerprint,
+                factory_version=ctx.factory_version,
+                spec_version=ctx.spec.spec_version,
+                payload=ConductorTickCompletedPayload(
+                    tick_index=tick_index,
+                    dispatched=result.dispatched,
+                    scheduled=result.scheduled,
+                    blocked=result.blocked,
+                    skipped=result.skipped,
+                    bailed=result.bailed,
+                ),
+            )
         )
-        store.append(evt)
 
     console.print(
         f"[bold green]heartbeat[/bold green] gestartet (session {session_id[:10]}, "
@@ -558,6 +558,211 @@ def _run_watch(
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, handler)  # type: ignore[arg-type]
         store.close()
+
+
+def _run_watch(
+    *,
+    ctx: ForgeContext,
+    repo_owner: str,
+    repo_name: str,
+    max_issues: int,
+    interval_s: float,
+    params: _DispatchParams,
+    triager: IssueTriager | None,
+    capabilities: Capabilities | None,
+    max_ticks: int | None = None,
+) -> HeartbeatStats:
+    """Flacher Dauerbetrieb (Phase B): pollt board-ready Issues und arbeitet
+    sie ab — ohne Stage-State-Machine."""
+
+    def make_tick(_store: Any, _session_id: str) -> Callable[[int], TickResult]:
+        def tick_fn(tick_index: int) -> TickResult:
+            try:
+                ready = list_ready_items(
+                    ctx.spec.board, repo_owner=repo_owner, repo_name=repo_name
+                )[:max_issues]
+            except BoardError as exc:
+                err_console.print(
+                    f"[red]board error[/red] (tick {tick_index}): {exc}"
+                )
+                return TickResult(bailed=False)
+            if not ready:
+                console.print(
+                    f"[dim]tick {tick_index}: Backlog leer — warte "
+                    f"{interval_s:.0f}s[/dim]"
+                )
+                return TickResult()
+            res = _dispatch_issues(
+                ctx=ctx,
+                issues=ready,
+                params=params,
+                triager=triager,
+                capabilities=capabilities,
+            )
+            _print_loop_summary(res.summaries, bailed=res.bailed)
+            return TickResult(
+                dispatched=res.dispatched, skipped=res.skipped, bailed=res.bailed
+            )
+
+        return tick_fn
+
+    return _heartbeat_session(
+        ctx=ctx, interval_s=interval_s, make_tick=make_tick, max_ticks=max_ticks
+    )
+
+
+def _run_conductor_watch(
+    *,
+    ctx: ForgeContext,
+    repo_owner: str,
+    repo_name: str,
+    max_issues: int,
+    interval_s: float,
+    params: _DispatchParams,
+    triager: IssueTriager | None,
+    capabilities: Capabilities | None,
+    max_ticks: int | None = None,
+) -> HeartbeatStats:
+    """Conductor-Dauerbetrieb (Phase C): fährt die Stage-State-Machine.
+
+    Pro Tick: alle ``forge:``-Stage-Issues laden, ``WorkItem``-Liste bauen
+    (Stage aus Labels, Deps aus Body, Signale aus dem Event-Strom), Tick planen
+    und effektieren — Label-Übergänge via gh, Dispatch über den bestehenden
+    ``execute_run``-Pfad, Kapazität 1. Übergänge und Blockaden werden als
+    ``WorkItemStageChanged``/``WorkItemBlocked`` persistiert.
+    """
+    stage_labels = [s.value for s in Stage]
+
+    def make_tick(store: Any, session_id: str) -> Callable[[int], TickResult]:
+        def _emit_stage_changed(t: StageTransition) -> None:
+            store.append(
+                build_event(
+                    kind=EventKind.WORK_ITEM_STAGE_CHANGED,
+                    run_id=session_id,
+                    project=ctx.spec.name,
+                    project_fingerprint=ctx.project_fingerprint,
+                    factory_version=ctx.factory_version,
+                    spec_version=ctx.spec.spec_version,
+                    payload=WorkItemStageChangedPayload(
+                        issue_number=t.number,
+                        from_stage=t.from_stage.value,
+                        to_stage=t.to_stage.value,
+                        reason=t.reason,
+                    ),
+                )
+            )
+
+        def _emit_blocked(b: Blocked) -> None:
+            store.append(
+                build_event(
+                    kind=EventKind.WORK_ITEM_BLOCKED,
+                    run_id=session_id,
+                    project=ctx.spec.name,
+                    project_fingerprint=ctx.project_fingerprint,
+                    factory_version=ctx.factory_version,
+                    spec_version=ctx.spec.spec_version,
+                    payload=WorkItemBlockedPayload(
+                        issue_number=b.number,
+                        kind=b.kind,  # type: ignore[arg-type]
+                        blocked_by=list(b.blocked_by),
+                        reason=b.reason,
+                    ),
+                )
+            )
+
+        def tick_fn(tick_index: int) -> TickResult:
+            try:
+                issues = list_stage_items(
+                    repo_owner=repo_owner,
+                    repo_name=repo_name,
+                    stage_labels=stage_labels,
+                    state="all",
+                )
+            except BoardError as exc:
+                err_console.print(
+                    f"[red]board error[/red] (tick {tick_index}): {exc}"
+                )
+                return TickResult()
+
+            events = []
+            for kind in (
+                EventKind.RUN_STARTED,
+                EventKind.PLAN_PROPOSED,
+                EventKind.PR_CREATED,
+                EventKind.PR_MERGED,
+            ):
+                events.extend(store.events_by_kind(kind))
+
+            by_number = {i.number: i for i in issues}
+            items: list[WorkItem] = []
+            for issue in issues:
+                stage = stage_of(issue.labels)
+                # Done bleibt drin (für Dependency-Auflösung), nur BLOCKED raus.
+                if stage is None or stage == Stage.BLOCKED:
+                    continue
+                items.append(
+                    WorkItem(
+                        number=issue.number,
+                        stage=stage,
+                        depends_on=tuple(parse_depends_on(issue.body)),
+                        signals=derive_signals(events, issue.number),
+                    )
+                )
+            if not items:
+                console.print(
+                    f"[dim]tick {tick_index}: keine aktiven Work-Items[/dim]"
+                )
+                return TickResult()
+
+            counters = {"dispatched": 0, "bailed": False}
+
+            def set_stage(t: StageTransition) -> None:
+                set_issue_stage_label(
+                    issue_number=t.number,
+                    repo_owner=repo_owner,
+                    repo_name=repo_name,
+                    add=t.to_stage.value,
+                    remove=t.from_stage.value,
+                )
+                _emit_stage_changed(t)
+                console.print(
+                    f"  [cyan]#{t.number}[/cyan] {t.from_stage.value} → "
+                    f"{t.to_stage.value} ([dim]{t.reason}[/dim])"
+                )
+
+            def dispatch(number: int) -> None:
+                issue = by_number.get(number)
+                if issue is None:
+                    return
+                res = _dispatch_issues(
+                    ctx=ctx,
+                    issues=[issue],
+                    params=params,
+                    triager=triager,
+                    capabilities=capabilities,
+                )
+                _print_loop_summary(res.summaries, bailed=res.bailed)
+                counters["dispatched"] += res.dispatched
+                counters["bailed"] = counters["bailed"] or res.bailed
+
+            result = run_conductor_tick(
+                items=items,
+                capacity=1,
+                set_stage=set_stage,
+                dispatch=dispatch,
+                on_blocked=_emit_blocked,
+            )
+            return TickResult(
+                dispatched=counters["dispatched"],
+                blocked=result.blocked,
+                bailed=bool(counters["bailed"]),
+            )
+
+        return tick_fn
+
+    return _heartbeat_session(
+        ctx=ctx, interval_s=interval_s, make_tick=make_tick, max_ticks=max_ticks
+    )
 
 
 @dataclass

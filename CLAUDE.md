@@ -111,10 +111,13 @@ Conductor-Kern ist **rein + testbar**: `stages.advance` (State-Machine),
 `dependencies` (Graph/Zyklen), `conductor.plan_tick` (Tick-Differenz) und
 `conductor.derive_signals` (Plan/PR/Merge rein aus dem Event-Strom, korreliert
 über `RunStarted.issue_number`). `run_conductor_tick` effektiert über injizierte
-Callables (set_stage/dispatch) — die GitHub-Seite (Label-Mutation, Stage-Fetch)
-ist die dünne, ersetzbare Außenschicht. Stage-Labels (`forge:<stage>`) fallen
-mit den `on_issue_label`-Trigger-Keys zusammen — ein Label, kein zweiter
-Konfig-Ort. Mantra 3: der Heartbeat taktet das Dispatchen von Runs
+Callables (set_stage/dispatch) — die GitHub-Seite (`list_stage_items`/
+`set_issue_stage_label` im board-Adapter) ist die dünne, ersetzbare Außenschicht.
+Verdrahtet als `board-loop --watch --conductor` (`_run_conductor_watch`);
+board-watch und conductor-watch teilen `_heartbeat_session`. Stage-Labels
+(`forge:<stage>`) fallen mit den `on_issue_label`-Trigger-Keys zusammen — ein
+Label, kein zweiter Konfig-Ort. **Noch offen:** Live-Verifikation der
+gh-Kommandos gegen ein echtes Board (bisher nur Stub-getestet). Mantra 3: der Heartbeat taktet das Dispatchen von Runs
 (`execute_run`), greift aber nie in Runner/Scoring/Gates ein. Die
 Heartbeat-Engine (`run_heartbeat`) ist mit injizierten Deps (sleep/should_stop/
 emit) ohne echtes `time.sleep` testbar — Tests nutzen `max_ticks`. Jeder Tick

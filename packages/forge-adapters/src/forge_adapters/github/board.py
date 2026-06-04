@@ -118,6 +118,113 @@ def list_ready_items(
     return ready
 
 
+def list_stage_items(
+    *,
+    repo_owner: str,
+    repo_name: str,
+    stage_labels: list[str],
+    state: str = "open",
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+    limit: int = 200,
+) -> list[ReadyIssue]:
+    """Listet Issues, die EIN ``forge:``-Stage-Label tragen.
+
+    Anders als :func:`list_ready_items` (nur board-ready „Todo"-Bugs) sieht der
+    Conductor das ganze Fließband — Issues über alle Stages, um sie
+    fortschreiben zu können. Eine ``gh issue list``-Abfrage, client-seitig nach
+    ``stage_labels`` gefiltert. Sortiert nach Issue-Nummer.
+
+    ``state`` durchgereicht an gh (``open``/``closed``/``all``). Der Conductor
+    nutzt ``all``, damit ``done``-Items (oft geschlossen) für die Dependency-
+    Auflösung sichtbar bleiben.
+
+    Raises:
+        BoardError: gh-Fehler oder ungültige JSON-Antwort.
+    """
+    result = run_subprocess(
+        [
+            gh_bin, "issue", "list",
+            "--repo", f"{repo_owner}/{repo_name}",
+            "--state", state,
+            "--limit", str(limit),
+            "--json", "number,title,body,labels,url",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise BoardError(
+            f"gh issue list failed (exit {result.returncode}): "
+            f"{(result.stderr or '').strip()}"
+        )
+    try:
+        raw = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise BoardError(f"gh issue list returned invalid JSON: {exc}") from exc
+
+    wanted = set(stage_labels)
+    out: list[ReadyIssue] = []
+    for item in raw:
+        labels = [lbl.get("name", "") for lbl in (item.get("labels") or [])]
+        if not any(lbl in wanted for lbl in labels):
+            continue
+        out.append(
+            ReadyIssue(
+                number=int(item["number"]),
+                title=item.get("title", "") or "",
+                body=item.get("body", "") or "",
+                labels=labels,
+                project_status="",
+                url=item.get("url", "") or "",
+            )
+        )
+    out.sort(key=lambda r: r.number)
+    return out
+
+
+def set_issue_stage_label(
+    *,
+    issue_number: int,
+    repo_owner: str,
+    repo_name: str,
+    add: str,
+    remove: str | None = None,
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> None:
+    """Effektiert einen Stage-Übergang: ``add``-Label setzen, ``remove`` weg.
+
+    ``gh issue edit`` ist idempotent — ein schon vorhandenes Label erneut zu
+    setzen bzw. ein fehlendes zu entfernen ist ein No-op. Damit ist der
+    Conductor-Tick wiederholbar (gleicher Event-Stand → gleiche Labels).
+
+    Raises:
+        BoardError: gh-Fehler.
+    """
+    cmd = [
+        gh_bin, "issue", "edit", str(issue_number),
+        "--repo", f"{repo_owner}/{repo_name}",
+        "--add-label", add,
+    ]
+    if remove:
+        cmd += ["--remove-label", remove]
+    result = run_subprocess(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise BoardError(
+            f"gh issue edit #{issue_number} failed (exit {result.returncode}): "
+            f"{(result.stderr or '').strip()}"
+        )
+
+
 def wrap_issue_body(*, title: str, body: str) -> str:
     """Wickle Issue-Inhalt in untrusted-content-Marker (Spec Teil 7.3).
 

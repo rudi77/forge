@@ -292,19 +292,29 @@ getestet, aber nicht an einen leeren Prompt verdrahtet.
 5. ✅ Tests: State-Machine, Dependency-Scheduling + Zyklen, Kapazitäts-Limit,
    Signal-Ableitung, Effekt-Reihenfolge (Label vor Dispatch).
 
-**Integration (verbleibend — braucht Verifikation gegen ein echtes Board):**
+**Integration (umgesetzt, gh-CLI gegen Stubs getestet):**
 
-6. Board-Adapter: `list_stage_items(...)` (Issues über ALLE `forge:`-Stages, nicht
-   nur board-ready) + `set_issue_stage_label(issue, from, to)` (idempotent) —
-   gh-CLI wie `board.py`, mit gestubbtem Subprocess getestet.
-7. CLI: `board-loop --watch --conductor` — baut pro Tick die `WorkItem`-Liste
+6. ✅ Board-Adapter: `list_stage_items(state="all")` (Issues über ALLE
+   `forge:`-Stages, inkl. `done`/closed für Dependency-Auflösung) +
+   `set_issue_stage_label(add, remove)` (idempotent) — gh-CLI wie `board.py`,
+   mit gestubbtem Subprocess getestet.
+7. ✅ CLI: `board-loop --watch --conductor` — baut pro Tick die `WorkItem`-Liste
    (Stage aus Labels, Deps aus Body, Signale aus Events) und ruft
-   `run_conductor_tick`; set_stage emittiert `WorkItemStageChanged`, on_blocked
-   `WorkItemBlocked`, dispatch nutzt den bestehenden `execute_run`-Pfad.
+   `run_conductor_tick`; `set_stage` effektiert das Label via gh + emittiert
+   `WorkItemStageChanged`, `on_blocked` emittiert `WorkItemBlocked`, `dispatch`
+   nutzt den bestehenden `_dispatch_issues`/`execute_run`-Pfad. Die gemeinsame
+   Heartbeat-Mechanik (Session-ULID, Signal-Shutdown, Tick-Event) teilen sich
+   board-watch und conductor-watch in `_heartbeat_session`.
 
-Der Kapazitäts-Semaphor steht in v1 auf 1 (sequenziell, Daten-Gate). Punkte 6+7
-sind mechanisch, aber gh-syntaxabhängig — sie landen erst, wenn sie gegen
-`rudi77/forge` real verifiziert sind, statt blind gemerged.
+Der Kapazitäts-Semaphor steht in v1 auf 1 (sequenziell, Daten-Gate). Die
+gh-Kommandos sind gegen Stubs verifiziert (gleicher Standard wie der bestehende
+Board-Adapter) — die **Live-Verifikation gegen ein echtes Board mit
+`forge:`-Labels** steht noch aus und ist der nächste Schritt vor Produktiv-Nutzung.
+
+**Operator-Setup (für die Live-Erprobung):** Issues mit `forge:`-Stage-Labels
+versehen (`forge:design`/`forge:ready`/…), Dependencies via `Depends-On: #N` im
+Body, dann `forge board-loop --watch --conductor --interval <s>`. Stage-Labels
+in GitHub vorab anlegen (gh erstellt sie sonst nicht automatisch).
 
 ## 12. Zu bestätigende Entscheidungen
 

@@ -311,6 +311,35 @@ gh-Kommandos sind gegen Stubs verifiziert (gleicher Standard wie der bestehende
 Board-Adapter) — die **Live-Verifikation gegen ein echtes Board mit
 `forge:`-Labels** steht noch aus und ist der nächste Schritt vor Produktiv-Nutzung.
 
+**Stage-spezifischer Dispatch (umgesetzt — der „verschiedene-Teams"-Kern):**
+
+Bis hierher dispatchte der Conductor *eine* Sorte Arbeit: `ready→in-dev` (den
+Dev-Loop → PR). Damit lief nur ein Team. Jetzt entscheidet die **Stage** über
+das **Team** und die **Run-Art**:
+
+- `stages.IN_PLACE_WORK_STAGES` (= `{design}`) markiert Stages, in denen ein
+  Team *in-place* arbeitet und seinen Advance-Auslöser produziert, ohne dass das
+  Item die Stage wechselt. `plan_tick` dispatcht so ein Item (dependency-gegated,
+  gemeinsame Kapazität mit `ready`), `advance` schreibt es nächsten Tick fort.
+- `TickPlan.dispatch` ist jetzt `list[DispatchOrder]` (`number` + `stage`) statt
+  `list[int]` — der Dispatch trägt sein Team mit. Die Wiring-Schicht
+  (`_run_conductor_watch`) verzweigt: `design` → `_dispatch_design_run`
+  (architect-Roster, `create_pr=False`, Output = `PlanProposed` → `has_plan` →
+  `design→ready`), `in-dev` → der bestehende Dev-Loop (`_dispatch_issues`,
+  `create_pr=True`, Output = PR).
+- Roster pro Stage: `triggers.on_issue_label["forge:<stage>"].agents`
+  (Stage-Label = Trigger-Key, ein Konfig-Ort); Default für `design` ist
+  `["architect"]`.
+
+Damit läuft erstmals ein **Zwei-Team-Fließband** (Design-Team → Dev-Team) rein
+event-getrieben. `requirements` und `release` bleiben offen: sie bräuchten je ein
+neues Advance-**Signal** (`StageSignals` + `advance`) und einen Dispatch-Zweig —
+`requirements` ein „Spec fertig"-Signal, `release` ein „Tag/Changelog erzeugt"-
+Signal. Beide kommen mit Inkrement 2 (eigenes Design der Output-Verträge). Auch
+offen: Re-Dispatch/Eskalation eines `in-dev`-Items, dessen Run keinen PR
+produzierte (heute bleibt es still in `in-dev`) — bewusste Design-Entscheidung,
+kein stiller Endlos-Retry (§3-Tabelle).
+
 **Operator-Setup (für die Live-Erprobung):** Issues mit `forge:`-Stage-Labels
 versehen (`forge:design`/`forge:ready`/…), Dependencies via `Depends-On: #N` im
 Body, dann `forge board-loop --watch --conductor --interval <s>`. Stage-Labels

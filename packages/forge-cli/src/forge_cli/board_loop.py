@@ -58,6 +58,7 @@ from ulid import ULID
 
 from forge_cli.conductor import (
     Blocked,
+    DispatchOrder,
     StageTransition,
     WorkItem,
     derive_signals,
@@ -485,6 +486,96 @@ def _dispatch_issues(
     )
 
 
+def _dispatch_design_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    params: _DispatchParams,
+) -> _PassResult:
+    """Dispatcht den **Design-Stage**-Run eines Work-Items (Team = architect).
+
+    Anders als der Dev-Loop produziert das Design-Team einen **Plan**, keinen
+    PR: ``create_pr=False``. Der ``architect``-Subagent emittiert den
+    ``---FORGE-PLAN-...---``-Marker → der Runner schreibt ein ``PlanProposed``,
+    aus dem ``derive_signals`` im nächsten Tick ``has_plan`` ableitet — und
+    ``advance`` das Item ``design→ready`` fortschreibt.
+
+    Roster: ``triggers.on_issue_label["forge:design"].agents``, falls
+    konfiguriert (Stage-Label = Trigger-Key); sonst ``["architect"]`` als
+    Default. Keine Triage (das Item ist bereits past requirements).
+    """
+    roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
+    prompt = wrap_issue_body(title=issue.title, body=issue.body)
+    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    console.print(
+        f"\n[bold magenta]>>> board-loop[/bold magenta] design run for issue "
+        f"#{issue.number} [italic]{issue.title}[/italic] "
+        f"([dim]team: {', '.join(roster)}[/dim])"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=prompt,
+            prompt_template_id="design",
+            trigger="issue_label",
+            focus=f"design:#{issue.number}",
+            base_ref=params.base_ref,
+            acceptance_criteria=acceptance,
+            max_iterations=params.max_iterations,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=issue.number,
+            pr_number=None,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=False,
+            agents=roster,
+            create_pr=False,
+            pr_base=params.pr_base,
+            extra_labels=[],
+            pr_draft=False,
+            auto_merge=False,
+            announce=False,
+        )
+    except Exception as exc:
+        err_console.print(
+            f"[red]error[/red] in design run for issue #{issue.number}: {exc}"
+        )
+        return _PassResult(
+            summaries=[
+                _LoopSummaryRow(
+                    issue_number=issue.number,
+                    issue_title=issue.title,
+                    decision="error",
+                    pr_url=None,
+                    auto_merge="-",
+                    error=str(exc),
+                )
+            ],
+            bailed=True,
+            dispatched=0,
+            skipped=0,
+        )
+
+    bailed = outcome.result.decision in {
+        "cost_cap_hit",
+        "guardrail_blocked",
+        "error",
+    }
+    if bailed:
+        err_console.print(
+            f"[yellow]board-loop bailing[/yellow]: design run decision = "
+            f"{outcome.result.decision}"
+        )
+    return _PassResult(
+        summaries=[_summary_row_from_outcome(issue, outcome)],
+        bailed=bailed,
+        dispatched=1,
+        skipped=0,
+    )
+
+
 def _heartbeat_session(
     *,
     ctx: ForgeContext,
@@ -730,17 +821,23 @@ def _run_conductor_watch(
                     f"{t.to_stage.value} ([dim]{t.reason}[/dim])"
                 )
 
-            def dispatch(number: int) -> None:
-                issue = by_number.get(number)
+            def dispatch(order: DispatchOrder) -> None:
+                issue = by_number.get(order.number)
                 if issue is None:
                     return
-                res = _dispatch_issues(
-                    ctx=ctx,
-                    issues=[issue],
-                    params=params,
-                    triager=triager,
-                    capabilities=capabilities,
-                )
+                # Team nach Stage: design → architect-Run (Plan, kein PR),
+                # in-dev → der bestehende Dev-Loop (PR). Beide teilen sich die
+                # Tick-Kapazität (sequenziell in v1).
+                if order.stage == Stage.DESIGN:
+                    res = _dispatch_design_run(ctx=ctx, issue=issue, params=params)
+                else:
+                    res = _dispatch_issues(
+                        ctx=ctx,
+                        issues=[issue],
+                        params=params,
+                        triager=triager,
+                        capabilities=capabilities,
+                    )
                 _print_loop_summary(res.summaries, bailed=res.bailed)
                 counters["dispatched"] += res.dispatched
                 counters["bailed"] = counters["bailed"] or res.bailed

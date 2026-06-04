@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from forge_core.events import EventKind
 
 from forge_cli.dependencies import find_cycle, unmet_dependencies
-from forge_cli.stages import Stage, StageSignals, advance
+from forge_cli.stages import IN_PLACE_WORK_STAGES, Stage, StageSignals, advance
 
 
 @dataclass(frozen=True)
@@ -48,11 +48,25 @@ class Blocked:
 
 
 @dataclass(frozen=True)
+class DispatchOrder:
+    """Ein zu dispatchender Run + die Stage, die das *Team* bestimmt.
+
+    ``stage`` ist der Schlüssel zum „verschiedene-Teams"-Verhalten: die
+    Wiring-Schicht wählt daraus das Roster und die Run-Art (``design`` →
+    architect-Team, ``create_pr=False``, Output = Plan; ``in-dev`` → Dev-Team,
+    ``create_pr=True``, Output = PR).
+    """
+
+    number: int
+    stage: Stage
+
+
+@dataclass(frozen=True)
 class TickPlan:
     """Was der Conductor in diesem Tick tun soll."""
 
     transitions: list[StageTransition] = field(default_factory=list)
-    dispatch: list[int] = field(default_factory=list)
+    dispatch: list[DispatchOrder] = field(default_factory=list)
     blocked: list[Blocked] = field(default_factory=list)
 
 
@@ -65,10 +79,16 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
          neu nach ``ready`` wandert, wird ERST im nächsten Tick dispatcht
          (genau ein Übergang pro Item pro Tick).
       2. CYCLES — Items in einem Dependency-Zyklus werden blockiert.
-      3. RESOLVE — Items, die schon zu Tick-Beginn in ``ready`` stehen: alle
-         Dependencies ``done`` → Dispatch-Kandidat; sonst blocked(``deps``).
-      4. DISPATCH — Kandidaten nach Nummer, bis ``capacity`` erschöpft; jeder
-         erhält einen ``ready→in-dev``-Übergang (Grund ``dispatched``).
+      3. RESOLVE — Dispatch-Kandidaten + ihr Team (Stage) bestimmen, jeweils
+         dependency-gegated:
+           * In-Place-Work-Stage (``design``), die ihren Auslöser noch nicht
+             produziert hat → Kandidat mit ``stage=design`` (Team = architect,
+             kein Stage-Wechsel — ``advance`` schreibt nächsten Tick fort).
+           * Stage ``ready`` → Kandidat mit ``stage=in-dev`` (Team = Dev-Loop),
+             erhält beim Dispatch den ``ready→in-dev``-Übergang.
+         Unerfüllte Dependencies → blocked(``deps``), nicht dispatcht.
+      4. DISPATCH — Kandidaten nach Nummer, bis ``capacity`` erschöpft. Eine
+         gemeinsame Kapazität über *alle* Teams (sequenziell in v1).
     """
     items = sorted(items, key=lambda w: w.number)
     known = {w.number for w in items}
@@ -95,12 +115,20 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
 
     done = {n for n, st in effective.items() if st == Stage.DONE}
 
-    # 3. RESOLVE (nur Items, die zu Tick-Beginn READY waren) -----------
-    dispatch: list[int] = []
+    # 3. RESOLVE — Kandidaten + Team, nur für Items, deren Stage zu
+    # Tick-Beginn dispatch-fähig war (nicht erst durch ADVANCE dahin gewandert).
+    candidates: list[DispatchOrder] = []
     for w in items:
         if w.number in cycle_nodes:
             continue
-        if w.stage != Stage.READY:
+        eff = effective[w.number]
+        if w.stage in IN_PLACE_WORK_STAGES and eff == w.stage:
+            # design (noch ohne Plan): Team arbeitet in-place, kein Übergang.
+            target = w.stage
+        elif w.stage == Stage.READY:
+            # Warteschlange → Dev-Team; Übergang folgt beim Dispatch.
+            target = Stage.IN_DEV
+        else:
             continue
         unmet = unmet_dependencies(
             w.number, list(w.depends_on), done=done, known=known
@@ -115,14 +143,15 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
                 )
             )
         else:
-            dispatch.append(w.number)
+            candidates.append(DispatchOrder(w.number, target))
 
-    # 4. DISPATCH (kapazitätsbegrenzt) ---------------------------------
-    selected = dispatch[: max(0, capacity)]
-    for n in selected:
-        transitions.append(
-            StageTransition(n, Stage.READY, Stage.IN_DEV, "dispatched")
-        )
+    # 4. DISPATCH (gemeinsame Kapazität über alle Teams) ---------------
+    selected = candidates[: max(0, capacity)]
+    for order in selected:
+        if order.stage == Stage.IN_DEV:
+            transitions.append(
+                StageTransition(order.number, Stage.READY, Stage.IN_DEV, "dispatched")
+            )
 
     return TickPlan(transitions=transitions, dispatch=selected, blocked=blocked)
 
@@ -140,7 +169,7 @@ class ConductorTickResult:
 # `run_conductor_tick` deterministisch testbar — die Tests übergeben Recorder
 # statt echter gh-Aufrufe.
 SetStageFn = Callable[[StageTransition], None]
-DispatchFn = Callable[[int], None]
+DispatchFn = Callable[[DispatchOrder], None]
 OnBlockedFn = Callable[[Blocked], None]
 
 
@@ -162,8 +191,8 @@ def run_conductor_tick(
     plan = plan_tick(items, capacity=capacity)
     for transition in plan.transitions:
         set_stage(transition)
-    for number in plan.dispatch:
-        dispatch(number)
+    for order in plan.dispatch:
+        dispatch(order)
     if on_blocked is not None:
         for blocked in plan.blocked:
             on_blocked(blocked)

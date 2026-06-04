@@ -105,8 +105,16 @@ Single-row INSERT via Python-Binding kostet ~12 ms each, auch in-Memory. Das ist
 ### Conductor / Heartbeat ist Loop 2 — über der Loop, nie darin
 
 Die Fabrik-Orchestrierung (`board-loop --watch`) lebt in `forge-cli`
-(`board_loop.py::_run_watch` + `heartbeat.py` + `schedule.py`), **nie** in
-`forge-execute`. Mantra 3: der Heartbeat taktet das Dispatchen von Runs
+(`board_loop.py::_run_watch` + `heartbeat.py` + `schedule.py` + `stages.py` +
+`dependencies.py` + `conductor.py`), **nie** in `forge-execute`. Der
+Conductor-Kern ist **rein + testbar**: `stages.advance` (State-Machine),
+`dependencies` (Graph/Zyklen), `conductor.plan_tick` (Tick-Differenz) und
+`conductor.derive_signals` (Plan/PR/Merge rein aus dem Event-Strom, korreliert
+über `RunStarted.issue_number`). `run_conductor_tick` effektiert über injizierte
+Callables (set_stage/dispatch) — die GitHub-Seite (Label-Mutation, Stage-Fetch)
+ist die dünne, ersetzbare Außenschicht. Stage-Labels (`forge:<stage>`) fallen
+mit den `on_issue_label`-Trigger-Keys zusammen — ein Label, kein zweiter
+Konfig-Ort. Mantra 3: der Heartbeat taktet das Dispatchen von Runs
 (`execute_run`), greift aber nie in Runner/Scoring/Gates ein. Die
 Heartbeat-Engine (`run_heartbeat`) ist mit injizierten Deps (sleep/should_stop/
 emit) ohne echtes `time.sleep` testbar — Tests nutzen `max_ticks`. Jeder Tick

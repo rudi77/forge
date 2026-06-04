@@ -36,8 +36,14 @@ from forge_core.events.kinds.proposal import (
 )
 from forge_core.events.kinds.run import RunFinishedPayload, RunStartedPayload
 from forge_core.events.kinds.triage import IssueTriagedPayload, TriageDecision
+from forge_core.events.kinds.workitem import (
+    BlockedKind,
+    WorkItemBlockedPayload,
+    WorkItemStageChangedPayload,
+)
 
 __all__ = [
+    "BlockedKind",
     "ConductorTickCompletedPayload",
     "CostCapHitPayload",
     "DecisionMadePayload",
@@ -61,4 +67,6 @@ __all__ = [
     "RunStartedPayload",
     "SubtaskStatus",
     "TriageDecision",
+    "WorkItemBlockedPayload",
+    "WorkItemStageChangedPayload",
 ]

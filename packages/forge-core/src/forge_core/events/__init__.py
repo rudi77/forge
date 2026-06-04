@@ -54,6 +54,8 @@ from forge_core.events.kinds import (
     RunStartedPayload,
     SubtaskStatus,
     TriageDecision,
+    WorkItemBlockedPayload,
+    WorkItemStageChangedPayload,
 )
 
 __all__ = [
@@ -83,5 +85,7 @@ __all__ = [
     "RunStartedPayload",
     "SubtaskStatus",
     "TriageDecision",
+    "WorkItemBlockedPayload",
+    "WorkItemStageChangedPayload",
     "build_event",
 ]

@@ -276,16 +276,35 @@ getestet, aber nicht an einen leeren Prompt verdrahtet.
 
 ### Phase C — konkrete Schritte (Conductor)
 
-1. Neue Event-Kinds (`WorkItemStageChanged`, `WorkItemBlocked`) + Schema-Tests.
-2. `stages.py`: Stage-Enum + erlaubte Übergänge + `derive_stage(events)` (rein,
-   testbar, idempotent).
-3. `dependencies.py`: `Depends-On:`-Parser + Graph + topologisches Ready-Set +
-   Zyklus-Erkennung (rein, testbar).
-4. `conductor.py`: Tick = ADVANCE (State-Machine effektieren via Board-Adapter) →
-   RESOLVE (Ready-Queue) → DISPATCH (`execute_run`). Kapazitäts-Semaphor=1.
-5. Board-Adapter: `set_stage_label(issue, from, to)` (idempotent).
-6. Tests: State-Machine-Tabelle, Dependency-Scheduling, Operator-Override-Respekt,
-   ein End-to-End-Tick gegen einen Fake-Board.
+**Kern (umgesetzt, voll getestet):**
+
+1. ✅ Event-Kinds `WorkItemStageChanged` + `WorkItemBlocked` (19→21) + Schema-Test.
+2. ✅ `stages.py`: `Stage`-Enum + `ALLOWED_TRANSITIONS` + `stage_of(labels)` +
+   `advance(stage, signals)` (rein: event-getriebene Auto-Übergänge).
+3. ✅ `dependencies.py`: `parse_depends_on(body)` + `find_cycle` +
+   `unmet_dependencies` (rein, replay-fähig — keine LLM-Inferenz).
+4. ✅ `conductor.py`: `plan_tick(items, capacity)` = ADVANCE → CYCLES → RESOLVE →
+   DISPATCH (genau ein Übergang pro Item pro Tick; at-most-once Dispatch).
+   `derive_signals(events, issue)` leitet Plan/PR/Merge rein aus dem Event-Strom
+   ab (Korrelation über `RunStarted.issue_number`). `run_conductor_tick` effektiert
+   den Plan über **injizierte** Callables (set_stage/dispatch/on_blocked) — erst
+   Labels, dann Dispatch.
+5. ✅ Tests: State-Machine, Dependency-Scheduling + Zyklen, Kapazitäts-Limit,
+   Signal-Ableitung, Effekt-Reihenfolge (Label vor Dispatch).
+
+**Integration (verbleibend — braucht Verifikation gegen ein echtes Board):**
+
+6. Board-Adapter: `list_stage_items(...)` (Issues über ALLE `forge:`-Stages, nicht
+   nur board-ready) + `set_issue_stage_label(issue, from, to)` (idempotent) —
+   gh-CLI wie `board.py`, mit gestubbtem Subprocess getestet.
+7. CLI: `board-loop --watch --conductor` — baut pro Tick die `WorkItem`-Liste
+   (Stage aus Labels, Deps aus Body, Signale aus Events) und ruft
+   `run_conductor_tick`; set_stage emittiert `WorkItemStageChanged`, on_blocked
+   `WorkItemBlocked`, dispatch nutzt den bestehenden `execute_run`-Pfad.
+
+Der Kapazitäts-Semaphor steht in v1 auf 1 (sequenziell, Daten-Gate). Punkte 6+7
+sind mechanisch, aber gh-syntaxabhängig — sie landen erst, wenn sie gegen
+`rudi77/forge` real verifiziert sind, statt blind gemerged.
 
 ## 12. Zu bestätigende Entscheidungen
 

@@ -148,6 +148,20 @@ uv run forge analyze
 uv run forge replay <run_id>
 ```
 
+## Binary bauen
+
+Ein eigenständiges `forge`-Binary (kein Python-Setup nötig zum Ausführen)
+entsteht via PyInstaller:
+
+```bash
+uv run --with pyinstaller python packaging/build_binary.py
+# Ergebnis: dist/forge  (Linux/macOS)  bzw.  dist/forge.exe  (Windows)
+```
+
+Die CI (`.github/workflows/ci.yml`) baut bei jedem Push die `forge.exe`
+auf einem Windows-Runner und lädt sie als Artefakt hoch (`forge-windows-x64`).
+Tag-Pushes (`v*`) hängen das Binary zusätzlich an ein GitHub-Release.
+
 ## Repo-Layout
 
 ```
@@ -157,6 +171,8 @@ forge/
 │   ├── forge-execute/       # Loop 1 — Runner, Strategies, Mutators, Evaluators
 │   ├── forge-adapters/      # GitHub (PR + Webhooks + Action-Templates)
 │   └── forge-cli/           # forge run / analyze / doctor / replay
+├── packaging/               # PyInstaller-Entry + reproduzierbarer Binary-Build
+├── .github/workflows/       # CI: Test + Lint + forge.exe-Build
 ├── examples/
 │   └── pinta/               # Reference-Spec
 ├── docs/

@@ -252,14 +252,27 @@ Kategorisch ausgeschlossen, gleiche Linie wie die Spec-v1-Ausschlüsse:
 
 **Diese Session implementiert B, dann C.** D/E bleiben datengetrieben offen.
 
-### Phase B — konkrete Schritte (Heartbeat)
+### Phase B — konkrete Schritte (Heartbeat) — **umgesetzt**
 
-1. `forge board-loop --watch --interval <s>`: umschließt den bestehenden
-   Single-Pass mit einer Endlosschleife + Sleep + Graceful-Shutdown.
-2. Cron-Auswertung für `schedule`-Trigger (letzter-Lauf aus Events rekonstruiert).
-3. `ConductorTickCompleted`-Event pro Durchlauf (Tick-Telemetrie).
-4. Tests: Watch-Loop bricht nach N Ticks ab (injizierbares Clock/Stop-Signal),
-   Cron-Fälligkeit, Graceful-Shutdown.
+1. ✅ `forge board-loop --watch --interval <s>`: umschließt den (extrahierten)
+   Board-Pass mit einer Endlosschleife + Sleep + Graceful-Shutdown (SIGINT/
+   SIGTERM → Stop-Flag, zwischen Ticks geprüft, laufender Run wird zu Ende
+   gebracht). Engine: `heartbeat.py::run_heartbeat`, mit injizierten Deps
+   (sleep/should_stop/emit) voll testbar.
+2. ✅ `ConductorTickCompleted`-Event pro Tick (Session-ULID als `run_id`).
+3. ✅ Cron-Matcher `schedule.py` (dependency-frei, 5-Feld, Vixie-dom/dow-ODER),
+   voll unit-getestet — die **Maschinerie** für `schedule`-Trigger.
+4. ✅ Tests: Heartbeat (max_ticks / Stop-Signal / stop_on_bail / emit),
+   Cron (parse/match/due-Fenster), Watch-Glue (Ticks + Event-Persistenz +
+   Board-Fehler-Robustheit).
+
+**Bewusst aufgeschoben (kein Half-Wiring):** das *Dispatchen* fälliger
+`schedule`-Trigger als Run. Ein Schedule-Trigger hat einen `focus`, aber
+**keine Prompt-Quelle** (anders als ein Issue, dessen Body der Prompt ist).
+Was ein „nächtlicher tech-debt-Sweep" konkret als Auftrag bekommt, ist eine
+echte Design-Entscheidung — sie gehört zum requirements/operations-Agent
+(Phase C), der Arbeit *erzeugt*. Bis dahin ist die Cron-Maschinerie gebaut und
+getestet, aber nicht an einen leeren Prompt verdrahtet.
 
 ### Phase C — konkrete Schritte (Conductor)
 

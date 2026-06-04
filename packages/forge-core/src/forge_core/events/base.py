@@ -42,6 +42,8 @@ class EventKind(StrEnum):
     COST_CAP_HIT = "CostCapHit"
     GUARDRAIL_VIOLATION = "GuardrailViolation"
     ISSUE_TRIAGED = "IssueTriaged"
+    # Fabrik-Ebene (Conductor / Loop 2) — über den Runs, nicht in ihnen.
+    CONDUCTOR_TICK_COMPLETED = "ConductorTickCompleted"
 
 
 class EventValidationError(ValueError):

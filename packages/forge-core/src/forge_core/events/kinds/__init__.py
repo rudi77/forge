@@ -8,6 +8,7 @@ Beim Import dieses Pakets registrieren sich alle Sub-Schemas im Registry der
 Base-Modul.
 """
 
+from forge_core.events.kinds.conductor import ConductorTickCompletedPayload
 from forge_core.events.kinds.cost import CostCapHitPayload
 from forge_core.events.kinds.decision import DecisionMadePayload
 from forge_core.events.kinds.eval_ import EvalFinishedPayload, EvalStartedPayload
@@ -37,6 +38,7 @@ from forge_core.events.kinds.run import RunFinishedPayload, RunStartedPayload
 from forge_core.events.kinds.triage import IssueTriagedPayload, TriageDecision
 
 __all__ = [
+    "ConductorTickCompletedPayload",
     "CostCapHitPayload",
     "DecisionMadePayload",
     "EvalFinishedPayload",

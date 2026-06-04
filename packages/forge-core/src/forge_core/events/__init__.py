@@ -31,6 +31,7 @@ from forge_core.events.base import (
     build_event,
 )
 from forge_core.events.kinds import (
+    ConductorTickCompletedPayload,
     CostCapHitPayload,
     DecisionMadePayload,
     EvalFinishedPayload,
@@ -56,6 +57,7 @@ from forge_core.events.kinds import (
 )
 
 __all__ = [
+    "ConductorTickCompletedPayload",
     "CostCapHitPayload",
     "DecisionMadePayload",
     "EvalFinishedPayload",

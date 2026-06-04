@@ -102,6 +102,21 @@ uv run forge doctor --spec examples/pinta/.forge/project.yaml
 
 Single-row INSERT via Python-Binding kostet ~12 ms each, auch in-Memory. Das ist ein bekanntes Issue von DuckDB; nicht versuchen, mit Indexes oder PRAGMA zu fighten. Für Bulk → `executemany`. Für Tests, die Zeit messen, statt 1000 Events lieber 10 nehmen.
 
+### Conductor / Heartbeat ist Loop 2 — über der Loop, nie darin
+
+Die Fabrik-Orchestrierung (`board-loop --watch`) lebt in `forge-cli`
+(`board_loop.py::_run_watch` + `heartbeat.py` + `schedule.py`), **nie** in
+`forge-execute`. Mantra 3: der Heartbeat taktet das Dispatchen von Runs
+(`execute_run`), greift aber nie in Runner/Scoring/Gates ein. Die
+Heartbeat-Engine (`run_heartbeat`) ist mit injizierten Deps (sleep/should_stop/
+emit) ohne echtes `time.sleep` testbar — Tests nutzen `max_ticks`. Jeder Tick
+ist ein `ConductorTickCompleted`-Event unter einer **Session-ULID** als
+`run_id` (Fabrik-Events stehen über den Run-Events, kein Envelope-Umbau). Der
+Cron-Matcher (`schedule.py`) ist dependency-frei (kein croniter). Design +
+Phasenplan: `docs/conductor-design.md`. Beim Erweitern des board-loop: den
+Dispatch-Pfad (`_dispatch_issues`) teilen Single-Pass und Watch-Tick — nicht
+duplizieren.
+
 ### Fabrik-Metriken leben in Views, nicht in der Loop
 
 Die „Software-Factory"-Sicht (Aggregation ÜBER Runs hinweg) ist bewusst **read-only** und liegt komplett in DuckDB-Views (`store.py`, `_VIEW_FACTORY_KPIS` + `_VIEW_FACTORY_THROUGHPUT`), gerendert von `forge analyze` (`analyze.py`). Sie berührt die Loop nie (Mantra 3) — reine Auswertung des Event-Stroms. KPIs: Durchsatz, Merge-Rate, Keep-Rate (keep/discard-Generationen), Kosten pro gemergtem PR, Lead-Time (`PRMerged.time_to_merge_s`). Wenn du eine neue Fabrik-Metrik brauchst: neuen View dazu, in `_VIEWS` registrieren, Sektion in `analyze.py` ergänzen — **keine** neue Event-Logik, **kein** Loop-Eingriff. Das ist die Datengrundlage, die v2 (Population) laut Spec voraussetzt (≥100 Runs + Plateau).

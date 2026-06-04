@@ -23,8 +23,10 @@ COMMON = dict(
 
 
 def test_all_event_kinds_have_registered_payload_schemas() -> None:
-    # Spec v0.4: 17 (v0.3) + IssueTriaged = 18 Kinds
-    assert len(EventKind) == 18
+    # Spec v0.4: 17 (v0.3) + IssueTriaged = 18 Kinds.
+    # + Loop 2: ConductorTickCompleted, WorkItemStageChanged,
+    #   WorkItemBlocked = 21.
+    assert len(EventKind) == 21
     for kind in EventKind:
         assert kind in _PAYLOAD_REGISTRY, f"missing schema for {kind}"
 

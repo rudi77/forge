@@ -219,7 +219,10 @@ class TriggerStrategy(StrEnum):
 
 
 # Subagent-Namen, die Spec v0.3 Teil 6.5 als Pflicht/Optional definiert.
-# v1: architect, developer, tester. v1.5+: reviewer, operations.
+# Implementiert (Template + Orchestrierung): architect, developer, tester,
+# reviewer. `operations` ist reserviert (v1.5, Telemetrie→Issue-Vorschläge),
+# hat noch kein Template — ein Roster mit `operations` wird von
+# `normalize_agents` still verworfen, die CLI warnt via `unknown_agents`.
 SubagentName = Literal["architect", "developer", "tester", "reviewer", "operations"]
 
 

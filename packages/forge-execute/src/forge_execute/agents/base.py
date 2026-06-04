@@ -75,6 +75,11 @@ class ProposalResult:
     raw_response: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     plan_md: str | None = None
+    agents_invoked: list[str] | None = None
+    """Subagent-Rollen, die der Master laut Selbstauskunft TATSÄCHLICH gerufen
+    hat (aus dem `---FORGE-AGENTS-...---`-Block). None, wenn der Master nichts
+    meldete oder Single-Agent-Run — dann fällt der Runner auf das konfigurierte
+    Roster zurück. Macht Orchestrierungs-Treue messbar (config != reality)."""
 
     @property
     def has_changes(self) -> bool:

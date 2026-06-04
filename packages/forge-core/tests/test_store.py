@@ -145,6 +145,71 @@ def test_pr_merge_rate_view(store: EventStore) -> None:
     assert rows[0]["merge_rate"] == pytest.approx(1.0)
 
 
+def test_factory_kpis_view(store: EventStore) -> None:
+    from forge_core.events.kinds.generation import GenerationFinishedPayload
+
+    pr = _seed_minimal_run(store, run_id="r1")
+    # Zwei Generationen: eine keep, eine discard → keep_rate 0.5.
+    store.append_many(
+        [
+            build_event(
+                kind=EventKind.GENERATION_FINISHED,
+                run_id="r1",
+                generation_id="g1",
+                payload=GenerationFinishedPayload(
+                    generation_idx=0,
+                    decision="keep",
+                    new_score=0.8,
+                    score_delta=0.04,
+                    reason="improved",
+                ),
+                **COMMON,
+            ),
+            build_event(
+                kind=EventKind.GENERATION_FINISHED,
+                run_id="r1",
+                generation_id="g2",
+                payload=GenerationFinishedPayload(
+                    generation_idx=1,
+                    decision="discard",
+                    reason="no gain",
+                ),
+                **COMMON,
+            ),
+        ]
+    )
+    store.append(
+        build_event(
+            kind=EventKind.PR_MERGED,
+            run_id="r1",
+            payload=PRMergedPayload(pr_number=pr, merger="rudi", time_to_merge_s=3600),
+            **COMMON,
+        )
+    )
+
+    [k] = store.query("SELECT * FROM factory_kpis")
+    assert k["total_runs"] == 1
+    assert k["prs_created"] == 1
+    assert k["prs_merged"] == 1
+    assert k["merge_rate"] == pytest.approx(1.0)
+    assert k["generations"] == 2
+    assert k["kept"] == 1
+    assert k["keep_rate"] == pytest.approx(0.5)
+    assert k["mean_lead_time_s"] == pytest.approx(3600.0)
+    # Run-Cost 0.94 (aus dem Seed), ein gemergter PR → 0.94 pro PR.
+    assert k["cost_per_merged_pr"] == pytest.approx(0.94)
+
+
+def test_factory_throughput_view(store: EventStore) -> None:
+    _seed_minimal_run(store, run_id="r1")
+    rows = store.query("SELECT * FROM factory_throughput")
+    assert len(rows) == 1
+    assert rows[0]["runs"] == 1
+    assert rows[0]["prs_created"] == 1
+    assert rows[0]["blocked"] == 0
+    assert rows[0]["no_improvement"] == 0
+
+
 def test_referenced_artifact_hashes(store: EventStore) -> None:
     _seed_minimal_run(store)
     refs = store.referenced_artifact_hashes()

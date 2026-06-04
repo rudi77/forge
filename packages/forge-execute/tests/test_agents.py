@@ -268,12 +268,25 @@ def test_normalize_agents_defaults_and_ordering() -> None:
     ]
 
 
+def test_normalize_agents_orders_reviewer_last() -> None:
+    from forge_execute.agents.templates import normalize_agents
+
+    # reviewer ist eine bekannte Rolle und folgt in der Pipeline-Ordnung
+    # hinter tester.
+    assert normalize_agents(["reviewer", "developer", "architect"]) == [
+        "architect",
+        "developer",
+        "reviewer",
+    ]
+
+
 def test_roster_needs_orchestration() -> None:
     from forge_execute.agents.templates import roster_needs_orchestration
 
     assert roster_needs_orchestration(["developer"]) is False
     assert roster_needs_orchestration(["architect", "developer"]) is True
     assert roster_needs_orchestration(["developer", "tester"]) is True
+    assert roster_needs_orchestration(["developer", "reviewer"]) is True
 
 
 def test_build_orchestrator_prompt_full_roster_has_plan_markers() -> None:
@@ -306,6 +319,82 @@ def test_build_orchestrator_prompt_without_tester_omits_verification() -> None:
     prompt = build_orchestrator_prompt(["architect", "developer"])
     assert "architect" in prompt
     assert "verification suite" not in prompt
+
+
+def test_build_orchestrator_prompt_with_reviewer_weaves_review_step() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(
+        ["architect", "developer", "tester", "reviewer"]
+    )
+    assert "reviewer" in prompt
+    # Der Reviewer-Schritt nennt die BLOCKING-Findings-Schleife und das
+    # Finalize-Verbot.
+    assert "BLOCKING" in prompt
+
+
+def test_build_orchestrator_prompt_without_reviewer_omits_review() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(["architect", "developer", "tester"])
+    assert "reviewer" not in prompt
+    assert "BLOCKING" not in prompt
+
+
+def test_unknown_agents_flags_dropped_roles() -> None:
+    from forge_execute.agents.templates import unknown_agents
+
+    assert unknown_agents(None) == []
+    assert unknown_agents(["architect", "developer", "tester", "reviewer"]) == []
+    # Tippfehler und spec-reservierte-aber-nicht-implementierte Rollen werden
+    # sichtbar (Input-Reihenfolge), bekannte fallen raus.
+    assert unknown_agents(["architect", "operations", "typo"]) == [
+        "operations",
+        "typo",
+    ]
+
+
+def test_build_orchestrator_prompt_requests_agents_marker() -> None:
+    from forge_execute.agents.templates import (
+        AGENTS_BEGIN_MARKER,
+        build_orchestrator_prompt,
+    )
+
+    # Beide Roster-Varianten (mit/ohne architect) fordern den Agents-Block an.
+    assert AGENTS_BEGIN_MARKER in build_orchestrator_prompt(
+        ["architect", "developer", "tester"]
+    )
+    assert AGENTS_BEGIN_MARKER in build_orchestrator_prompt(["developer", "tester"])
+
+
+def test_extract_agents_from_master_output_roundtrip() -> None:
+    from forge_execute.agents.templates import (
+        AGENTS_BEGIN_MARKER,
+        AGENTS_END_MARKER,
+        extract_agents_from_master_output,
+    )
+
+    blob = (
+        f"summary text\n{AGENTS_BEGIN_MARKER}\n"
+        "tester, developer, bogus, tester\n"
+        f"{AGENTS_END_MARKER}\ntrailing"
+    )
+    # Bekannte Rollen in Pipeline-Ordnung, Garbage + Duplikate gefiltert.
+    assert extract_agents_from_master_output(blob) == ["developer", "tester"]
+
+
+def test_extract_agents_from_master_output_absent_returns_none() -> None:
+    from forge_execute.agents.templates import extract_agents_from_master_output
+
+    assert extract_agents_from_master_output("no markers anywhere") is None
+    # Marker da, aber nur Unbekanntes drin → None (Caller fällt auf Config).
+    from forge_execute.agents.templates import (
+        AGENTS_BEGIN_MARKER,
+        AGENTS_END_MARKER,
+    )
+
+    empty = f"{AGENTS_BEGIN_MARKER}\nbogus only\n{AGENTS_END_MARKER}"
+    assert extract_agents_from_master_output(empty) is None
 
 
 def test_claude_agent_roster_derives_multi_agent() -> None:

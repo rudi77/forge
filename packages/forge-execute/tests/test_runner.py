@@ -303,6 +303,62 @@ def test_runner_self_termination_with_changes_still_keeps(
     store.close()
 
 
+def test_runner_plan_proposed_records_invoked_agents_over_config(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """agents_used spiegelt die vom Master GEMELDETEN Rollen, nicht das
+    konfigurierte Roster.
+
+    Der Agent meldet, dass nur architect+developer liefen (kein tester),
+    obwohl config das volle Roster trägt. Das PlanProposed-Event muss die
+    gemeldete Realität tragen — sonst misst forge Absicht statt Wirklichkeit.
+    """
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+
+    def fix_with_plan(wt: Path, prompt: str) -> ProposalResult:
+        (wt / "src" / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n", encoding="utf-8"
+        )
+        import subprocess as sp
+
+        diff = sp.run(
+            ["git", "diff"], cwd=str(wt), capture_output=True, text=True
+        ).stdout
+        return ProposalResult(
+            diff=diff,
+            stop_reason="end_turn",
+            plan_md=(
+                "# Plan: fix add\n\n## Subtasks\n"
+                "1. **Fix add** — file: `src/calc.py`\n\n## Risk\nlow\n"
+            ),
+            agents_invoked=["architect", "developer"],
+        )
+
+    agent = MockCodingAgent(callable_=fix_with_plan)
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="t1",
+        initial_prompt="Fix the failing test.",
+        agents=["architect", "developer", "tester"],
+        max_iterations=1,
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+    runner.run()
+
+    plans = store.events_by_kind(EventKind.PLAN_PROPOSED)
+    assert plans, "kein PlanProposed-Event emittiert"
+    # Gemeldete Realität (ohne tester) gewinnt über das volle config-Roster.
+    assert plans[0].payload["agents_used"] == ["architect", "developer"]
+
+    store.close()
+
+
 def test_runner_blocks_capability_violation(
     red_repo: Path, tmp_path: Path
 ) -> None:

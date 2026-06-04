@@ -31,6 +31,7 @@ from forge_core.events.base import (
     build_event,
 )
 from forge_core.events.kinds import (
+    ConductorTickCompletedPayload,
     CostCapHitPayload,
     DecisionMadePayload,
     EvalFinishedPayload,
@@ -53,9 +54,12 @@ from forge_core.events.kinds import (
     RunStartedPayload,
     SubtaskStatus,
     TriageDecision,
+    WorkItemBlockedPayload,
+    WorkItemStageChangedPayload,
 )
 
 __all__ = [
+    "ConductorTickCompletedPayload",
     "CostCapHitPayload",
     "DecisionMadePayload",
     "EvalFinishedPayload",
@@ -81,5 +85,7 @@ __all__ = [
     "RunStartedPayload",
     "SubtaskStatus",
     "TriageDecision",
+    "WorkItemBlockedPayload",
+    "WorkItemStageChangedPayload",
     "build_event",
 ]

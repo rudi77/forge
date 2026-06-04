@@ -643,6 +643,7 @@ class SequentialRunner:
                 plan_md=result.plan_md,
                 gen_id=gen_id,
                 architect_turns=result.turns_used,
+                agents_invoked=result.agents_invoked,
             )
 
         self._emit(
@@ -670,12 +671,19 @@ class SequentialRunner:
         plan_md: str,
         gen_id: str,
         architect_turns: int,
+        agents_invoked: list[str] | None = None,
     ) -> None:
         """Persistiert den Plan im Blob-Store und emittiert PlanProposed.
 
         `architect_turns` ist heute der Master-Total — wir haben kein
         feinkörniges Subagent-Turn-Tracking. Spec v0.3 erlaubt das (das
         Feld ist informativ, nicht semantisch).
+
+        `agents_used` spiegelt, welche Rollen der Master laut Selbstauskunft
+        TATSÄCHLICH gerufen hat (`agents_invoked`), und fällt nur dann auf das
+        konfigurierte Roster zurück, wenn der Master nichts meldete. Das Feld
+        bedeutet semantisch „mitgewirkt" — die Realität ist treuer als die
+        bloße Config.
         """
         from forge_core.events.kinds.plan import PlanProposedPayload, PlanSubtask
 
@@ -695,7 +703,7 @@ class SequentialRunner:
                     PlanSubtask(index=s.index, title=s.title, status=s.status)
                     for s in parsed.subtasks
                 ],
-                agents_used=list(self.config.agents),
+                agents_used=agents_invoked or list(self.config.agents),
             ),
             generation_id=gen_id,
             artifacts={"plan": plan_hash},

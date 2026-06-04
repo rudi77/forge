@@ -251,6 +251,11 @@ def board_loop_command(
                 continue
 
         focus = focus_template.format(number=issue.number)
+        # Roster aus der Trigger-Config ableiten (Spec v0.3 Teil 5.1): das
+        # erste Issue-Label, das in `triggers.on_issue_label` konfiguriert
+        # ist, bestimmt, welche Arbeitspferde mitwirken. Kein Treffer → der
+        # multi_agent-Default in execute_run greift.
+        roster = _roster_for_issue(ctx.spec, issue.labels)
         prompt = wrap_issue_body(title=issue.title, body=issue.body)
         # Der vom Menschen geschriebene Issue-Text IST das Akzeptanz-
         # kriterium für den LLM-Judge (spec.judge.enabled). Wir geben den
@@ -280,6 +285,7 @@ def board_loop_command(
                 dry_run=False,
                 claude_bin=claude_bin,
                 multi_agent=multi_agent,
+                agents=roster,
                 create_pr=True,
                 pr_base=pr_base,
                 extra_labels=[*(pr_label or []), f"issue-{issue.number}"],
@@ -637,6 +643,26 @@ def _fetch_issues_by_number(
             )
         )
     return out
+
+
+def _roster_for_issue(spec, labels: list[str]) -> list[str] | None:
+    """Liefert das Subagent-Roster für ein Issue aus der Trigger-Config.
+
+    Das erste Issue-Label, das als Key in ``triggers.on_issue_label`` steht,
+    gewinnt; sein ``agents``-Feld ist das Roster. Kein Treffer (oder keine
+    Trigger-Config) → ``None``, dann greift der ``multi_agent``-Default in
+    ``execute_run``. So wird die ``agents:[...]``-Spec-Config funktional,
+    ohne den Single-Agent-Default zu erzwingen.
+    """
+    triggers = getattr(spec, "triggers", None)
+    if triggers is None:
+        return None
+    on_label = getattr(triggers, "on_issue_label", None) or {}
+    for label in labels:
+        cfg = on_label.get(label)
+        if cfg is not None:
+            return list(cfg.agents)
+    return None
 
 
 # --- Output helpers ----------------------------------------------------

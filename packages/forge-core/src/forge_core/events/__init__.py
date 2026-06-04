@@ -41,6 +41,7 @@ from forge_core.events.kinds import (
     IssueTriagedPayload,
     MutationAppliedPayload,
     PlanProposedPayload,
+    PlanSubtask,
     PRCreatedPayload,
     PreflightFailedPayload,
     PRMergedPayload,
@@ -50,6 +51,7 @@ from forge_core.events.kinds import (
     RiskLevel,
     RunFinishedPayload,
     RunStartedPayload,
+    SubtaskStatus,
     TriageDecision,
 )
 
@@ -70,12 +72,14 @@ __all__ = [
     "PRMergedPayload",
     "PRRevertedPayload",
     "PlanProposedPayload",
+    "PlanSubtask",
     "PreflightFailedPayload",
     "ProposalReceivedPayload",
     "ProposalRequestedPayload",
     "RiskLevel",
     "RunFinishedPayload",
     "RunStartedPayload",
+    "SubtaskStatus",
     "TriageDecision",
     "build_event",
 ]

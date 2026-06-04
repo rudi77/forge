@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from forge_cli.run import _load_latest_plan
+from forge_cli.run import _load_latest_plan, _split_agents
 from forge_core.blobs import BlobStore
 from forge_core.events import EventKind, build_event
 from forge_core.events.kinds.plan import PlanProposedPayload
@@ -109,3 +109,23 @@ def test_load_latest_plan_returns_none_when_blob_missing(tmp_path: Path) -> None
         assert _load_latest_plan(store, ctx, run_id="r1") is None
     finally:
         store.close()
+
+
+# --- _split_agents ----------------------------------------------------
+
+
+def test_split_agents_parses_comma_list() -> None:
+    assert _split_agents("architect,developer,tester") == [
+        "architect",
+        "developer",
+        "tester",
+    ]
+    # Whitespace und leere Felder werden getrimmt/verworfen.
+    assert _split_agents(" developer , tester ,, ") == ["developer", "tester"]
+
+
+def test_split_agents_none_and_empty_return_none() -> None:
+    assert _split_agents(None) is None
+    assert _split_agents("") is None
+    assert _split_agents("   ") is None
+    assert _split_agents(",, ,") is None

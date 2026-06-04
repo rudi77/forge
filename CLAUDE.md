@@ -156,9 +156,21 @@ Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
 
 Vor jeder Schema-Änderung: `len(EventKind) == 18` und `len(_PAYLOAD_REGISTRY) == 18` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED`).
 
+`PlanProposed` steht auf Schema **1.1** (additiv: `subtasks: list[PlanSubtask]` + `agents_used: list[str]`). Alte 1.0-Events lesen weiter, weil beide Felder Defaults haben — siehe `test_plan_proposed_schema_is_v1_1_with_additive_fields`.
+
 ## CodingAgent ist Plug-in, nicht Fundament
 
 `ClaudeCodeCLIAgent` ist eine konkrete Implementierung. Das `CodingAgent`-Protocol erlaubt morgen einen `CodexCLIAgent`, `OpenCodeAgent` oder `DirectAnthropicAPIAgent`. Wenn du im Runner gegen `claude` direkt programmierst statt gegen das Protocol, brichst du das.
+
+### Multi-Agent ist Plug-in-intern, nicht Runner-Sache
+
+Das Subagent-Team (architect → developer → tester) wird **vom Master-`claude` orchestriert**, nicht vom Runner. Der Runner ruft ein einziges `propose()` auf; die Rollen-Choreografie lebt komplett im `ClaudeCodeCLIAgent`. Würde der Runner die Schritte selbst takten, müsste die Loop die Agent-Rollen kennen — das bricht Mantra 3 und das Plug-in-Prinzip.
+
+Welche Rollen mitwirken, steuert die `agents:[...]`-Roster aus der Trigger-Config (`spec.triggers.on_issue_label[label].agents`). Der board-loop löst das Roster pro Issue-Label auf (`_roster_for_issue`), `forge run` nimmt `--agents a,b,c` (oder `--multi-agent` als Shortcut fürs Default-Roster). Das Roster fließt in:
+- `ClaudeCodeCLIAgent(agents=...)` → `build_orchestrator_prompt(roster)` baut den `--append-system-prompt` aus genau den aktiven Rollen; ohne `architect` entfallen Plan-Schritt + `---FORGE-PLAN-...---`-Marker. `_install_subagents(wt, agents=roster)` kopiert nur die Roster-`.md`s in den Worktree.
+- `RunConfig.agents` → `PlanProposed.agents_used` (Record, welche Arbeitspferde liefen).
+
+Ein einsamer `["developer"]` braucht keine Orchestrierung (`roster_needs_orchestration`) — das ist der klassische Single-Agent-Run (kein Task-Tool, kein Plan). Das alte `multi_agent: bool` bleibt rückwärtskompatibel (`True` = Default-Roster, `False` = `["developer"]`).
 
 ## Sicherheit — vier Schichten
 

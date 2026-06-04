@@ -215,6 +215,34 @@ def test_install_subagents_finds_override_above_worktree(
     assert "Project-specific developer" in text
 
 
+def test_install_subagents_roster_filters_templates(repo: Path) -> None:
+    """Roster begrenzt, welche Subagents installiert werden."""
+    from forge_execute.agents.claude_cli import _install_subagents
+
+    _install_subagents(repo, agents=["architect", "developer"])
+    target = repo / ".claude" / "agents"
+    assert (target / "architect.md").is_file()
+    assert (target / "developer.md").is_file()
+    # tester ist NICHT im Roster → nicht installiert.
+    assert not (target / "tester.md").exists()
+
+
+def test_install_subagents_roster_filters_project_override(repo: Path) -> None:
+    """Auch Projekt-Overlays außerhalb des Rosters werden gefiltert."""
+    from forge_execute.agents.claude_cli import _install_subagents
+
+    override_dir = repo / ".forge" / "agents"
+    override_dir.mkdir(parents=True)
+    (override_dir / "tester.md").write_text(
+        "---\nname: tester\n---\n# CUSTOM TESTER\n", encoding="utf-8"
+    )
+
+    _install_subagents(repo, agents=["developer"])
+    target = repo / ".claude" / "agents"
+    assert (target / "developer.md").is_file()
+    assert not (target / "tester.md").exists()
+
+
 def test_augment_tools_adds_task_when_missing() -> None:
     from forge_execute.agents.claude_cli import _augment_tools_for_multi_agent
 
@@ -223,6 +251,83 @@ def test_augment_tools_adds_task_when_missing() -> None:
     assert _augment_tools_for_multi_agent("Read,Edit") == "Read,Edit,Task"
     # idempotent
     assert _augment_tools_for_multi_agent("Read,Task,Edit") == "Read,Task,Edit"
+
+
+# --- Roster resolution & orchestrator prompt ------------------------------
+
+
+def test_normalize_agents_defaults_and_ordering() -> None:
+    from forge_execute.agents.templates import DEFAULT_AGENTS, normalize_agents
+
+    assert normalize_agents(None) == list(DEFAULT_AGENTS)
+    assert normalize_agents([]) == list(DEFAULT_AGENTS)
+    # Reihenfolge folgt der Pipeline, Duplikate/Unbekanntes fallen raus.
+    assert normalize_agents(["tester", "architect", "bogus", "tester"]) == [
+        "architect",
+        "tester",
+    ]
+
+
+def test_roster_needs_orchestration() -> None:
+    from forge_execute.agents.templates import roster_needs_orchestration
+
+    assert roster_needs_orchestration(["developer"]) is False
+    assert roster_needs_orchestration(["architect", "developer"]) is True
+    assert roster_needs_orchestration(["developer", "tester"]) is True
+
+
+def test_build_orchestrator_prompt_full_roster_has_plan_markers() -> None:
+    from forge_execute.agents.templates import (
+        PLAN_BEGIN_MARKER,
+        build_orchestrator_prompt,
+    )
+
+    prompt = build_orchestrator_prompt(["architect", "developer", "tester"])
+    assert "architect" in prompt
+    assert "tester" in prompt
+    assert PLAN_BEGIN_MARKER in prompt
+
+
+def test_build_orchestrator_prompt_without_architect_omits_plan() -> None:
+    from forge_execute.agents.templates import (
+        PLAN_BEGIN_MARKER,
+        build_orchestrator_prompt,
+    )
+
+    prompt = build_orchestrator_prompt(["developer", "tester"])
+    # Kein architect → kein Plan-Schritt, keine Marker.
+    assert PLAN_BEGIN_MARKER not in prompt
+    assert "tester" in prompt
+
+
+def test_build_orchestrator_prompt_without_tester_omits_verification() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(["architect", "developer"])
+    assert "architect" in prompt
+    assert "verification suite" not in prompt
+
+
+def test_claude_agent_roster_derives_multi_agent() -> None:
+    """`agents`-Roster ist die Quelle der Wahrheit für multi_agent."""
+    lone = ClaudeCodeCLIAgent(agents=["developer"])
+    assert lone.agents == ["developer"]
+    assert lone.multi_agent is False
+
+    team = ClaudeCodeCLIAgent(agents=["tester", "architect"])
+    assert team.agents == ["architect", "tester"]  # normalisiert
+    assert team.multi_agent is True
+
+
+def test_claude_agent_multi_agent_flag_backcompat() -> None:
+    """Alt-Pfad: multi_agent=True → volles Default-Roster."""
+    legacy = ClaudeCodeCLIAgent(multi_agent=True)
+    assert legacy.agents == ["architect", "developer", "tester"]
+    assert legacy.multi_agent is True
+
+    single = ClaudeCodeCLIAgent(multi_agent=False)
+    assert single.agents == ["developer"]
+    assert single.multi_agent is False
 
 
 # --- Plan extraction from master output -----------------------------------

@@ -306,3 +306,46 @@ def test_board_config_empty_filter_labels_allowed() -> None:
     spec = ProjectSpec.model_validate(d)
     assert spec.board is not None
     assert spec.board.filter_labels == []
+
+
+# --- Judge (Spec v0.5) --------------------------------------------------
+
+
+def test_judge_disabled_by_default() -> None:
+    spec = ProjectSpec.model_validate(_minimal_spec_dict())
+    assert spec.judge.enabled is False
+    assert spec.judge.threshold == 0.8
+
+
+def test_llm_judge_score_accepted_as_gate() -> None:
+    d = _minimal_spec_dict()
+    d["judge"] = {"enabled": True}
+    d["gates"] = [{"kind": "llm_judge_score", "threshold": 0.8}]
+    spec = ProjectSpec.model_validate(d)
+    assert any(g.kind == "llm_judge_score" for g in spec.gates)
+
+
+def test_judge_enabled_without_gate_warns() -> None:
+    d = _minimal_spec_dict()
+    d["judge"] = {"enabled": True}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ProjectSpec.model_validate(d)
+    assert any("llm_judge_score" in str(w.message) for w in caught)
+
+
+def test_judge_enabled_with_gate_does_not_warn() -> None:
+    d = _minimal_spec_dict()
+    d["judge"] = {"enabled": True}
+    d["gates"] = [{"kind": "llm_judge_score", "threshold": 0.8}]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ProjectSpec.model_validate(d)
+    assert not any("llm_judge_score" in str(w.message) for w in caught)
+
+
+def test_judge_threshold_out_of_range_rejected() -> None:
+    d = _minimal_spec_dict()
+    d["judge"] = {"enabled": True, "threshold": 1.5}
+    with pytest.raises((ValueError, SpecValidationError)):
+        ProjectSpec.model_validate(d)

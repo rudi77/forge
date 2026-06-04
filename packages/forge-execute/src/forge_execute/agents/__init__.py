@@ -12,6 +12,7 @@ from forge_execute.agents.base import (
     CodingAgentError,
     CodingAgentTimeout,
     ProposalResult,
+    ReviewResult,
 )
 from forge_execute.agents.claude_cli import ClaudeCodeCLIAgent
 from forge_execute.agents.mock import MockCodingAgent
@@ -23,4 +24,5 @@ __all__ = [
     "CodingAgentTimeout",
     "MockCodingAgent",
     "ProposalResult",
+    "ReviewResult",
 ]

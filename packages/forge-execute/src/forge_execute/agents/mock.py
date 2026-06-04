@@ -17,9 +17,10 @@ from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 
-from forge_execute.agents.base import CodingAgent, ProposalResult
+from forge_execute.agents.base import CodingAgent, ProposalResult, ReviewResult
 
 _AgentFn = Callable[[Path, str], "ProposalResult | str | None"]
+_ReviewFn = Callable[[Path, str, str], ReviewResult]
 
 
 class MockCodingAgent:
@@ -47,6 +48,9 @@ class MockCodingAgent:
         static_result: ProposalResult | None = None,
         sequence: list[ProposalResult] | None = None,
         callable_: _AgentFn | None = None,
+        review_result: ReviewResult | None = None,
+        review_sequence: list[ReviewResult] | None = None,
+        review_callable: _ReviewFn | None = None,
     ) -> None:
         provided = sum(x is not None for x in (static_result, sequence, callable_))
         if provided != 1:
@@ -56,7 +60,14 @@ class MockCodingAgent:
         self._static = static_result
         self._sequence = list(sequence) if sequence else None
         self._callable = callable_
+        # Judge-Mock: optional. Default (nichts gesetzt) ist ein pass mit
+        # score 1.0 — so läuft ein dry-run mit aktiviertem Judge sauber
+        # durch, ohne dass Tests jeden Judge-Aufruf konfigurieren müssen.
+        self._review_static = review_result
+        self._review_sequence = list(review_sequence) if review_sequence else None
+        self._review_callable = review_callable
         self.calls: list[tuple[Path, str]] = []
+        self.review_calls: list[tuple[Path, str, str]] = []
 
     def propose(
         self,
@@ -97,6 +108,30 @@ class MockCodingAgent:
             stop_reason="end_turn",
             turns_used=1,
         )
+
+    def review(
+        self,
+        *,
+        worktree: Path,
+        acceptance_criteria: str,
+        diff: str,
+        max_turns: int,
+        budget_usd: Decimal,
+        model: str | None = None,
+        allowed_tools: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> ReviewResult:
+        self.review_calls.append((worktree, acceptance_criteria, diff))
+        if self._review_callable is not None:
+            return self._review_callable(worktree, acceptance_criteria, diff)
+        if self._review_sequence is not None:
+            if not self._review_sequence:
+                raise IndexError("MockCodingAgent review_sequence exhausted")
+            return self._review_sequence.pop(0)
+        if self._review_static is not None:
+            return self._review_static
+        # Default: pass mit voller Punktzahl (dry-run-freundlich).
+        return ReviewResult(judge_score=1.0, verdict="pass", reasoning="mock judge")
 
 
 # --- Local git helpers (Mock soll forge-core nicht querbenötigen) ---

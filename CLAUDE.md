@@ -4,7 +4,7 @@
 
 ## Einordnung
 
-forge ist die **messbare, replay-fähige Auto-PR-Maschine** aus `docs/forge-spec-v0.4.md` (Diff-Doku gegenüber v0.3 und v0.2, die als historische Snapshots im Repo bleiben). Die Spec ist Vertrag: wenn dein Vorschlag einem der drei Mantras widerspricht, ist es kein Bug, sondern eine Designentscheidung.
+forge ist die **messbare, replay-fähige Auto-PR-Maschine** aus `docs/forge-spec-v0.5.md` (Diff-Doku gegenüber v0.4/v0.3/v0.2, die als historische Snapshots im Repo bleiben). Die Spec ist Vertrag: wenn dein Vorschlag einem der drei Mantras widerspricht, ist es kein Bug, sondern eine Designentscheidung.
 
 Die drei Mantras:
 
@@ -105,6 +105,12 @@ Single-row INSERT via Python-Binding kostet ~12 ms each, auch in-Memory. Das ist
 ### Scoring bei rot→grün
 
 Wenn die Baseline-Gates nicht passen (Tests rot) und nach der Mutation passen, ist das **immer** ein Improvement, unabhängig vom Composite-Delta. Siehe `scoring.keep_or_discard(baseline_gates_passed=False)`. Vergessen → der `legacy_test_revival`-Pfad bleibt stuck.
+
+### Judge ist fail-closed, Triage ist fail-open
+
+Beide sind opt-in LLM-Pre/Sub-Phasen, aber mit **entgegengesetzter** Fehlerpolitik — nicht verwechseln. Die Triage lässt im Zweifel *durch* (`decision="relevant"`), weil ein zu Unrecht geschlossenes Issue teurer ist als ein unnötiger Run. Der Judge (`evaluators/judge.py`) lässt im Zweifel *fallen* (`score=0.0`/`fail`), weil ein unverifizierter Diff nie gemerged werden darf. Wenn du am Judge schraubst und einen Default einbaust, der bei Fehler „durchwinkt", brichst du die Sicherheitseigenschaft.
+
+Der Judge trägt sein Ergebnis als `llm_judge_score`-Messwert in den Eval-Output und bindet über ein gewöhnliches Gate. Die Decide-Logik (`scoring.py`/`gates.py`) bleibt **unangetastet** — der Judge füttert nur ein, er entscheidet nicht (Mantra 3). Vor der Implementierung fehlt der Messwert → Gate rot → nach Judge-`pass` grün → `gate_revival`. Das ist derselbe rot→grün-Pfad wie oben, nur dass die „Röte" vom Judge statt von pytest kommt.
 
 ### Forbidden Zones überschneiden Surfaces
 

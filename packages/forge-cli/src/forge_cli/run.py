@@ -164,9 +164,9 @@ def run_command(
             "--agents",
             help=(
                 "Explizites Subagent-Roster, komma-separiert "
-                "(z.B. 'architect,developer,tester' oder 'developer'). "
+                "(z.B. 'architect,developer,tester,reviewer' oder 'developer'). "
                 "Überschreibt --multi-agent. Bekannte Rollen: "
-                "architect, developer, tester."
+                "architect, developer, tester, reviewer."
             ),
         ),
     ] = None,

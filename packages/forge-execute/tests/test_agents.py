@@ -268,12 +268,25 @@ def test_normalize_agents_defaults_and_ordering() -> None:
     ]
 
 
+def test_normalize_agents_orders_reviewer_last() -> None:
+    from forge_execute.agents.templates import normalize_agents
+
+    # reviewer ist eine bekannte Rolle und folgt in der Pipeline-Ordnung
+    # hinter tester.
+    assert normalize_agents(["reviewer", "developer", "architect"]) == [
+        "architect",
+        "developer",
+        "reviewer",
+    ]
+
+
 def test_roster_needs_orchestration() -> None:
     from forge_execute.agents.templates import roster_needs_orchestration
 
     assert roster_needs_orchestration(["developer"]) is False
     assert roster_needs_orchestration(["architect", "developer"]) is True
     assert roster_needs_orchestration(["developer", "tester"]) is True
+    assert roster_needs_orchestration(["developer", "reviewer"]) is True
 
 
 def test_build_orchestrator_prompt_full_roster_has_plan_markers() -> None:
@@ -306,6 +319,26 @@ def test_build_orchestrator_prompt_without_tester_omits_verification() -> None:
     prompt = build_orchestrator_prompt(["architect", "developer"])
     assert "architect" in prompt
     assert "verification suite" not in prompt
+
+
+def test_build_orchestrator_prompt_with_reviewer_weaves_review_step() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(
+        ["architect", "developer", "tester", "reviewer"]
+    )
+    assert "reviewer" in prompt
+    # Der Reviewer-Schritt nennt die BLOCKING-Findings-Schleife und das
+    # Finalize-Verbot.
+    assert "BLOCKING" in prompt
+
+
+def test_build_orchestrator_prompt_without_reviewer_omits_review() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(["architect", "developer", "tester"])
+    assert "reviewer" not in prompt
+    assert "BLOCKING" not in prompt
 
 
 def test_claude_agent_roster_derives_multi_agent() -> None:

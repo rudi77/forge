@@ -8,10 +8,13 @@ from importlib.resources import files
 from pathlib import Path
 
 # Subagent-Rollen, die forge als Arbeitspferde kennt. Reihenfolge ist die
-# kanonische Pipeline-Ordnung (architect plant, developer baut, tester prüft).
-KNOWN_AGENTS: tuple[str, ...] = ("architect", "developer", "tester")
+# kanonische Pipeline-Ordnung (architect plant, developer baut, tester prüft,
+# reviewer liest am Ende kritisch gegen).
+KNOWN_AGENTS: tuple[str, ...] = ("architect", "developer", "tester", "reviewer")
 
-# Default-Roster, wenn der Operator nichts anderes konfiguriert.
+# Default-Roster, wenn der Operator nichts anderes konfiguriert. Der reviewer
+# ist bewusst NICHT im Default — er ist opt-in pro Roster (kostet einen
+# zusätzlichen read-only Subagent-Pass).
 DEFAULT_AGENTS: tuple[str, ...] = ("architect", "developer", "tester")
 
 
@@ -70,6 +73,7 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
     roster = normalize_agents(agents)
     has_architect = "architect" in roster
     has_tester = "tester" in roster
+    has_reviewer = "reviewer" in roster
 
     # --- Rollenbeschreibungen (nur aktivierte) ----------------------
     descriptions: list[str] = []
@@ -89,6 +93,15 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "- **tester**: writes failing tests OR runs the test suite to "
             "verify a subtask's acceptance criteria. Invoke before AND after "
             "a developer run when the task requires new tests."
+        )
+    if has_reviewer:
+        descriptions.append(
+            "- **reviewer** (read-only): critically reviews the cumulative "
+            "diff for correctness, design adherence, security and test "
+            "quality. Reports BLOCKING and non-blocking findings. Invoke LAST, "
+            "once the implementation is complete"
+            + (" and the tester reports green" if has_tester else "")
+            + "."
         )
 
     # --- Workflow-Schritte (konditional) ----------------------------
@@ -142,6 +155,17 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
         )
         n += 1
 
+    if has_reviewer:
+        steps.append(
+            f"{n}. Call the **reviewer** subagent with the cumulative diff "
+            "and the acceptance criteria. If it returns BLOCKING findings, "
+            "hand them back to the developer to fix (two rounds max), then "
+            "re-run the reviewer"
+            + (" and the tester" if has_tester else "")
+            + ". Carry any non-blocking findings into the run summary."
+        )
+        n += 1
+
     # --- Abschluss-Output -------------------------------------------
     if has_architect:
         steps.append(
@@ -184,6 +208,11 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
         "- Touch any file matching a pattern in `.forge/project.yaml` "
         "`forbidden` list."
     )
+    if has_reviewer:
+        nevers.append(
+            "- Finalize while the reviewer has unresolved BLOCKING findings. "
+            "Non-blocking findings may ship — note them in the run summary."
+        )
     if has_architect:
         nevers.append(
             f"- Omit the `{PLAN_BEGIN_MARKER}` / `{PLAN_END_MARKER}` markers. "

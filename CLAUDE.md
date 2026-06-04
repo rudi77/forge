@@ -102,6 +102,10 @@ uv run forge doctor --spec examples/pinta/.forge/project.yaml
 
 Single-row INSERT via Python-Binding kostet ~12 ms each, auch in-Memory. Das ist ein bekanntes Issue von DuckDB; nicht versuchen, mit Indexes oder PRAGMA zu fighten. Für Bulk → `executemany`. Für Tests, die Zeit messen, statt 1000 Events lieber 10 nehmen.
 
+### Fabrik-Metriken leben in Views, nicht in der Loop
+
+Die „Software-Factory"-Sicht (Aggregation ÜBER Runs hinweg) ist bewusst **read-only** und liegt komplett in DuckDB-Views (`store.py`, `_VIEW_FACTORY_KPIS` + `_VIEW_FACTORY_THROUGHPUT`), gerendert von `forge analyze` (`analyze.py`). Sie berührt die Loop nie (Mantra 3) — reine Auswertung des Event-Stroms. KPIs: Durchsatz, Merge-Rate, Keep-Rate (keep/discard-Generationen), Kosten pro gemergtem PR, Lead-Time (`PRMerged.time_to_merge_s`). Wenn du eine neue Fabrik-Metrik brauchst: neuen View dazu, in `_VIEWS` registrieren, Sektion in `analyze.py` ergänzen — **keine** neue Event-Logik, **kein** Loop-Eingriff. Das ist die Datengrundlage, die v2 (Population) laut Spec voraussetzt (≥100 Runs + Plateau).
+
 ### Scoring bei rot→grün
 
 Wenn die Baseline-Gates nicht passen (Tests rot) und nach der Mutation passen, ist das **immer** ein Improvement, unabhängig vom Composite-Delta. Siehe `scoring.keep_or_discard(baseline_gates_passed=False)`. Vergessen → der `legacy_test_revival`-Pfad bleibt stuck.

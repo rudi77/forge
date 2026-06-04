@@ -1,11 +1,18 @@
 """`forge analyze` — Standard-Reports aus dem Event-Store.
 
-Drei Reports gemäß Spec Teil 8 / 10:
+Reports gemäß Spec Teil 8 / 10:
 
-1. **Run-Outcomes** — letzte N Runs mit Decision, Cost, Score-Delta
-2. **Cost pro Focus** — wo Geld fließt, was es bringt
-3. **PR-Merge-Rate pro Focus** — Mensch-Maschine-Match-Indikator
-4. **Top Failure-Modes** — recurring Stolperfallen
+1. **Factory KPIs** — Fabrik-Executive-Summary über alle Runs: Durchsatz,
+   Merge-/Keep-Rate, Kosten pro gemergtem PR, Lead-Time
+2. **Throughput (per day)** — Durchsatz-Trend pro Tag
+3. **Run-Outcomes** — letzte N Runs mit Decision, Cost, Score-Delta
+4. **Cost pro Focus** — wo Geld fließt, was es bringt
+5. **PR-Merge-Rate pro Focus** — Mensch-Maschine-Match-Indikator
+6. **Top Failure-Modes** — recurring Stolperfallen
+
+Die Factory-KPIs sind die „Software-Factory"-Sicht (Mantra 1): read-only
+Aggregation über den Event-Strom, Voraussetzung für Koordinations- und
+Skalierungsentscheidungen.
 
 Ausgabe als Markdown, default nach stdout. Mit `--output FILE` in eine
 Datei.
@@ -58,11 +65,96 @@ def analyze_command(
 def _render_report(store, *, project: str, last_runs: int) -> str:
     sections: list[str] = []
     sections.append(f"# forge analyze — {project}\n")
+    # Fabrik-Sicht zuerst: die Executive Summary über alle Runs hinweg.
+    sections.append(_section_factory_kpis(store))
+    sections.append(_section_factory_throughput(store))
     sections.append(_section_recent_runs(store, last_runs))
     sections.append(_section_cost_per_focus(store))
     sections.append(_section_pr_merge_rate(store))
     sections.append(_section_failure_modes(store))
     return "\n".join(sections)
+
+
+def _fmt_duration(seconds: float | None) -> str:
+    """Sekunden → kompakte, menschenlesbare Dauer (—, 45s, 12m, 3.2h, 1.5d)."""
+    if seconds is None:
+        return "—"
+    s = float(seconds)
+    if s < 60:
+        return f"{s:.0f}s"
+    if s < 3600:
+        return f"{s / 60:.0f}m"
+    if s < 86400:
+        return f"{s / 3600:.1f}h"
+    return f"{s / 86400:.1f}d"
+
+
+def _section_factory_kpis(store) -> str:
+    rows = store.query("SELECT * FROM factory_kpis")
+    if not rows:
+        return "## Factory KPIs\n\n_no runs yet._\n"
+    r = rows[0]
+
+    def pct(v: float | None) -> str:
+        return f"{v * 100:.0f}%" if v is not None else "—"
+
+    def money(v: float | None) -> str:
+        return f"${v:.2f}" if v is not None else "—"
+
+    keep = (
+        f"{pct(r['keep_rate'])} ({r['kept']}/{r['generations']} generations)"
+        if r["generations"]
+        else "—"
+    )
+    out = [
+        "## Factory KPIs",
+        "",
+        "| metric | value |",
+        "|---|---|",
+        f"| Runs total | {r['total_runs']} |",
+        f"| PRs created | {r['prs_created']} |",
+        f"| PRs merged | {r['prs_merged']} |",
+        f"| Merge rate | {pct(r['merge_rate'])} |",
+        f"| Keep rate | {keep} |",
+        f"| Cost total | {money(r['total_cost_usd'])} |",
+        f"| Cost / merged PR | {money(r['cost_per_merged_pr'])} |",
+        f"| Mean run duration | {_fmt_duration(r['mean_run_duration_s'])} |",
+        f"| Mean lead time (PR→merge) | {_fmt_duration(r['mean_lead_time_s'])} |",
+        "",
+    ]
+    return "\n".join(out)
+
+
+def _section_factory_throughput(store, *, last_days: int = 14) -> str:
+    rows = store.query(
+        """
+        SELECT day, runs, prs_created, no_improvement, blocked,
+               total_cost_usd, mean_duration_s
+        FROM factory_throughput
+        ORDER BY day DESC
+        LIMIT ?
+        """,
+        [last_days],
+    )
+    if not rows:
+        return "## Throughput (per day)\n\n_no data._\n"
+
+    out = [
+        "## Throughput (per day)",
+        "",
+        "| day | runs | PRs | no-impr | blocked | cost | avg dur |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        day = r["day"].isoformat() if r["day"] is not None else "—"
+        cost = f"${r['total_cost_usd']:.2f}" if r["total_cost_usd"] is not None else "—"
+        out.append(
+            f"| {day} | {r['runs']} | {r['prs_created']} | "
+            f"{r['no_improvement']} | {r['blocked']} | {cost} | "
+            f"{_fmt_duration(r['mean_duration_s'])} |"
+        )
+    out.append("")
+    return "\n".join(out)
 
 
 def _section_recent_runs(store, last: int) -> str:

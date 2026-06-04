@@ -152,11 +152,87 @@ ORDER BY occurrences DESC;
 """
 
 
+# --- Fabrik-Ebene: Aggregation ÜBER Runs hinweg ----------------------------
+# Diese Views sind die „Software-Factory"-Sicht (Mantra 1: nur Messbares lässt
+# sich optimieren). Sie sind read-only und berühren die Loop nicht — reine
+# Auswertung des Event-Stroms. Voraussetzung für jede Koordinations- oder
+# Skalierungsentscheidung (Conductor, Parallelisierung).
+
+_VIEW_FACTORY_KPIS = """
+CREATE OR REPLACE VIEW factory_kpis AS
+WITH runs AS (
+    SELECT
+        project,
+        COUNT(*)                                         AS total_runs,
+        COUNT(*) FILTER (WHERE decision = 'pr_created')  AS prs_created,
+        SUM(total_cost_usd)                              AS total_cost_usd,
+        AVG(duration_s)                                  AS mean_run_duration_s
+    FROM runs_with_outcomes
+    GROUP BY project
+),
+gens AS (
+    SELECT
+        project,
+        COUNT(*)                                                                   AS generations,
+        COUNT(*) FILTER (WHERE json_extract_string(payload, '$.decision') = 'keep') AS kept
+    FROM events
+    WHERE kind = 'GenerationFinished'
+    GROUP BY project
+),
+merges AS (
+    SELECT
+        project,
+        COUNT(*)                                                        AS prs_merged,
+        AVG(CAST(json_extract(payload, '$.time_to_merge_s') AS DOUBLE)) AS mean_lead_time_s
+    FROM events
+    WHERE kind = 'PRMerged'
+    GROUP BY project
+)
+SELECT
+    r.project,
+    r.total_runs,
+    r.prs_created,
+    COALESCE(m.prs_merged, 0)                                            AS prs_merged,
+    CAST(COALESCE(m.prs_merged, 0) AS DOUBLE) / NULLIF(r.prs_created, 0) AS merge_rate,
+    COALESCE(g.generations, 0)                                          AS generations,
+    COALESCE(g.kept, 0)                                                  AS kept,
+    CAST(COALESCE(g.kept, 0) AS DOUBLE) / NULLIF(g.generations, 0)       AS keep_rate,
+    r.total_cost_usd,
+    r.total_cost_usd / NULLIF(m.prs_merged, 0)                          AS cost_per_merged_pr,
+    r.mean_run_duration_s,
+    m.mean_lead_time_s
+FROM runs r
+LEFT JOIN gens g   ON g.project = r.project
+LEFT JOIN merges m ON m.project = r.project;
+"""
+
+
+_VIEW_FACTORY_THROUGHPUT = """
+CREATE OR REPLACE VIEW factory_throughput AS
+SELECT
+    project,
+    CAST(started_at AS DATE)                            AS day,
+    COUNT(*)                                            AS runs,
+    COUNT(*) FILTER (WHERE decision = 'pr_created')     AS prs_created,
+    COUNT(*) FILTER (WHERE decision = 'no_improvement') AS no_improvement,
+    COUNT(*) FILTER (WHERE decision IN
+        ('cost_cap_hit', 'guardrail_blocked', 'preflight_blocked', 'error')
+    )                                                   AS blocked,
+    SUM(total_cost_usd)                                 AS total_cost_usd,
+    AVG(duration_s)                                     AS mean_duration_s
+FROM runs_with_outcomes
+WHERE started_at IS NOT NULL
+GROUP BY project, CAST(started_at AS DATE);
+"""
+
+
 _VIEWS = [
     _VIEW_RUNS_WITH_OUTCOMES,
     _VIEW_COST_PER_FOCUS,
     _VIEW_PR_MERGE_RATE,
     _VIEW_FAILURE_MODES,
+    _VIEW_FACTORY_KPIS,
+    _VIEW_FACTORY_THROUGHPUT,
 ]
 
 

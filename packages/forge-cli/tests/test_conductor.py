@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from forge_cli.conductor import (
     Blocked,
+    DispatchOrder,
     StageTransition,
     WorkItem,
     derive_signals,
@@ -116,7 +117,7 @@ def test_plan_tick_auto_advance_then_no_same_tick_dispatch() -> None:
 
 def test_plan_tick_dispatches_ready_without_deps() -> None:
     plan = plan_tick([_wi(1, Stage.READY)], capacity=5)
-    assert plan.dispatch == [1]
+    assert plan.dispatch == [DispatchOrder(1, Stage.IN_DEV)]
     assert StageTransition(1, Stage.READY, Stage.IN_DEV, "dispatched") in (
         plan.transitions
     )
@@ -133,13 +134,47 @@ def test_plan_tick_blocks_ready_with_unmet_deps() -> None:
 def test_plan_tick_dispatches_when_dep_done() -> None:
     items = [_wi(1, Stage.DONE), _wi(2, Stage.READY, deps=[1])]
     plan = plan_tick(items, capacity=5)
-    assert plan.dispatch == [2]
+    assert plan.dispatch == [DispatchOrder(2, Stage.IN_DEV)]
 
 
 def test_plan_tick_capacity_limits_dispatch() -> None:
     items = [_wi(n, Stage.READY) for n in (1, 2, 3)]
     plan = plan_tick(items, capacity=1)
-    assert plan.dispatch == [1]  # nach Nummer sortiert, nur 1 Slot
+    # nach Nummer sortiert, nur 1 Slot
+    assert plan.dispatch == [DispatchOrder(1, Stage.IN_DEV)]
+
+
+def test_plan_tick_dispatches_design_in_place_without_plan() -> None:
+    # design ohne Plan → in-place dispatcht (Team architect), KEIN Stage-Wechsel.
+    plan = plan_tick([_wi(1, Stage.DESIGN)], capacity=5)
+    assert plan.dispatch == [DispatchOrder(1, Stage.DESIGN)]
+    assert plan.transitions == []  # bleibt design, bis ein Plan vorliegt
+
+
+def test_plan_tick_design_with_plan_advances_not_dispatched() -> None:
+    # design + Plan → advance design→ready, NICHT im selben Tick dispatcht.
+    plan = plan_tick(
+        [_wi(1, Stage.DESIGN, signals=StageSignals(has_plan=True))], capacity=5
+    )
+    assert plan.dispatch == []
+    assert plan.transitions == [
+        StageTransition(1, Stage.DESIGN, Stage.READY, "plan_proposed")
+    ]
+
+
+def test_plan_tick_design_blocked_on_unmet_deps() -> None:
+    # design #2 hängt an #1 (nicht done) → blocked, kein Design-Run.
+    items = [_wi(1, Stage.IN_DEV), _wi(2, Stage.DESIGN, deps=[1])]
+    plan = plan_tick(items, capacity=5)
+    assert plan.dispatch == []
+    assert any(b.number == 2 and b.kind == "deps" for b in plan.blocked)
+
+
+def test_plan_tick_shared_capacity_across_teams() -> None:
+    # design #1 + ready #2 konkurrieren um 1 Slot → #1 (kleinere Nummer) gewinnt.
+    items = [_wi(1, Stage.DESIGN), _wi(2, Stage.READY)]
+    plan = plan_tick(items, capacity=1)
+    assert plan.dispatch == [DispatchOrder(1, Stage.DESIGN)]
 
 
 def test_plan_tick_cycle_blocks_members() -> None:
@@ -164,16 +199,16 @@ def test_run_conductor_tick_effects_transitions_before_dispatch() -> None:
     ]
     order: list[str] = []
     transitions: list[StageTransition] = []
-    dispatched: list[int] = []
+    dispatched: list[DispatchOrder] = []
     blocked: list[Blocked] = []
 
     def set_stage(t: StageTransition) -> None:
         order.append(f"stage:{t.number}:{t.to_stage.value}")
         transitions.append(t)
 
-    def dispatch(n: int) -> None:
-        order.append(f"dispatch:{n}")
-        dispatched.append(n)
+    def dispatch(o: DispatchOrder) -> None:
+        order.append(f"dispatch:{o.number}")
+        dispatched.append(o)
 
     res = run_conductor_tick(
         items=items,
@@ -183,7 +218,7 @@ def test_run_conductor_tick_effects_transitions_before_dispatch() -> None:
         on_blocked=blocked.append,
     )
     assert res.dispatched == 1
-    assert dispatched == [1]
+    assert dispatched == [DispatchOrder(1, Stage.IN_DEV)]
     # #2 advanced to ready, #1 advanced ready→in-dev (dispatch).
     assert res.transitions == 2
     # Sicherheit: der in-dev-Übergang von #1 kommt VOR dem dispatch von #1.

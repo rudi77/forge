@@ -70,6 +70,23 @@ class StageSignals:
     """Der PR des Items wurde gemergt (``PRMerged``)."""
 
 
+# Stages, in denen ein Team *in-place* arbeitet und dabei seinen
+# Advance-Auslöser produziert (``design`` → architect-Team → ``PlanProposed`` →
+# ``has_plan`` → ``design→ready``). Der Conductor dispatcht so ein Item, ohne es
+# zu bewegen; ``advance`` schreibt es fort, sobald das Signal vorliegt. Das ist
+# der „verschiedene-Teams"-Kern: jede Stage hier bekommt ihr eigenes Roster.
+#
+# ``in-dev`` steht bewusst NICHT hier: es wird beim ``ready→in-dev``-Übergang
+# *gekoppelt* dispatcht (genau einmal). Re-Dispatch/Eskalation bei
+# ausbleibendem PR (``no_improvement``) ist eine eigene Design-Entscheidung
+# (conductor-design.md §3, noch offen) — kein stiller Endlos-Retry.
+#
+# Wächst die Liste (``requirements``/``release``), braucht jede neue Stage
+# zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
+# Dispatch-Zweig in der board-loop-Wiring-Schicht.
+IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset({Stage.DESIGN})
+
+
 def stage_of(labels: list[str]) -> Stage | None:
     """Die ``forge:``-Stage eines Issues aus seinen Labels, oder ``None``.
 

@@ -116,8 +116,25 @@ Callables (set_stage/dispatch) — die GitHub-Seite (`list_stage_items`/
 Verdrahtet als `board-loop --watch --conductor` (`_run_conductor_watch`);
 board-watch und conductor-watch teilen `_heartbeat_session`. Stage-Labels
 (`forge:<stage>`) fallen mit den `on_issue_label`-Trigger-Keys zusammen — ein
-Label, kein zweiter Konfig-Ort. **Noch offen:** Live-Verifikation der
-gh-Kommandos gegen ein echtes Board (bisher nur Stub-getestet). Mantra 3: der Heartbeat taktet das Dispatchen von Runs
+Label, kein zweiter Konfig-Ort.
+
+**Stage-spezifischer Dispatch (verschiedene Teams pro Stage):** Die **Stage**
+bestimmt das **Team** und die **Run-Art**. `plan_tick` liefert
+`list[DispatchOrder]` (`number` + `stage`), nicht mehr nur `list[int]`.
+`stages.IN_PLACE_WORK_STAGES` (= `{design}`) markiert Stages, in denen ein Team
+*in-place* arbeitet (kein Stage-Wechsel beim Dispatch, anders als
+`ready→in-dev`) und seinen Advance-Auslöser produziert; `advance` schreibt das
+Item nächsten Tick fort, sobald das Signal vorliegt. `_run_conductor_watch`
+verzweigt nach `DispatchOrder.stage`: `design` → `_dispatch_design_run`
+(architect-Roster, `create_pr=False`, Output `PlanProposed` → `has_plan` →
+`design→ready`), sonst → der bestehende Dev-Loop (`_dispatch_issues`, PR). Neue
+executable Stage = Eintrag in `IN_PLACE_WORK_STAGES` **+** Advance-Signal in
+`StageSignals`/`advance` **+** Dispatch-Zweig. `requirements`/`release` fehlt
+jeweils noch ihr „fertig"-Signal (Inkrement 2). **Noch offen:** Live-Verifikation
+der gh-Kommandos gegen ein echtes Board (bisher nur Stub-getestet);
+Re-Dispatch/Eskalation eines `in-dev`-Items, dessen Run keinen PR produzierte.
+
+Mantra 3: der Heartbeat taktet das Dispatchen von Runs
 (`execute_run`), greift aber nie in Runner/Scoring/Gates ein. Die
 Heartbeat-Engine (`run_heartbeat`) ist mit injizierten Deps (sleep/should_stop/
 emit) ohne echtes `time.sleep` testbar — Tests nutzen `max_ticks`. Jeder Tick

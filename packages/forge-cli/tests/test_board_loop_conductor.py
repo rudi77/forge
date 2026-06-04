@@ -189,6 +189,45 @@ def test_conductor_dispatches_when_dependency_done(
     assert dispatched == [2]
 
 
+def test_conductor_dispatches_design_stage_to_design_run(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    ctx = _make_ctx(tmp_path)
+    # Ein design-Item ohne Plan → der Design-Run (architect-Team) läuft,
+    # NICHT der Dev-Loop. Kein Stage-Wechsel (bleibt design bis Plan vorliegt).
+    monkeypatch.setattr(
+        bl, "list_stage_items", lambda **k: [_issue(9, ["forge:design"])]
+    )
+    set_label = MagicMock()
+    monkeypatch.setattr(bl, "set_issue_stage_label", set_label)
+
+    design_runs: list[int] = []
+
+    def fake_design(*, ctx, issue, params):
+        design_runs.append(issue.number)
+        return bl._PassResult(
+            summaries=[], bailed=False, dispatched=1, skipped=0
+        )
+
+    # Der Dev-Loop darf hier NICHT angefasst werden.
+    dev_runs: list[int] = []
+    monkeypatch.setattr(bl, "_dispatch_design_run", fake_design)
+    monkeypatch.setattr(
+        bl,
+        "_dispatch_issues",
+        lambda **k: dev_runs.append(1)
+        or bl._PassResult(summaries=[], bailed=False, dispatched=1, skipped=0),
+    )
+
+    stats = _run(ctx)
+    assert design_runs == [9]
+    assert dev_runs == []  # kein Dev-Loop für ein design-Item
+    assert stats.total_dispatched == 1
+    # design bleibt design — kein gh-Label-Wechsel in diesem Tick.
+    set_label.assert_not_called()
+    assert _events_of_kind(ctx, "WorkItemStageChanged") == 0
+
+
 def test_conductor_empty_board_emits_tick_only(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

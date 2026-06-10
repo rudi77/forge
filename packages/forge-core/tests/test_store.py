@@ -78,6 +78,41 @@ def test_append_and_count(store: EventStore) -> None:
     assert store.count() == 3
 
 
+def test_project_cost_since_sums_only_matching_runs(store: EventStore) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+
+    def _finished(run_id: str, project: str, cost: str, ts: datetime):
+        return build_event(
+            kind=EventKind.RUN_FINISHED,
+            run_id=run_id,
+            payload=RunFinishedPayload(
+                decision="no_improvement",
+                generations_count=1,
+                total_cost_usd=Decimal(cost),
+            ),
+            ts=ts,
+            **{**COMMON, "project": project},
+        )
+
+    store.append_many(
+        [
+            _finished("r1", "pinta", "1.25", now - timedelta(hours=1)),
+            _finished("r2", "pinta", "0.75", now - timedelta(hours=2)),
+            # vor dem Cutoff
+            _finished("r3", "pinta", "9.99", now - timedelta(days=3)),
+            # anderes Projekt
+            _finished("r4", "other", "5.00", now - timedelta(hours=1)),
+        ]
+    )
+
+    cutoff = now - timedelta(days=1)
+    assert store.project_cost_since("pinta", cutoff) == Decimal("2.00")
+    assert store.project_cost_since("pinta", now - timedelta(days=7)) == Decimal("11.99")
+    assert store.project_cost_since("unknown", cutoff) == Decimal("0")
+
+
 def test_append_idempotent_on_event_id(store: EventStore) -> None:
     evt = build_event(
         kind=EventKind.RUN_STARTED,

@@ -333,6 +333,26 @@ class EventStore:
         cols = [d[0] for d in cur.description]
         return [_row_to_event(dict(zip(cols, r, strict=True))) for r in rows]
 
+    def project_cost_since(self, project: str, since: datetime) -> Decimal:
+        """Summiert `total_cost_usd` aller `RunFinished`-Events eines Projekts
+        ab `since` (inklusive).
+
+        Grundlage der Projekt-Cost-Caps (Spec Teil 5.3): Runs, die noch laufen,
+        haben kein `RunFinished` und zählen nicht — in v1 läuft pro Repo genau
+        ein forge-Prozess, daher kein Doppelzähl-Risiko.
+        """
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(
+                CAST(json_extract(payload, '$.total_cost_usd') AS DECIMAL(18, 6))
+            ), 0)
+            FROM events
+            WHERE kind = 'RunFinished' AND project = ? AND ts >= ?
+            """,
+            [project, since],
+        ).fetchone()
+        return Decimal(str(row[0])) if row and row[0] is not None else Decimal("0")
+
     def events_by_kind(self, kind: EventKind, *, limit: int = 1000) -> list[Event]:
         cur = self._conn.execute(
             "SELECT * FROM events WHERE kind = ? ORDER BY ts DESC LIMIT ?",

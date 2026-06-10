@@ -7,9 +7,11 @@ in den Blob-Store.
 
 Designentscheidungen für M1:
 
-- Nur eine Eval-Suite pro Run, default `quick`. `full` + `judge` sind M2.
-- Cost-Caps der Ebenen `generation` und `run`. `project_day`/`project_month`
-  sind v1-Stubs (Query gegen den Store) — können in M2 nachgezogen werden.
+- Nur eine Eval-Suite pro Run, default `quick`. `full` ist M2; der Judge
+  (Spec v0.5) läuft als opt-in Sub-Phase nach der Eval.
+- Cost-Caps aller vier Ebenen: `generation`/`run` werden während des Runs
+  geprüft, `project_day`/`project_month` vor Run-Start via Store-Query
+  (UTC-Kalendertag bzw. -Monat).
 - Kein PR-Erzeugung hier — das macht `forge-adapters/github`. Der Runner
   liefert das letzte gehaltene Commit-SHA + Diff zurück.
 """
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -203,6 +206,10 @@ class SequentialRunner:
     # --- Top-level run ---------------------------------------------------
 
     def run(self) -> RunResult:
+        blocked = self._check_project_cost_caps()
+        if blocked is not None:
+            return blocked
+
         worktree = self.worktrees.create(
             run_id=self.run_id,
             base_ref=self.config.base_ref,
@@ -981,6 +988,58 @@ class SequentialRunner:
             self._baseline_gate_results = {g.kind: g.passed for g in gate_results}
         if composite is not None:
             self._baseline_composite = composite
+
+    def _check_project_cost_caps(self) -> RunResult | None:
+        """Projekt-Cost-Caps (Spec Teil 5.3): vor Run-Start gegen den Store.
+
+        Summiert die `RunFinished`-Kosten des Projekts im laufenden
+        UTC-Kalendertag bzw. -Monat. Ist ein Budget bereits ausgeschöpft,
+        startet der Run gar nicht erst (kein Worktree, kein LLM-Call) —
+        es entsteht nur das Event-Tripel RunStarted/CostCapHit/RunFinished,
+        damit der Stopp im Event-Strom sichtbar und auswertbar bleibt.
+        """
+        caps = self.config.spec.cost_caps
+        now = datetime.now(UTC)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        month_start = day_start.replace(day=1)
+        checks: list[tuple[str, datetime, Decimal]] = [
+            ("project_day", day_start, caps.per_project_per_day_usd),
+            ("project_month", month_start, caps.per_project_per_month_usd),
+        ]
+        for level, since, cap in checks:
+            spent = self.store.project_cost_since(self.config.project, since)
+            if spent < cap:
+                continue
+            self._emit(
+                EventKind.RUN_STARTED,
+                RunStartedPayload(
+                    trigger=self.config.trigger,
+                    strategy="sequential",
+                    config_hash=self._compute_config_hash(),
+                    focus=self.config.focus,
+                    issue_number=self.config.issue_number,
+                    pr_number=self.config.pr_number,
+                    max_iterations=self.config.max_iterations,
+                ),
+            )
+            self._emit(
+                EventKind.COST_CAP_HIT,
+                CostCapHitPayload(
+                    level=level,  # type: ignore[arg-type]
+                    cap_usd=cap,
+                    actual_usd=spent,
+                ),
+            )
+            self._emit(
+                EventKind.RUN_FINISHED,
+                RunFinishedPayload(
+                    decision="cost_cap_hit",
+                    generations_count=0,
+                    total_cost_usd=Decimal("0"),
+                ),
+            )
+            return RunResult(run_id=self.run_id, decision="cost_cap_hit")
+        return None
 
     def _check_run_cost_cap(self) -> Decimal | None:
         cap = self.config.spec.cost_caps.per_run_usd

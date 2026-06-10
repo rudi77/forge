@@ -244,12 +244,13 @@ def test_run_conductor_tick_reports_blocked() -> None:
 
 
 class _Evt:
-    """Minimaler Event-Stand-in (kind/run_id/payload)."""
+    """Minimaler Event-Stand-in (kind/run_id/payload/ts)."""
 
-    def __init__(self, kind, run_id, payload):
+    def __init__(self, kind, run_id, payload, ts=0):
         self.kind = kind
         self.run_id = run_id
         self.payload = payload
+        self.ts = ts
 
 
 def test_derive_signals_from_events() -> None:
@@ -288,3 +289,89 @@ def test_derive_signals_insufficient_context_is_no_plan() -> None:
         _Evt(EK.PLAN_PROPOSED, "r1", {"insufficient_context": True}),
     ]
     assert derive_signals(events, 1).has_plan is False
+
+
+# --- Stuck-Item-Eskalation (stalled) ---------------------------------------
+
+
+def test_derive_signals_latest_run_finished_without_pr() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=1),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}),
+    ]
+    sig = derive_signals(events, 5)
+    assert sig.last_run_finished_without_pr is True
+    assert sig.last_run_finished_without_plan is True
+
+
+def test_derive_signals_running_run_is_not_stalled() -> None:
+    from forge_core.events import EventKind as EK
+
+    # Älterer Run scheiterte, aber der jüngste läuft noch → keine Eskalation.
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=1),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}),
+        _Evt(EK.RUN_STARTED, "r2", {"issue_number": 5}, ts=2),
+    ]
+    sig = derive_signals(events, 5)
+    assert sig.last_run_finished_without_pr is False
+    assert sig.last_run_finished_without_plan is False
+
+
+def test_derive_signals_successful_run_is_not_stalled() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=1),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 9}),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "pr_created"}),
+    ]
+    sig = derive_signals(events, 5)
+    assert sig.last_run_finished_without_pr is False
+
+
+def test_advance_escalates_stalled_in_dev_to_blocked() -> None:
+    nxt, reason = advance(
+        Stage.IN_DEV, StageSignals(last_run_finished_without_pr=True)
+    )
+    assert nxt == Stage.BLOCKED
+    assert reason == "run_finished_without_pr"
+    # PR-Signal gewinnt gegenüber der Eskalation:
+    nxt, reason = advance(
+        Stage.IN_DEV,
+        StageSignals(has_open_pr=True, last_run_finished_without_pr=True),
+    )
+    assert nxt == Stage.QA
+
+
+def test_advance_escalates_stalled_design_to_blocked() -> None:
+    nxt, reason = advance(
+        Stage.DESIGN, StageSignals(last_run_finished_without_plan=True)
+    )
+    assert nxt == Stage.BLOCKED
+    assert reason == "run_finished_without_plan"
+    # Plan-Signal gewinnt:
+    nxt, _ = advance(
+        Stage.DESIGN,
+        StageSignals(has_plan=True, last_run_finished_without_plan=True),
+    )
+    assert nxt == Stage.READY
+
+
+def test_plan_tick_reports_stalled_item_as_blocked() -> None:
+    items = [
+        WorkItem(
+            number=4,
+            stage=Stage.IN_DEV,
+            signals=StageSignals(last_run_finished_without_pr=True),
+        ),
+    ]
+    plan = plan_tick(items, capacity=1)
+    assert plan.transitions == [
+        StageTransition(4, Stage.IN_DEV, Stage.BLOCKED, "run_finished_without_pr")
+    ]
+    assert len(plan.blocked) == 1
+    assert plan.blocked[0].kind == "stalled"
+    assert plan.dispatch == []

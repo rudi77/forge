@@ -69,6 +69,15 @@ class StageSignals:
     has_merged_pr: bool = False
     """Der PR des Items wurde gemergt (``PRMerged``)."""
 
+    last_run_finished_without_pr: bool = False
+    """Der jüngste Run des Items ist beendet (``RunFinished``), ohne ein
+    ``PRCreated`` zu produzieren — Eskalations-Auslöser für ``in-dev``."""
+
+    last_run_finished_without_plan: bool = False
+    """Der jüngste Run des Items ist beendet, ohne einen verwertbaren Plan
+    (``PlanProposed`` ohne ``insufficient_context``) zu produzieren —
+    Eskalations-Auslöser für ``design``."""
+
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
 # Advance-Auslöser produziert (``design`` → architect-Team → ``PlanProposed`` →
@@ -77,9 +86,10 @@ class StageSignals:
 # der „verschiedene-Teams"-Kern: jede Stage hier bekommt ihr eigenes Roster.
 #
 # ``in-dev`` steht bewusst NICHT hier: es wird beim ``ready→in-dev``-Übergang
-# *gekoppelt* dispatcht (genau einmal). Re-Dispatch/Eskalation bei
-# ausbleibendem PR (``no_improvement``) ist eine eigene Design-Entscheidung
-# (conductor-design.md §3, noch offen) — kein stiller Endlos-Retry.
+# *gekoppelt* dispatcht (genau einmal). Endet der Run ohne PR, eskaliert
+# ``advance`` das Item nach ``blocked`` (``run_finished_without_pr``) — der
+# Operator entscheidet über den Re-Dispatch (Label zurück auf ``ready``),
+# kein stiller Endlos-Retry. Gleiches Muster für ``design`` ohne Plan.
 #
 # Wächst die Liste (``requirements``/``release``), braucht jede neue Stage
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
@@ -122,6 +132,10 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
       - design  → ready    sobald ein Plan vorliegt
       - in-dev  → qa       sobald ein PR geöffnet wurde
       - qa      → release  sobald der PR gemergt wurde
+      - design/in-dev → blocked  wenn der jüngste Run endete, OHNE sein
+        Stage-Artefakt (Plan bzw. PR) zu produzieren — Operator-Eskalation
+        statt stillem Liegenbleiben bzw. Endlos-Re-Dispatch. ``blocked``
+        wird nur manuell wieder verlassen.
 
     ``ready → in-dev`` passiert beim DISPATCH (Conductor, mit Kapazität +
     Dependencies) und ``release → done`` / ``requirements → design`` brauchen
@@ -130,8 +144,12 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     """
     if stage == Stage.DESIGN and signals.has_plan:
         return Stage.READY, "plan_proposed"
+    if stage == Stage.DESIGN and signals.last_run_finished_without_plan:
+        return Stage.BLOCKED, "run_finished_without_plan"
     if stage == Stage.IN_DEV and signals.has_open_pr:
         return Stage.QA, "pr_created"
+    if stage == Stage.IN_DEV and signals.last_run_finished_without_pr:
+        return Stage.BLOCKED, "run_finished_without_pr"
     if stage == Stage.QA and signals.has_merged_pr:
         return Stage.RELEASE, "pr_merged"
     return stage, ""

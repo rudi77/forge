@@ -103,6 +103,11 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
         if nxt != w.stage:
             transitions.append(StageTransition(w.number, w.stage, nxt, reason))
             effective[w.number] = nxt
+            if nxt == Stage.BLOCKED:
+                # Eskalation (stalled): zusätzlich als Blockade melden, damit
+                # ein WorkItemBlocked-Event den Grund trägt — der Operator
+                # sieht im Event-Strom UND am Label, dass er dran ist.
+                blocked.append(Blocked(w.number, "stalled", (), reason))
 
     # 2. CYCLES --------------------------------------------------------
     graph = {w.number: [d for d in w.depends_on] for w in items}
@@ -215,15 +220,22 @@ def derive_signals(events: list, issue_number: int) -> StageSignals:
       - has_open_pr   : ein PRCreated in einem Run dieses Issues.
       - has_merged_pr : ein PRMerged, dessen pr_number zu einem PRCreated
                         dieses Issues gehört.
+      - last_run_finished_without_pr / _without_plan:
+                        der JÜNGSTE Run des Issues (max ``ts`` des
+                        RunStarted) hat ein RunFinished, aber kein
+                        PRCreated bzw. keinen verwertbaren PlanProposed —
+                        Eskalations-Auslöser (advance → blocked). Läuft der
+                        jüngste Run noch (kein RunFinished), ist beides False.
     """
-    run_ids = {
-        e.run_id
+    started = [
+        e
         for e in events
         if e.kind == EventKind.RUN_STARTED
         and (e.payload or {}).get("issue_number") == issue_number
-    }
-    if not run_ids:
+    ]
+    if not started:
         return StageSignals()
+    run_ids = {e.run_id for e in started}
 
     has_plan = any(
         e.kind == EventKind.PLAN_PROPOSED
@@ -243,8 +255,26 @@ def derive_signals(events: list, issue_number: int) -> StageSignals:
         and (e.payload or {}).get("pr_number") in pr_numbers
         for e in events
     )
+
+    latest_run_id = max(started, key=lambda e: e.ts).run_id
+    latest_finished = any(
+        e.kind == EventKind.RUN_FINISHED and e.run_id == latest_run_id
+        for e in events
+    )
+    latest_has_pr = any(
+        e.kind == EventKind.PR_CREATED and e.run_id == latest_run_id
+        for e in events
+    )
+    latest_has_plan = any(
+        e.kind == EventKind.PLAN_PROPOSED
+        and e.run_id == latest_run_id
+        and not (e.payload or {}).get("insufficient_context", False)
+        for e in events
+    )
     return StageSignals(
         has_plan=has_plan,
         has_open_pr=has_open_pr,
         has_merged_pr=has_merged_pr,
+        last_run_finished_without_pr=latest_finished and not latest_has_pr,
+        last_run_finished_without_plan=latest_finished and not latest_has_plan,
     )

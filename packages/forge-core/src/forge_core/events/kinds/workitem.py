@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from forge_core.events.base import EventKind, register_payload
 
-BlockedKind = Literal["deps", "cycle", "error"]
+BlockedKind = Literal["deps", "cycle", "error", "stalled"]
 
 
 class WorkItemStageChangedPayload(BaseModel):
@@ -43,7 +43,9 @@ class WorkItemBlockedPayload(BaseModel):
     issue_number: int = Field(gt=0)
     kind: BlockedKind
     """``deps`` = wartet auf offene Dependencies, ``cycle`` = Zyklus im
-    Dependency-Graph, ``error`` = Dispatch/Adapter-Fehler."""
+    Dependency-Graph, ``error`` = Dispatch/Adapter-Fehler, ``stalled`` =
+    der jüngste Run des Items endete, ohne sein Stage-Artefakt (PR bzw.
+    Plan) zu produzieren — Operator-Eskalation statt stillem Endlos-Retry."""
 
     blocked_by: list[int] = Field(default_factory=list)
     """Issue-Nummern, die das Item blockieren (bei ``deps``/``cycle``)."""
@@ -54,4 +56,5 @@ class WorkItemBlockedPayload(BaseModel):
 register_payload(
     EventKind.WORK_ITEM_STAGE_CHANGED, WorkItemStageChangedPayload, "1.0"
 )
-register_payload(EventKind.WORK_ITEM_BLOCKED, WorkItemBlockedPayload, "1.0")
+# 1.1: additiv — BlockedKind um "stalled" erweitert (alte Events lesen weiter).
+register_payload(EventKind.WORK_ITEM_BLOCKED, WorkItemBlockedPayload, "1.1")

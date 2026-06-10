@@ -915,6 +915,7 @@ def _run_conductor_watch(
             events = []
             for kind in (
                 EventKind.RUN_STARTED,
+                EventKind.RUN_FINISHED,
                 EventKind.PLAN_PROPOSED,
                 EventKind.PR_CREATED,
                 EventKind.PR_MERGED,

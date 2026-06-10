@@ -353,6 +353,31 @@ class EventStore:
         ).fetchone()
         return Decimal(str(row[0])) if row and row[0] is not None else Decimal("0")
 
+    def last_run_started(
+        self, project: str, *, trigger: str, focus: str
+    ) -> datetime | None:
+        """Zeitstempel des jüngsten `RunStarted` mit gegebenem Trigger + Focus.
+
+        Replay-fähiger Anker für Schedule-Trigger (`cron_due(last=...)`): der
+        Heartbeat liest „wann lief dieser Trigger zuletzt" rein aus dem
+        Event-Strom, kein zweiter State-Ort.
+        """
+        row = self._conn.execute(
+            """
+            SELECT MAX(ts) FROM events
+            WHERE kind = 'RunStarted' AND project = ?
+              AND json_extract_string(payload, '$.trigger') = ?
+              AND json_extract_string(payload, '$.focus') = ?
+            """,
+            [project, trigger, focus],
+        ).fetchone()
+        ts = row[0] if row else None
+        if ts is None:
+            return None
+        if isinstance(ts, datetime):
+            return ts.astimezone(UTC) if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+        return None
+
     def events_by_kind(self, kind: EventKind, *, limit: int = 1000) -> list[Event]:
         cur = self._conn.execute(
             "SELECT * FROM events WHERE kind = ? ORDER BY ts DESC LIMIT ?",

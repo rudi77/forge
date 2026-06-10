@@ -22,6 +22,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -74,6 +75,7 @@ from forge_cli.runtime import (
     err_console,
     load_context,
 )
+from forge_cli.schedule import CronError, cron_due
 from forge_cli.stages import Stage, stage_of
 
 # Wir teilen denselben SubprocessRunner-DI-Pattern wie pr.py / board.py,
@@ -576,6 +578,125 @@ def _dispatch_design_run(
     )
 
 
+@dataclass
+class _ScheduleResult:
+    """Was ein Schedule-Durchlauf eines Ticks bewirkt hat."""
+
+    scheduled: int = 0
+    bailed: bool = False
+
+
+def _dispatch_due_schedules(
+    *,
+    ctx: ForgeContext,
+    store: Any,
+    params: _DispatchParams,
+    session_start: datetime,
+    now: datetime | None = None,
+) -> _ScheduleResult:
+    """Dispatcht alle fälligen ``triggers.schedule``-Einträge als Runs.
+
+    Prompt-Quelle ist die operator-geschriebene ``prompt_file`` (trusted —
+    anders als Issue-Bodies kein UNTRUSTED-Wrapper nötig). Der ``last``-Anker
+    für :func:`cron_due` kommt rein aus dem Event-Strom (jüngstes
+    ``RunStarted`` mit ``trigger=schedule`` + gleichem Focus) — replay-fähig,
+    kein zweiter State-Ort. Lief der Trigger noch nie, zählt der
+    Session-Start als Anker: kein Massen-Feuern beim Heartbeat-Start,
+    gefeuert wird ab der ersten fälligen Minute *innerhalb* der Session.
+
+    Trigger ohne ``prompt_file`` oder mit fehlender Datei werden mit Warnung
+    übersprungen — ein Schedule-Run ohne Auftrag wäre ein leerer LLM-Call.
+    """
+    result = _ScheduleResult()
+    schedules = ctx.spec.triggers.schedule
+    if not schedules:
+        return result
+    now = now or datetime.now(UTC)
+
+    for idx, sched in enumerate(schedules):
+        if sched.prompt_file is None:
+            # Spec-Validierung hat beim Laden bereits gewarnt — hier still
+            # überspringen, sonst spammt jeder Tick das Log.
+            continue
+        last = store.last_run_started(
+            ctx.spec.name, trigger="schedule", focus=sched.focus
+        )
+        try:
+            due = cron_due(sched.cron, last=last or session_start, now=now)
+        except CronError as exc:
+            err_console.print(
+                f"[yellow]schedule[{idx}][/yellow]: invalid cron "
+                f"{sched.cron!r}: {exc}"
+            )
+            continue
+        if not due:
+            continue
+
+        prompt_path = ctx.repo_root / sched.prompt_file
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            err_console.print(
+                f"[yellow]schedule[{idx}][/yellow]: prompt_file "
+                f"{sched.prompt_file!r} not readable ({exc}) — skipping."
+            )
+            continue
+        if not prompt:
+            err_console.print(
+                f"[yellow]schedule[{idx}][/yellow]: prompt_file "
+                f"{sched.prompt_file!r} is empty — skipping."
+            )
+            continue
+
+        console.print(
+            f"\n[bold blue]>>> schedule[/bold blue] firing "
+            f"[italic]{sched.focus}[/italic] (cron {sched.cron})"
+        )
+        try:
+            outcome = execute_run(
+                ctx=ctx,
+                rendered_prompt=prompt,
+                prompt_template_id=f"schedule:{sched.focus}",
+                trigger="schedule",
+                focus=sched.focus,
+                base_ref=params.base_ref,
+                acceptance_criteria=prompt,
+                max_iterations=sched.max_iterations or params.max_iterations,
+                max_turns=params.max_turns,
+                eval_suite=params.eval_suite,
+                model=sched.model or params.model,
+                issue_number=None,
+                pr_number=None,
+                dry_run=False,
+                claude_bin=params.claude_bin,
+                multi_agent=False,
+                agents=list(sched.agents),
+                create_pr=True,
+                pr_base=params.pr_base,
+                extra_labels=list(params.pr_label or []),
+                pr_draft=False,
+                auto_merge=params.auto_merge,
+                announce=False,
+            )
+        except Exception as exc:
+            err_console.print(
+                f"[red]error[/red] in schedule run {sched.focus!r}: {exc}"
+            )
+            result.bailed = True
+            break
+
+        result.scheduled += 1
+        if outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}:
+            err_console.print(
+                f"[yellow]schedule bailing[/yellow]: run decision = "
+                f"{outcome.result.decision}"
+            )
+            result.bailed = True
+            break
+
+    return result
+
+
 def _heartbeat_session(
     *,
     ctx: ForgeContext,
@@ -664,10 +785,17 @@ def _run_watch(
     max_ticks: int | None = None,
 ) -> HeartbeatStats:
     """Flacher Dauerbetrieb (Phase B): pollt board-ready Issues und arbeitet
-    sie ab — ohne Stage-State-Machine."""
+    sie ab; fällige ``schedule``-Trigger feuern vor dem Board-Pass."""
 
-    def make_tick(_store: Any, _session_id: str) -> Callable[[int], TickResult]:
+    def make_tick(store: Any, _session_id: str) -> Callable[[int], TickResult]:
+        session_start = datetime.now(UTC)
+
         def tick_fn(tick_index: int) -> TickResult:
+            sched = _dispatch_due_schedules(
+                ctx=ctx, store=store, params=params, session_start=session_start
+            )
+            if sched.bailed:
+                return TickResult(scheduled=sched.scheduled, bailed=True)
             try:
                 ready = list_ready_items(
                     ctx.spec.board, repo_owner=repo_owner, repo_name=repo_name
@@ -676,13 +804,13 @@ def _run_watch(
                 err_console.print(
                     f"[red]board error[/red] (tick {tick_index}): {exc}"
                 )
-                return TickResult(bailed=False)
+                return TickResult(scheduled=sched.scheduled, bailed=False)
             if not ready:
                 console.print(
                     f"[dim]tick {tick_index}: Backlog leer — warte "
                     f"{interval_s:.0f}s[/dim]"
                 )
-                return TickResult()
+                return TickResult(scheduled=sched.scheduled)
             res = _dispatch_issues(
                 ctx=ctx,
                 issues=ready,
@@ -692,7 +820,10 @@ def _run_watch(
             )
             _print_loop_summary(res.summaries, bailed=res.bailed)
             return TickResult(
-                dispatched=res.dispatched, skipped=res.skipped, bailed=res.bailed
+                dispatched=res.dispatched,
+                scheduled=sched.scheduled,
+                skipped=res.skipped,
+                bailed=res.bailed,
             )
 
         return tick_fn
@@ -725,6 +856,7 @@ def _run_conductor_watch(
     stage_labels = [s.value for s in Stage]
 
     def make_tick(store: Any, session_id: str) -> Callable[[int], TickResult]:
+        session_start = datetime.now(UTC)
         def _emit_stage_changed(t: StageTransition) -> None:
             store.append(
                 build_event(
@@ -762,6 +894,11 @@ def _run_conductor_watch(
             )
 
         def tick_fn(tick_index: int) -> TickResult:
+            sched = _dispatch_due_schedules(
+                ctx=ctx, store=store, params=params, session_start=session_start
+            )
+            if sched.bailed:
+                return TickResult(scheduled=sched.scheduled, bailed=True)
             try:
                 issues = list_stage_items(
                     repo_owner=repo_owner,
@@ -773,7 +910,7 @@ def _run_conductor_watch(
                 err_console.print(
                     f"[red]board error[/red] (tick {tick_index}): {exc}"
                 )
-                return TickResult()
+                return TickResult(scheduled=sched.scheduled)
 
             events = []
             for kind in (
@@ -803,7 +940,7 @@ def _run_conductor_watch(
                 console.print(
                     f"[dim]tick {tick_index}: keine aktiven Work-Items[/dim]"
                 )
-                return TickResult()
+                return TickResult(scheduled=sched.scheduled)
 
             counters = {"dispatched": 0, "bailed": False}
 
@@ -851,6 +988,7 @@ def _run_conductor_watch(
             )
             return TickResult(
                 dispatched=counters["dispatched"],
+                scheduled=sched.scheduled,
                 blocked=result.blocked,
                 bailed=bool(counters["bailed"]),
             )

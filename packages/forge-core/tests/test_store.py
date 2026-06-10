@@ -113,6 +113,42 @@ def test_project_cost_since_sums_only_matching_runs(store: EventStore) -> None:
     assert store.project_cost_since("unknown", cutoff) == Decimal("0")
 
 
+def test_last_run_started_filters_trigger_and_focus(store: EventStore) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC).replace(microsecond=0)
+
+    def _started(run_id: str, trigger: str, focus: str, ts: datetime):
+        return build_event(
+            kind=EventKind.RUN_STARTED,
+            run_id=run_id,
+            payload=RunStartedPayload(
+                trigger=trigger,
+                strategy="sequential",
+                config_hash="sha256:cfg",
+                focus=focus,
+            ),
+            ts=ts,
+            **COMMON,
+        )
+
+    store.append_many(
+        [
+            _started("r1", "schedule", "nightly", now - timedelta(hours=5)),
+            _started("r2", "schedule", "nightly", now - timedelta(hours=2)),
+            # anderer Focus / anderer Trigger zählen nicht
+            _started("r3", "schedule", "weekly", now - timedelta(hours=1)),
+            _started("r4", "manual", "nightly", now - timedelta(minutes=30)),
+        ]
+    )
+
+    last = store.last_run_started("pinta", trigger="schedule", focus="nightly")
+    assert last == now - timedelta(hours=2)
+    assert (
+        store.last_run_started("pinta", trigger="schedule", focus="missing") is None
+    )
+
+
 def test_append_idempotent_on_event_id(store: EventStore) -> None:
     evt = build_event(
         kind=EventKind.RUN_STARTED,

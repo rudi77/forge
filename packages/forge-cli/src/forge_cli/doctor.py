@@ -69,6 +69,13 @@ def doctor_command(
     # Judge-Konsistenz (Spec v0.5)
     findings.append(_check_judge(ctx.spec))
 
+    # Schedule-Trigger: Cron parsebar + prompt_file vorhanden
+    findings.extend(_check_schedule_triggers(ctx.spec, ctx.repo_root))
+
+    # Tote Config sichtbar machen: auto_tag ohne Executor, reservierte Rollen
+    findings.extend(_check_release_config(ctx.spec))
+    findings.extend(_check_trigger_rosters(ctx.spec))
+
     has_error = any(f.level == "error" for f in findings)
     _render(findings)
     raise typer.Exit(code=1 if has_error else 0)
@@ -157,6 +164,91 @@ def _check_judge(spec) -> Finding:
         "judge.enabled but no llm_judge_score gate — judge runs but cannot "
         "block a decision; add `{kind: llm_judge_score, threshold: 0.8}` to gates",
     )
+
+
+def _check_schedule_triggers(spec, repo_root: Path) -> list[Finding]:
+    """Schedule-Trigger: Cron muss parsen, ``prompt_file`` muss existieren.
+
+    Ein Trigger ohne (lesbare) Prompt-Quelle wird vom Heartbeat nie
+    dispatcht — das soll der Operator VOR dem 24/7-Betrieb sehen, nicht im
+    Log um 02:00.
+    """
+    from forge_cli.schedule import CronError, parse_cron
+
+    out: list[Finding] = []
+    for idx, sched in enumerate(spec.triggers.schedule):
+        label = f"schedule[{idx}] ({sched.focus})"
+        try:
+            parse_cron(sched.cron)
+        except CronError as exc:
+            out.append(Finding("schedule", "error", f"{label}: invalid cron: {exc}"))
+            continue
+        if sched.prompt_file is None:
+            out.append(
+                Finding(
+                    "schedule",
+                    "warn",
+                    f"{label}: no prompt_file — trigger will never dispatch",
+                )
+            )
+        elif not (repo_root / sched.prompt_file).is_file():
+            out.append(
+                Finding(
+                    "schedule",
+                    "warn",
+                    f"{label}: prompt_file {sched.prompt_file!r} not found — "
+                    f"trigger will be skipped",
+                )
+            )
+        else:
+            out.append(Finding("schedule", "ok", f"{label}: cron + prompt_file ok"))
+    return out
+
+
+def _check_release_config(spec) -> list[Finding]:
+    """`release.on_main_green: auto_tag` ist reservierte Config ohne Executor
+    in v1 — still akzeptierte, wirkungslose Config ist eine Operator-Falle."""
+    if spec.release.on_main_green == "auto_tag":
+        return [
+            Finding(
+                "release",
+                "warn",
+                "release.on_main_green: auto_tag is configured but v1 has no "
+                "tagging executor — no tag will be created on green main",
+            )
+        ]
+    return []
+
+
+def _check_trigger_rosters(spec) -> list[Finding]:
+    """Roster-Einträge, für die kein Subagent-Template existiert (z.B. die
+    spec-reservierte Rolle `operations`), werden beim Dispatch still
+    verworfen — hier sichtbar machen."""
+    from forge_execute.agents.templates import unknown_agents
+
+    out: list[Finding] = []
+
+    def _check(roster: list[str], where: str) -> None:
+        missing = unknown_agents(list(roster))
+        if missing:
+            out.append(
+                Finding(
+                    "roster",
+                    "warn",
+                    f"{where}: agent(s) {missing} have no implementation and "
+                    f"will be silently dropped from the roster",
+                )
+            )
+
+    for lbl, cfg in spec.triggers.on_issue_label.items():
+        _check(cfg.agents, f"triggers.on_issue_label[{lbl!r}]")
+    if spec.triggers.on_pr_opened is not None:
+        _check(spec.triggers.on_pr_opened.agents, "triggers.on_pr_opened")
+    if spec.triggers.on_ci_failure is not None:
+        _check(spec.triggers.on_ci_failure.agents, "triggers.on_ci_failure")
+    for idx, sched in enumerate(spec.triggers.schedule):
+        _check(sched.agents, f"triggers.schedule[{idx}]")
+    return out
 
 
 def _render(findings: list[Finding]) -> None:

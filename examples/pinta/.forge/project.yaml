@@ -197,6 +197,9 @@ triggers:
     - cron: "0 2 * * *"
       strategy: sequential
       focus: legacy_test_revival
+      # Auftrags-Prompt des nächtlichen Runs — ohne prompt_file wird der
+      # Trigger vom Heartbeat übersprungen (kein leerer LLM-Call).
+      prompt_file: ".forge/prompts/legacy_test_revival.md"
 
 # === RELEASE ===
 release:

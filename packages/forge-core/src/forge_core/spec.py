@@ -268,6 +268,11 @@ class ScheduleTriggerConfig(BaseModel):
     agents: list[SubagentName] = Field(
         default_factory=lambda: ["architect", "developer", "tester"]
     )
+    prompt_file: NonEmptyStr | None = None
+    """Repo-relative Datei (z.B. ``.forge/prompts/nightly.md``), deren Inhalt
+    der Auftrags-Prompt des Schedule-Runs ist. Ohne ``prompt_file`` wird der
+    Trigger beim Heartbeat mit Warnung übersprungen — ein Schedule-Run ohne
+    Auftrag wäre ein leerer LLM-Call."""
 
 
 class TriggersConfig(BaseModel):
@@ -554,6 +559,24 @@ class ProjectSpec(BaseModel):
                 "`{kind: llm_judge_score, threshold: 0.8}` to make it binding.",
                 stacklevel=2,
             )
+        return self
+
+    @model_validator(mode="after")
+    def _schedule_triggers_have_prompt_source(self) -> ProjectSpec:
+        """Warnt, wenn ein Schedule-Trigger keine `prompt_file` hat.
+
+        Ein Schedule-Trigger ohne Prompt-Quelle wird vom Heartbeat nie
+        dispatcht (kein leerer LLM-Call) — die Cron-Config wäre wirkungslos.
+        Kein harter Fehler, weil Operatoren die Datei nachreichen können.
+        """
+        for idx, sched in enumerate(self.triggers.schedule):
+            if sched.prompt_file is None:
+                warnings.warn(
+                    f"triggers.schedule[{idx}] (focus={sched.focus!r}) has no "
+                    f"prompt_file — the trigger will never dispatch. Add e.g. "
+                    f"`prompt_file: .forge/prompts/{sched.focus}.md`.",
+                    stacklevel=2,
+                )
         return self
 
     @model_validator(mode="after")

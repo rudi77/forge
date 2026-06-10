@@ -165,6 +165,102 @@ def test_doctor_judge_check() -> None:
     assert _check_judge(enabled_with_gate).level == "ok"
 
 
+def test_doctor_schedule_check(tmp_path: Path) -> None:
+    """`_check_schedule_triggers`: error bei kaputtem Cron, warn ohne/mit
+    fehlender prompt_file, ok wenn beides stimmt."""
+    import warnings
+
+    from forge_cli.doctor import _check_schedule_triggers
+    from forge_core.spec import ProjectSpec
+
+    base = {
+        "spec_version": "1.0",
+        "name": "t",
+        "cost_caps": {
+            "per_generation_usd": "0.5",
+            "per_run_usd": "5",
+            "per_project_per_day_usd": "30",
+            "per_project_per_month_usd": "500",
+        },
+    }
+
+    def _spec_with(sched: dict) -> ProjectSpec:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return ProjectSpec.model_validate(
+                {**base, "triggers": {"schedule": [sched]}}
+            )
+
+    bad_cron = _spec_with({"cron": "61 * * * *", "focus": "x"})
+    findings = _check_schedule_triggers(bad_cron, tmp_path)
+    assert findings[0].level == "error"
+
+    no_file = _spec_with({"cron": "0 2 * * *", "focus": "x"})
+    findings = _check_schedule_triggers(no_file, tmp_path)
+    assert findings[0].level == "warn"
+    assert "prompt_file" in findings[0].detail
+
+    missing_file = _spec_with(
+        {"cron": "0 2 * * *", "focus": "x", "prompt_file": "nope.md"}
+    )
+    findings = _check_schedule_triggers(missing_file, tmp_path)
+    assert findings[0].level == "warn"
+
+    (tmp_path / "prompt.md").write_text("auftrag", encoding="utf-8")
+    ok = _spec_with({"cron": "0 2 * * *", "focus": "x", "prompt_file": "prompt.md"})
+    findings = _check_schedule_triggers(ok, tmp_path)
+    assert findings[0].level == "ok"
+
+
+def test_doctor_release_and_roster_checks() -> None:
+    """auto_tag ohne Executor und reservierte Rollen (`operations`) werden
+    als warn sichtbar, statt still wirkungslos zu bleiben."""
+    from forge_cli.doctor import _check_release_config, _check_trigger_rosters
+    from forge_core.spec import ProjectSpec
+
+    base = {
+        "spec_version": "1.0",
+        "name": "t",
+        "cost_caps": {
+            "per_generation_usd": "0.5",
+            "per_run_usd": "5",
+            "per_project_per_day_usd": "30",
+            "per_project_per_month_usd": "500",
+        },
+    }
+
+    plain = ProjectSpec.model_validate(base)
+    assert _check_release_config(plain) == []
+    assert _check_trigger_rosters(plain) == []
+
+    auto_tag = ProjectSpec.model_validate(
+        {**base, "release": {"on_main_green": "auto_tag"}}
+    )
+    findings = _check_release_config(auto_tag)
+    assert len(findings) == 1
+    assert findings[0].level == "warn"
+    assert "auto_tag" in findings[0].detail
+
+    with_ops = ProjectSpec.model_validate(
+        {
+            **base,
+            "triggers": {
+                "on_issue_label": {
+                    "auto-fix": {
+                        "strategy": "sequential",
+                        "model": "sonnet",
+                        "agents": ["developer", "operations"],
+                    }
+                }
+            },
+        }
+    )
+    findings = _check_trigger_rosters(with_ops)
+    assert len(findings) == 1
+    assert findings[0].level == "warn"
+    assert "operations" in findings[0].detail
+
+
 def test_doctor_fails_without_api_key(mini_repo: Path, monkeypatch) -> None:
     monkeypatch.chdir(mini_repo)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

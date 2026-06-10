@@ -266,13 +266,14 @@ Kategorisch ausgeschlossen, gleiche Linie wie die Spec-v1-Ausschlüsse:
    Cron (parse/match/due-Fenster), Watch-Glue (Ticks + Event-Persistenz +
    Board-Fehler-Robustheit).
 
-**Bewusst aufgeschoben (kein Half-Wiring):** das *Dispatchen* fälliger
-`schedule`-Trigger als Run. Ein Schedule-Trigger hat einen `focus`, aber
-**keine Prompt-Quelle** (anders als ein Issue, dessen Body der Prompt ist).
-Was ein „nächtlicher tech-debt-Sweep" konkret als Auftrag bekommt, ist eine
-echte Design-Entscheidung — sie gehört zum requirements/operations-Agent
-(Phase C), der Arbeit *erzeugt*. Bis dahin ist die Cron-Maschinerie gebaut und
-getestet, aber nicht an einen leeren Prompt verdrahtet.
+5. ✅ Schedule-Dispatch (nachgereicht, Production-Hardening): die fehlende
+   Prompt-Quelle ist entschieden — `ScheduleTriggerConfig.prompt_file`
+   (repo-relative, operator-geschriebene Datei = trusted Auftragstext).
+   `_dispatch_due_schedules` feuert fällige Trigger in beiden Watch-Modi vor
+   dem Board-Pass; `last`-Anker = jüngstes `RunStarted(trigger=schedule,
+   focus=…)` aus dem Event-Strom (`EventStore.last_run_started`), Fallback
+   Session-Start (kein Massen-Feuern beim Heartbeat-Start). Ohne
+   `prompt_file`: Skip + Spec-Warnung + Doctor-Check — kein leerer LLM-Call.
 
 ### Phase C — konkrete Schritte (Conductor)
 
@@ -335,10 +336,16 @@ Damit läuft erstmals ein **Zwei-Team-Fließband** (Design-Team → Dev-Team) re
 event-getrieben. `requirements` und `release` bleiben offen: sie bräuchten je ein
 neues Advance-**Signal** (`StageSignals` + `advance`) und einen Dispatch-Zweig —
 `requirements` ein „Spec fertig"-Signal, `release` ein „Tag/Changelog erzeugt"-
-Signal. Beide kommen mit Inkrement 2 (eigenes Design der Output-Verträge). Auch
-offen: Re-Dispatch/Eskalation eines `in-dev`-Items, dessen Run keinen PR
-produzierte (heute bleibt es still in `in-dev`) — bewusste Design-Entscheidung,
-kein stiller Endlos-Retry (§3-Tabelle).
+Signal. Beide kommen mit Inkrement 2 (eigenes Design der Output-Verträge).
+
+**Eskalation (nachgereicht, Production-Hardening):** ein `in-dev`-Item, dessen
+jüngster Run ohne `PRCreated` endete (bzw. ein `design`-Item ohne verwertbaren
+Plan), eskaliert via `advance` nach `forge:blocked` —
+`StageSignals.last_run_finished_without_pr/_plan`, abgeleitet aus
+`RunStarted`+`RunFinished` des jüngsten Runs. Event-Spur: `WorkItemStageChanged`
++ `WorkItemBlocked(kind="stalled")`. Re-Dispatch bleibt Operator-Entscheidung
+(Label zurück auf `ready`) — kein stiller Endlos-Retry, aber auch kein
+lautloses Liegenbleiben mehr.
 
 **Operator-Setup (für die Live-Erprobung):** Issues mit `forge:`-Stage-Labels
 versehen (`forge:design`/`forge:ready`/…), Dependencies via `Depends-On: #N` im

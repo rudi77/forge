@@ -2,6 +2,49 @@
 
 Alle bemerkenswerten Änderungen an forge werden hier dokumentiert. Format: [Keep a Changelog](https://keepachangelog.com/), Versionierung: [SemVer](https://semver.org/).
 
+## [Unreleased] — Production-Hardening
+
+Schließt die im Code-Review identifizierten Lücken auf dem Weg zum
+produktiven 24/7-Betrieb.
+
+### Hinzugefügt
+
+- **Projekt-Cost-Caps aktiv** (`runner.py`, `store.py`) — die bisherigen
+  v1-Stubs `per_project_per_day_usd`/`per_project_per_month_usd` sind echte
+  Checks: vor Run-Start summiert `EventStore.project_cost_since()` die
+  `RunFinished`-Kosten des Projekts im laufenden UTC-Kalendertag/-Monat.
+  Bei ausgeschöpftem Budget startet der Run nicht (kein Worktree, kein
+  LLM-Call); das Event-Tripel `RunStarted`/`CostCapHit(project_day|
+  project_month)`/`RunFinished` macht den Stopp auswertbar.
+- **Schedule-Trigger dispatchen** (`board_loop.py`, `spec.py`) — die
+  Cron-Maschinerie aus Phase B bekommt ihre Prompt-Quelle:
+  `ScheduleTriggerConfig.prompt_file` (additiv) zeigt auf eine
+  operator-geschriebene, repo-relative Datei. Fällige Trigger feuern in
+  beiden Watch-Modi vor dem Board-Pass; der `last`-Anker für `cron_due`
+  kommt replay-fähig aus dem Event-Strom (`EventStore.last_run_started`).
+  Ohne `prompt_file` wird übersprungen (Spec-Warnung + Doctor-Check) —
+  kein leerer LLM-Call.
+- **Stuck-Item-Eskalation** (`conductor.py`, `stages.py`) — ein
+  `in-dev`-Item, dessen jüngster Run ohne `PRCreated` endete (bzw. ein
+  `design`-Item ohne verwertbaren Plan), eskaliert nach `forge:blocked`
+  statt lautlos liegenzubleiben oder endlos re-dispatcht zu werden.
+  Sichtbar als `WorkItemStageChanged` + `WorkItemBlocked` mit neuem
+  `BlockedKind` `stalled` (Schema additiv 1.0 → 1.1). Re-Dispatch ist
+  Operator-Entscheidung (Label zurück auf `ready`).
+- **Doctor-Checks für tote Config** (`doctor.py`) — Schedule-Trigger
+  (Cron parsebar, `prompt_file` existiert), `release.on_main_green:
+  auto_tag` ohne v1-Executor, Roster-Rollen ohne Implementierung
+  (z.B. die spec-reservierte `operations`).
+
+### Geändert
+
+- `push_branch` retried transiente git-push-Fehler (Backoff 2s/4s,
+  injizierbar für Tests).
+- `WorktreeManager.cleanup` warnt via `logging`, wenn das
+  Worktree-Verzeichnis nicht entfernt werden konnte (Disk-Leak war
+  vorher unsichtbar); `parse_scores_json` warnt bei unparsebarem
+  Eval-Output statt stillschweigend leerer Measurements.
+
 ## [Unreleased] — v0.5: LLM-Judge Verifikationsphase
 
 322 Tests grün, ruff clean.

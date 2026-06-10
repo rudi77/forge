@@ -130,9 +130,24 @@ verzweigt nach `DispatchOrder.stage`: `design` → `_dispatch_design_run`
 `design→ready`), sonst → der bestehende Dev-Loop (`_dispatch_issues`, PR). Neue
 executable Stage = Eintrag in `IN_PLACE_WORK_STAGES` **+** Advance-Signal in
 `StageSignals`/`advance` **+** Dispatch-Zweig. `requirements`/`release` fehlt
-jeweils noch ihr „fertig"-Signal (Inkrement 2). **Noch offen:** Live-Verifikation
-der gh-Kommandos gegen ein echtes Board (bisher nur Stub-getestet);
-Re-Dispatch/Eskalation eines `in-dev`-Items, dessen Run keinen PR produzierte.
+jeweils noch ihr „fertig"-Signal (Inkrement 2).
+
+**Stuck-Item-Eskalation:** Endet der jüngste Run eines `in-dev`-Items ohne
+`PRCreated` (bzw. eines `design`-Items ohne verwertbaren Plan), eskaliert
+`advance` nach `forge:blocked` (`StageSignals.last_run_finished_without_pr/
+_plan`, abgeleitet in `derive_signals` aus `RunStarted`+`RunFinished` des
+jüngsten Runs). Event-Spur: `WorkItemStageChanged` + `WorkItemBlocked` mit
+`kind="stalled"` (Schema 1.1). Re-Dispatch ist Operator-Entscheidung (Label
+zurück auf `ready`) — kein automatischer Retry. **Noch offen:**
+Live-Verifikation der gh-Kommandos gegen ein echtes Board (bisher nur
+Stub-getestet).
+
+**Schedule-Trigger sind verdrahtet:** `triggers.schedule[].prompt_file`
+(repo-relativ, operator-geschrieben = trusted) ist die Prompt-Quelle;
+`_dispatch_due_schedules` feuert fällige Crons in beiden Watch-Modi vor dem
+Board-Pass. `last`-Anker = jüngstes `RunStarted(trigger=schedule, focus=...)`
+aus dem Store (`last_run_started`), Fallback Session-Start (kein Massen-Feuern
+beim Heartbeat-Start). Ohne `prompt_file`: Skip + Spec-Warnung + Doctor-Check.
 
 Mantra 3: der Heartbeat taktet das Dispatchen von Runs
 (`execute_run`), greift aber nie in Runner/Scoring/Gates ein. Die
@@ -201,9 +216,9 @@ Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
 - Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
 - Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
 
-Vor jeder Schema-Änderung: `len(EventKind) == 18` und `len(_PAYLOAD_REGISTRY) == 18` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED`).
+Vor jeder Schema-Änderung: `len(EventKind) == 21` und `len(_PAYLOAD_REGISTRY) == 21` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED`; Conductor Phase C = +`CONDUCTOR_TICK_COMPLETED`, `WORK_ITEM_STAGE_CHANGED`, `WORK_ITEM_BLOCKED`).
 
-`PlanProposed` steht auf Schema **1.1** (additiv: `subtasks: list[PlanSubtask]` + `agents_used: list[str]`). Alte 1.0-Events lesen weiter, weil beide Felder Defaults haben — siehe `test_plan_proposed_schema_is_v1_1_with_additive_fields`.
+`PlanProposed` steht auf Schema **1.1** (additiv: `subtasks: list[PlanSubtask]` + `agents_used: list[str]`). Alte 1.0-Events lesen weiter, weil beide Felder Defaults haben — siehe `test_plan_proposed_schema_is_v1_1_with_additive_fields`. `WorkItemBlocked` steht ebenfalls auf **1.1** (additiv: `BlockedKind` um `stalled` erweitert).
 
 ## CodingAgent ist Plug-in, nicht Fundament
 
@@ -234,7 +249,7 @@ Ein einsamer `["developer"]` braucht keine Orchestrierung (`roster_needs_orchest
 
 1. **Forbidden Zones** (Pfad-Ebene) — `Capabilities.check_edit/read`
 2. **Capabilities** (Aktions-Ebene) — `Capabilities.check_action/run/egress`
-3. **Cost-Caps** (Ressourcen-Ebene) — `SequentialRunner._check_run_cost_cap`
+3. **Cost-Caps** (Ressourcen-Ebene) — `SequentialRunner._check_run_cost_cap` (generation/run, während des Runs) + `_check_project_cost_caps` (project_day/project_month, vor Run-Start via `EventStore.project_cost_since`)
 4. **Subprocess-Isolation** (Prozess-Ebene) — Worktree pro Run, separate venv kommt in M2
 
 `merge_pr` / `push_to_main` / `push_force` sind dreifach gesichert: in der Spec via `Literal[False]`, in `Capabilities.check_action` als hartkodiertes Deny, und im PR-Body steht der Hinweis explizit.

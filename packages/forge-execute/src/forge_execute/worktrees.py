@@ -17,10 +17,13 @@ API laut todos.txt Schritt 3a:
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class GitError(RuntimeError):
@@ -101,6 +104,15 @@ class WorktreeManager:
             if worktree.path.exists():
                 shutil.rmtree(worktree.path, ignore_errors=True)
             self._run(["git", "worktree", "prune"], cwd=self.repo_root)
+            if worktree.path.exists():
+                # Nicht fatal (der Run ist durch), aber sichtbar machen:
+                # liegengebliebene Worktrees fressen Diskplatz, bis gc_stale
+                # beim nächsten board-loop aufräumt.
+                logger.warning(
+                    "worktree cleanup left directory behind: %s (%s)",
+                    worktree.path,
+                    result.stderr.strip(),
+                )
 
     def cleanup_branch(self, worktree: Worktree) -> None:
         """Optional: löscht den Branch nach Cleanup."""

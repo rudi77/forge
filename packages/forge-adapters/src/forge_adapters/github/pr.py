@@ -20,8 +20,10 @@ Operatoren, die das nicht wollen, lassen ``--auto-merge`` weg.
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,8 @@ from forge_core.store import EventStore
 # Injizierbar für Tests; produktiv ``subprocess.run``.
 SubprocessRunner = Callable[..., subprocess.CompletedProcess]
 
+logger = logging.getLogger(__name__)
+
 
 class GitHubError(RuntimeError):
     """gh CLI oder git-push-Fehler."""
@@ -49,20 +53,48 @@ class PRCreationResult:
     branch: str
 
 
-def push_branch(*, repo: Path, branch: str, remote: str = "origin") -> None:
-    """`git push -u <remote> <branch>` mit anständigem Error-Reporting."""
-    result = subprocess.run(
-        ["git", "push", "-u", remote, branch],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
-        raise GitHubError(
-            f"git push -u {remote} {branch} failed: {result.stderr.strip()}"
+def push_branch(
+    *,
+    repo: Path,
+    branch: str,
+    remote: str = "origin",
+    attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> None:
+    """`git push -u <remote> <branch>` mit Retry bei transienten Fehlern.
+
+    Netzwerk-Hiccups beim Push sind im 24/7-Betrieb der häufigste
+    vermeidbare Run-Abbruch — bis zu ``attempts`` Versuche mit
+    exponentiellem Backoff (2s, 4s, …). ``sleep``/``run_subprocess`` sind
+    injizierbar, damit Tests ohne echte Wartezeit laufen.
+    """
+    last_stderr = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        result = run_subprocess(
+            ["git", "push", "-u", remote, branch],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
+        if result.returncode == 0:
+            return
+        last_stderr = (result.stderr or "").strip()
+        if attempt < max(1, attempts):
+            backoff = 2.0**attempt
+            logger.warning(
+                "git push %s/%s failed (attempt %d/%d), retrying in %.0fs: %s",
+                remote,
+                branch,
+                attempt,
+                attempts,
+                backoff,
+                last_stderr,
+            )
+            sleep(backoff)
+    raise GitHubError(f"git push -u {remote} {branch} failed: {last_stderr}")
 
 
 def create_pr_for_run(

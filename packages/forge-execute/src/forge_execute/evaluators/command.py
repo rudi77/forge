@@ -17,6 +17,7 @@ Drei Parse-Modi:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import re
@@ -29,6 +30,8 @@ from pathlib import Path
 from forge_core.spec import EvalSuiteConfig
 
 from forge_execute._venv import venv_aware_env
+
+logger = logging.getLogger(__name__)
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -305,7 +308,10 @@ def parse_scores_json(stdout: str) -> dict[str, float]:
     """Erwartet ein JSON-Dict mit Float-Werten als stdout.
 
     Wenn der Eval-Befehl mehr als nur das JSON druckt (z.B. Setup-Logs vor
-    dem JSON), suchen wir nach dem letzten `{` … `}` im Output.
+    dem JSON), suchen wir nach dem letzten `{` … `}` im Output. Unparsebarer
+    Output liefert leere Measurements (Gates werden rot, fail-safe), aber
+    mit Warnung — die Ursache soll im Log stehen, nicht nur das Symptom
+    „missing measurement" in der Gate-Begründung.
     """
     text = stdout.strip()
     if not text:
@@ -319,13 +325,22 @@ def parse_scores_json(stdout: str) -> dict[str, float]:
         last_open = text.rfind("{")
         last_close = text.rfind("}")
         if last_open == -1 or last_close == -1 or last_close < last_open:
+            logger.warning(
+                "scores_json: eval stdout contains no JSON object "
+                "(first 200 chars: %r)",
+                text[:200],
+            )
             return {}
         try:
             data = json.loads(text[last_open : last_close + 1])
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            logger.warning("scores_json: trailing JSON block unparsable: %s", exc)
             return {}
 
     if not isinstance(data, dict):
+        logger.warning(
+            "scores_json: expected JSON dict, got %s", type(data).__name__
+        )
         return {}
 
     out: dict[str, float] = {}

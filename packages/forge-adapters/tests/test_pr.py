@@ -285,3 +285,47 @@ def test_queue_auto_merge_raises_on_gh_merge_failure(tmp_path: Path) -> None:
     )
     with pytest.raises(GitHubError, match="gh pr merge --auto failed"):
         queue_auto_merge(repo=tmp_path, pr_number=999, run_subprocess=runner)
+
+
+# --- push_branch Retry --------------------------------------------------
+
+
+def test_push_branch_retries_transient_failure(tmp_path: Path) -> None:
+    from forge_adapters.github.pr import push_branch
+
+    runner = _stub_runner(
+        _fail("fatal: unable to access remote (transient)"),
+        _fail("fatal: unable to access remote (transient)"),
+        _ok(),
+    )
+    sleeps: list[float] = []
+    push_branch(
+        repo=tmp_path,
+        branch="forge/r1",
+        attempts=3,
+        sleep=sleeps.append,
+        run_subprocess=runner,
+    )
+    # 2 Fehlversuche -> 2 Backoffs (2s, 4s), dann Erfolg.
+    assert sleeps == [2.0, 4.0]
+    assert len(runner.calls) == 3  # type: ignore[attr-defined]
+
+
+def test_push_branch_raises_after_exhausted_attempts(tmp_path: Path) -> None:
+    from forge_adapters.github.pr import push_branch
+
+    runner = _stub_runner(
+        _fail("fatal: repository not found"),
+        _fail("fatal: repository not found"),
+        _fail("fatal: repository not found"),
+    )
+    sleeps: list[float] = []
+    with pytest.raises(GitHubError, match="repository not found"):
+        push_branch(
+            repo=tmp_path,
+            branch="forge/r1",
+            attempts=3,
+            sleep=sleeps.append,
+            run_subprocess=runner,
+        )
+    assert len(sleeps) == 2  # kein Backoff nach dem letzten Versuch

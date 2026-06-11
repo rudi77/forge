@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+Read the following file for additional important information:
+- [CLAUDE_BEHAVIORAL.md](CLAUDE_BEHAVIORAL.md)
+
 > Architektur- und Konventions-Notizen für Pair-Programming-Sessions auf forge selbst. Lies das, bevor du Code änderst — das Dokument lebt zusammen mit dem Repo, im Gegensatz zur statischen Spec.
 
 ## Einordnung

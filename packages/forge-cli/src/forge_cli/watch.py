@@ -21,6 +21,7 @@ Kern ist in pure Funktionen (``discover_active_run``, ``collect_worktree_state``
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -45,6 +46,11 @@ from forge_cli.runtime import ContextError, ForgeContext, console, err_console, 
 _MAX_EVENT_ROWS = 14
 # Wie viele geänderte Dateien das Worktree-Panel maximal listet.
 _MAX_CHANGED_FILES = 8
+# Wie viele Agent-Aktivitäten das Stream-Panel maximal zeigt (jüngste unten).
+_MAX_ACTIVITY_ROWS = 16
+# Tail-Fenster beim Lesen des Stream-Logs — die Logs wachsen über einen
+# 50-Minuten-Run auf viele MB (Thinking-Blöcke); wir brauchen nur das Ende.
+_STREAM_TAIL_BYTES = 512 * 1024
 
 
 @dataclass
@@ -87,6 +93,168 @@ def _safe_mtime(path: Path) -> float:
         return path.stat().st_mtime
     except OSError:
         return 0.0
+
+
+# --- Agent-Aktivität aus dem Stream-Log (read-only) ---------------------
+#
+# Der ClaudeCodeCLIAgent schreibt jeden claude-Event live als Envelope
+# {"ts": <UTC-ISO>, "event": <stream-json-event>} nach
+# `.forge/logs/<run_id>/propose-*.jsonl`. Das ist das Signal, das die
+# Propose-Blackbox öffnet: Tool-Calls, Subagent-Spawns (Task), Turns.
+
+
+@dataclass
+class StreamActivity:
+    """Geparste Sicht auf das Stream-Log eines propose-Aufrufs."""
+
+    log_path: Path | None = None
+    rows: list[tuple[str, str, str]] = field(default_factory=list)
+    """(HH:MM:SS lokal, Art, Detail) — jüngste zuletzt."""
+    turns: int = 0
+    tool_calls: int = 0
+    subagent_calls: int = 0
+    last_event_age_s: float | None = None
+    finished: bool = False
+
+
+def discover_stream_log(logs_dir: Path) -> Path | None:
+    """Jüngstes ``*.jsonl`` unter ``.forge/logs/<run_id>/`` — der laufende
+    bzw. letzte propose-Aufruf (gen 0, gen 1, … schreiben je eine Datei)."""
+    if not logs_dir.is_dir():
+        return None
+    files = sorted(logs_dir.glob("*.jsonl"), key=_safe_mtime)
+    return files[-1] if files else None
+
+
+def _tail_lines(path: Path, *, max_bytes: int = _STREAM_TAIL_BYTES) -> list[str]:
+    """Letzte Zeilen einer (potenziell großen) Datei, lock-frei.
+
+    Liest höchstens ``max_bytes`` vom Ende; eine angeschnittene erste Zeile
+    wird verworfen. Fehler (Datei verschwunden, Encoding) ⇒ leere Liste.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            data = fh.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]  # erste Zeile ist vermutlich angeschnitten
+    return lines
+
+
+_TOOL_DETAIL_KEYS = ("command", "file_path", "pattern", "path", "url", "prompt")
+
+
+def _tool_detail(name: str, tool_input: dict) -> str:
+    """Kompakte Ein-Zeilen-Beschreibung eines Tool-Calls."""
+    if name == "Task":
+        sub = tool_input.get("subagent_type") or "?"
+        desc = tool_input.get("description") or ""
+        return f"{sub} — {desc}"
+    for key in _TOOL_DETAIL_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.replace("\n", " ⏎ ")
+    return ""
+
+
+def _clip(text: str, limit: int = 76) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def parse_stream_activity(
+    lines: list[str],
+    *,
+    now: datetime,
+    log_path: Path | None = None,
+    max_rows: int = _MAX_ACTIVITY_ROWS,
+) -> StreamActivity:
+    """Übersetzt Envelope-Zeilen in menschenlesbare Aktivitäts-Rows (rein).
+
+    Gezeigt werden Tool-Calls (inkl. ``↳``-Präfix für Subagent-Aktivität via
+    ``parent_tool_use_id``), Task-Spawns, Assistant-Text-Snippets, Fehler-
+    Tool-Results und das finale result-Event. Thinking-Blöcke und Tool-Result-
+    Erfolge sind bewusst ausgelassen — Signal statt Rauschen.
+    """
+    activity = StreamActivity(log_path=log_path)
+    last_ts: datetime | None = None
+
+    for line in lines:
+        try:
+            envelope = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(envelope, dict):
+            continue
+        event = envelope.get("event")
+        ts_str = str(envelope.get("ts") or "")
+        if not isinstance(event, dict):
+            continue
+
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            last_ts = ts
+            local = ts.astimezone().strftime("%H:%M:%S")
+        except ValueError:
+            local = "--:--:--"
+
+        etype = event.get("type")
+        indent = "↳ " if event.get("parent_tool_use_id") else ""
+
+        if etype == "system" and event.get("subtype") == "init":
+            model = event.get("model") or "?"
+            activity.rows.append((local, "session", f"claude gestartet — model {model}"))
+        elif etype == "assistant":
+            activity.turns += 1
+            content = (event.get("message") or {}).get("content") or []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    name = str(block.get("name") or "?")
+                    activity.tool_calls += 1
+                    if name == "Task":
+                        activity.subagent_calls += 1
+                    detail = _clip(_tool_detail(name, block.get("input") or {}))
+                    activity.rows.append((local, f"{indent}{name}", detail))
+                elif block.get("type") == "text":
+                    text = _clip(str(block.get("text") or ""))
+                    if text:
+                        activity.rows.append((local, f"{indent}text", f"[dim]{text}[/dim]"))
+        elif etype == "user":
+            content = (event.get("message") or {}).get("content") or []
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and block.get("is_error")
+                ):
+                    activity.rows.append(
+                        (local, f"{indent}tool✗", "[red]tool_result error[/red]")
+                    )
+        elif etype == "result":
+            activity.finished = True
+            cost = event.get("total_cost_usd")
+            cost_part = f", ${cost:.2f}" if isinstance(cost, (int, float)) else ""
+            activity.rows.append(
+                (
+                    local,
+                    "result",
+                    f"{event.get('subtype')}, {event.get('num_turns')} turns{cost_part}",
+                )
+            )
+
+    if last_ts is not None:
+        activity.last_event_age_s = max(0.0, (now - last_ts).total_seconds())
+    if len(activity.rows) > max_rows:
+        activity.rows = activity.rows[-max_rows:]
+    return activity
 
 
 # --- Worktree-State (git + mtimes, read-only) ---------------------------
@@ -198,6 +366,7 @@ def render_watch_view(
     wt_state: WorktreeState,
     *,
     now: datetime,
+    activity: StreamActivity | None = None,
 ) -> Panel:
     """Baut das kombinierte Live-Panel (rein, ohne IO)."""
     finished = _events_show_finished(events)
@@ -209,14 +378,49 @@ def render_watch_view(
     header.add_row("[bold]elapsed[/bold]", _elapsed_label(events, now))
     header.add_row("[bold]generations[/bold]", _generations_label(events, wt_state))
     header.add_row("[bold]cost[/bold]", _cost_label(events))
+    if activity is not None and activity.rows:
+        header.add_row("[bold]agent[/bold]", _activity_summary(activity))
 
-    parts: list[RenderableType] = [header, _worktree_block(wt_state)]
+    parts: list[RenderableType] = [header, _activity_block(activity)]
+    parts.append(_worktree_block(wt_state))
     parts.append(_events_block(events))
 
     title = "forge watch"
     if finished:
         title = "forge watch — run beendet"
     return Panel(Group(*parts), title=title, border_style=border)
+
+
+def _activity_summary(activity: StreamActivity) -> str:
+    parts = [f"{activity.turns} turns", f"{activity.tool_calls} tool-calls"]
+    if activity.subagent_calls:
+        parts.append(f"{activity.subagent_calls} subagent-spawns")
+    if activity.last_event_age_s is not None and not activity.finished:
+        parts.append(f"letztes Event vor {format_age(activity.last_event_age_s)}")
+    return " · ".join(parts)
+
+
+def _activity_block(activity: StreamActivity | None) -> RenderableType:
+    """Panel mit den jüngsten claude-Aktionen aus dem Stream-Log."""
+    if activity is None or activity.log_path is None:
+        return Panel(
+            "[dim]kein Stream-Log unter .forge/logs/<run_id>/ — Run stammt von "
+            "einer forge-Version ohne stream-json-Logging.[/dim]",
+            title="agent-aktivität",
+            border_style="dim",
+        )
+    if not activity.rows:
+        return Panel(
+            "[dim]Stream-Log existiert, aber noch keine Events — claude startet.[/dim]",
+            title="agent-aktivität",
+            border_style="dim",
+        )
+
+    table = Table.grid(padding=(0, 2))
+    for local_ts, kind, detail in activity.rows:
+        table.add_row(f"[dim]{local_ts}[/dim]", f"[bold]{kind}[/bold]", detail)
+    subtitle = f"[dim]{activity.log_path.name}[/dim]"
+    return Panel(table, title="agent-aktivität", subtitle=subtitle, border_style="dim")
 
 
 def _border_for(wt_state: WorktreeState, finished: bool) -> str:
@@ -434,6 +638,7 @@ def watch_command(
         raise typer.Exit(code=1)
 
     wt_path = worktree_root / resolved
+    logs_dir = ctx.forge_dir / "logs" / resolved
     idle_threshold_s = max(interval * 3.0, 30.0)
 
     def tick() -> tuple[Panel, list[Event] | None]:
@@ -442,7 +647,16 @@ def watch_command(
             wt_path, resolved, now=now, idle_threshold_s=idle_threshold_s
         )
         events = _try_read_events(ctx, resolved)
-        return render_watch_view(resolved, events, wt_state, now=now), events
+        log_path = discover_stream_log(logs_dir)
+        activity: StreamActivity | None = None
+        if log_path is not None:
+            activity = parse_stream_activity(
+                _tail_lines(log_path), now=now, log_path=log_path
+            )
+        return (
+            render_watch_view(resolved, events, wt_state, now=now, activity=activity),
+            events,
+        )
 
     if once:
         view, _ = tick()

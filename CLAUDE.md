@@ -149,30 +149,30 @@ duplizieren.
 
 Die „Software-Factory"-Sicht (Aggregation ÜBER Runs hinweg) ist bewusst **read-only** und liegt komplett in DuckDB-Views (`store.py`, `_VIEW_FACTORY_KPIS` + `_VIEW_FACTORY_THROUGHPUT`), gerendert von `forge analyze` (`analyze.py`). Sie berührt die Loop nie (Mantra 3) — reine Auswertung des Event-Stroms. KPIs: Durchsatz, Merge-Rate, Keep-Rate (keep/discard-Generationen), Kosten pro gemergtem PR, Lead-Time (`PRMerged.time_to_merge_s`). Wenn du eine neue Fabrik-Metrik brauchst: neuen View dazu, in `_VIEWS` registrieren, Sektion in `analyze.py` ergänzen — **keine** neue Event-Logik, **kein** Loop-Eingriff. Das ist die Datengrundlage, die v2 (Population) laut Spec voraussetzt (≥100 Runs + Plateau).
 
-### Live-Tracking ist read-only Worktree-Poll, nie propose-Pfad-Umbau
+### Live-Tracking: Stream-Log als primäres Signal, Worktree-Poll als Basis
 
-`forge watch [RUN_ID]` (`watch.py`) füllt die konstruktionsbedingt **stumme
-Propose-Phase** (der Master-`claude` läuft mit `--output-format json` +
-`communicate()`, gepuffert — zwischen `ProposalRequested` und
-`ProposalReceived` kein Event). Das primäre Live-Signal ist der **lock-freie
-Worktree-Poll**: git-Status + File-mtimes + `forge:`-Commit-Zahl unter
-`.forge/worktrees/<run_id>/`. Auto-Discovery des aktiven Runs (ohne run_id) =
-jüngster Worktree — auch das ohne DB.
+Der propose-Pfad läuft seit dem stream-json-Umbau mit `--output-format
+stream-json --verbose`: `_pump_streaming` (claude_cli.py) schreibt **jeden
+claude-Event live** als Envelope `{"ts": <UTC-ISO>, "event": <event>}` nach
+`.forge/logs/<run_id>/propose-<utc>.jsonl` — geflusht pro Zeile, Timestamps
+stammen von forge (claude-Events tragen keine), damit sichtbar ist, WO die
+Zeit verbraucht wird. Das Log liegt bewusst AUSSERHALB des Worktrees
+(`revert()` macht `git clean -fdx` — bei DISCARD/Timeout braucht man das Log
+gerade). Das finale `result`-Event hat exakt die Shape des alten
+json-Outputs (`_extract_result_event`) — der restliche propose-Pfad ist
+unverändert; verifiziert gegen echtes `claude` (Format + `--verbose`-Pflicht
+im Print-Mode).
 
-Die Event-Chronik aus DuckDB ist **opportunistisch**: solange ein forge-Prozess
-die `events.duckdb` schreibend hält, kann ein zweiter Prozess sie nicht öffnen
-(DuckDB-Single-Writer-Limit, store.py-Docstring) — `_try_read_events` fängt das
-ab und der Renderer degradiert sauber auf „Worktree-only". Kein Lock-Bruch, kein
-Eingriff in den Writer. Kern (`discover_active_run`, `collect_worktree_state`,
-`render_watch_view`, `_watch_loop`) ist pure + via injizierte
-`sleep`/`should_stop`/`max_ticks` testbar — wie der Heartbeat. Mantra 3 intakt:
+`forge watch [RUN_ID]` (`watch.py`) rendert daraus das Panel
+„agent-aktivität": Tool-Calls mit Kompakt-Detail (Bash-Command, file_path,
+Task-`subagent_type` + description), `↳`-Präfix für Subagent-Aktivität (via
+`parent_tool_use_id`), Fehler-tool_results, Turn-/Tool-Zähler. Dazu weiterhin
+der **lock-freie Worktree-Poll** (git-Status + File-mtimes + `forge:`-Commits)
+und die **opportunistische** Event-Chronik aus DuckDB (Single-Writer-Limit —
+`_try_read_events` degradiert sauber, kein Lock-Bruch). Alles read-only,
+getailt (`_tail_lines`, letzte 512 KB — Logs wachsen über lange Runs);
+Kern-Funktionen pure + via injizierte Deps testbar. Mantra 3 intakt:
 beobachtet nur, taktet/entscheidet nichts.
-
-**Bewusst NICHT:** stream-json-Live-View (welcher Subagent, welcher Tool-Call).
-Das wäre ein Eingriff in den funktionierenden propose-Pfad und ist als separater,
-gegen echtes `claude` zu verifizierender, **additiver** Schritt zurückgestellt
-(baut auf `render_watch_view` auf) — derselbe Vorbehalt wie bei der
-Per-Subagent-Telemetrie weiter unten.
 
 ### Scoring bei rot→grün
 
@@ -250,7 +250,7 @@ Die `.md`-Templates tragen `model: sonnet` im Frontmatter. Wer eine Rolle auf ei
 
 ### Was die Orchestrierung (noch) NICHT misst
 
-- **Per-Subagent-Telemetrie** (Cost/Tokens/Turns pro Rolle): `--output-format json` liefert nur Master-Totals. Eine echte Aufschlüsselung bräuchte `--output-format stream-json` + Stream-Parser — ein separater, gegen echtes `claude` zu verifizierender Change, kein blinder Umbau des funktionierenden propose-Pfads.
+- **Per-Subagent-Telemetrie** (Cost/Tokens/Turns pro Rolle) als *Events/Metriken*: das `result`-Event liefert nur Master-Totals. Die **Rohdaten** liegen seit dem stream-json-Umbau vollständig in `.forge/logs/<run_id>/*.jsonl` (jeder Subagent-Event trägt `parent_tool_use_id`) — `forge watch` zeigt sie live, aber eine Aggregation in den Event-Store (z.B. `cost_per_role`) ist bewusst noch offen: das wäre neue Event-Logik und braucht einen eigenen, kleinen Schritt.
 - **„Zwei Runden max"** bei roter Verifikation/BLOCKING-Findings ist bewusst eine Prompt-Instruktion, **kein** vom Runner gezähltes Limit: die harte Ressourcen-Grenze sind Cost-Caps + `max_turns` (`_check_run_cost_cap`). Würde der Runner die Retry-Runden zählen, müsste er die Orchestrierungs-Schritte kennen → Mantra-3-Bruch.
 
 Ein einsamer `["developer"]` braucht keine Orchestrierung (`roster_needs_orchestration`) — das ist der klassische Single-Agent-Run (kein Task-Tool, kein Plan). Das alte `multi_agent: bool` bleibt rückwärtskompatibel (`True` = Default-Roster, `False` = `["developer"]`).

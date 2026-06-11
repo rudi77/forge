@@ -6,6 +6,7 @@ Subcommands:
 - `forge analyze` — Markdown-Reports aus dem Event-Store
 - `forge doctor`  — Spec-Konsistenz, Tool-Verfügbarkeit, API-Keys
 - `forge replay`  — rekonstruiert einen Run als Markdown-Timeline
+- `forge watch`   — Live-Tracking eines laufenden Runs (Worktree + Events)
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from forge_cli import doctor as doctor_mod
 from forge_cli import plan as plan_mod
 from forge_cli import replay as replay_mod
 from forge_cli import run as run_mod
+from forge_cli import watch as watch_mod
 
 app = typer.Typer(
     name="forge",
@@ -58,6 +60,11 @@ app.command(
         "via issue_label-Trigger, optional mit --auto-merge."
     ),
 )(board_loop_mod.board_loop_command)
+
+app.command(
+    name="watch",
+    help="Live-Tracking eines laufenden Runs (Worktree-Aktivität + Event-Chronik).",
+)(watch_mod.watch_command)
 
 
 def main() -> None:

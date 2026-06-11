@@ -149,6 +149,31 @@ duplizieren.
 
 Die „Software-Factory"-Sicht (Aggregation ÜBER Runs hinweg) ist bewusst **read-only** und liegt komplett in DuckDB-Views (`store.py`, `_VIEW_FACTORY_KPIS` + `_VIEW_FACTORY_THROUGHPUT`), gerendert von `forge analyze` (`analyze.py`). Sie berührt die Loop nie (Mantra 3) — reine Auswertung des Event-Stroms. KPIs: Durchsatz, Merge-Rate, Keep-Rate (keep/discard-Generationen), Kosten pro gemergtem PR, Lead-Time (`PRMerged.time_to_merge_s`). Wenn du eine neue Fabrik-Metrik brauchst: neuen View dazu, in `_VIEWS` registrieren, Sektion in `analyze.py` ergänzen — **keine** neue Event-Logik, **kein** Loop-Eingriff. Das ist die Datengrundlage, die v2 (Population) laut Spec voraussetzt (≥100 Runs + Plateau).
 
+### Live-Tracking ist read-only Worktree-Poll, nie propose-Pfad-Umbau
+
+`forge watch [RUN_ID]` (`watch.py`) füllt die konstruktionsbedingt **stumme
+Propose-Phase** (der Master-`claude` läuft mit `--output-format json` +
+`communicate()`, gepuffert — zwischen `ProposalRequested` und
+`ProposalReceived` kein Event). Das primäre Live-Signal ist der **lock-freie
+Worktree-Poll**: git-Status + File-mtimes + `forge:`-Commit-Zahl unter
+`.forge/worktrees/<run_id>/`. Auto-Discovery des aktiven Runs (ohne run_id) =
+jüngster Worktree — auch das ohne DB.
+
+Die Event-Chronik aus DuckDB ist **opportunistisch**: solange ein forge-Prozess
+die `events.duckdb` schreibend hält, kann ein zweiter Prozess sie nicht öffnen
+(DuckDB-Single-Writer-Limit, store.py-Docstring) — `_try_read_events` fängt das
+ab und der Renderer degradiert sauber auf „Worktree-only". Kein Lock-Bruch, kein
+Eingriff in den Writer. Kern (`discover_active_run`, `collect_worktree_state`,
+`render_watch_view`, `_watch_loop`) ist pure + via injizierte
+`sleep`/`should_stop`/`max_ticks` testbar — wie der Heartbeat. Mantra 3 intakt:
+beobachtet nur, taktet/entscheidet nichts.
+
+**Bewusst NICHT:** stream-json-Live-View (welcher Subagent, welcher Tool-Call).
+Das wäre ein Eingriff in den funktionierenden propose-Pfad und ist als separater,
+gegen echtes `claude` zu verifizierender, **additiver** Schritt zurückgestellt
+(baut auf `render_watch_view` auf) — derselbe Vorbehalt wie bei der
+Per-Subagent-Telemetrie weiter unten.
+
 ### Scoring bei rot→grün
 
 Wenn die Baseline-Gates nicht passen (Tests rot) und nach der Mutation passen, ist das **immer** ein Improvement, unabhängig vom Composite-Delta. Siehe `scoring.keep_or_discard(baseline_gates_passed=False)`. Vergessen → der `legacy_test_revival`-Pfad bleibt stuck.

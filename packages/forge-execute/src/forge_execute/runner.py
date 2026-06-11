@@ -560,24 +560,42 @@ class SequentialRunner:
         gen_id: str,
         gen_idx: int,
     ) -> ProposalResult | None:
-        # Inter-Generation-Memory: existierende KEPT-Diffs werden an den
-        # initial_prompt angehängt, damit der Subagent weiß, was schon gemacht
-        # ist und auf das aufbaut (Spec v0.3 Teil 6.8).
-        addendum = self._run_context.render_prompt_addendum()
-        effective_prompt = self.config.initial_prompt + addendum
+        # Project memory (cross-run) + inter-generation memory (within-run).
+        from forge_execute._project_memory import (
+            build_project_memory,
+            render_project_memory_addendum,
+        )
+
+        memory_md = build_project_memory(
+            forge_dir=self.config.repo_root / ".forge",
+            store=self.store,
+            blobs=self.blobs,
+            project=self.config.project,
+            exclude_run_id=self.run_id,
+        )
+        memory_addendum = render_project_memory_addendum(memory_md)
+        run_addendum = self._run_context.render_prompt_addendum()
+        effective_prompt = (
+            self.config.initial_prompt + memory_addendum + run_addendum
+        )
 
         prompt_hash = self.blobs.put_text(effective_prompt)
+        proposal_artifacts: dict[str, str] = {"prompt": prompt_hash}
+        context_keys = ["prompt"]
+        if memory_md.strip():
+            proposal_artifacts["project_memory"] = self.blobs.put_text(memory_md)
+            context_keys.append("project_memory")
 
         self._emit(
             EventKind.PROPOSAL_REQUESTED,
             ProposalRequestedPayload(
                 prompt_template_id=self.config.prompt_template_id,
-                context_artifact_keys=["prompt"],
+                context_artifact_keys=context_keys,
                 max_turns=self.config.max_turns_per_proposal,
                 requested_model=self.config.model,
             ),
             generation_id=gen_id,
-            artifacts={"prompt": prompt_hash},
+            artifacts=proposal_artifacts,
         )
 
         try:

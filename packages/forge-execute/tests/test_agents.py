@@ -469,6 +469,7 @@ def test_build_orchestrator_prompt_full_roster_has_plan_markers() -> None:
     assert "architect" in prompt
     assert "tester" in prompt
     assert PLAN_BEGIN_MARKER in prompt
+    assert "forge project memory" in prompt
 
 
 def test_build_orchestrator_prompt_without_architect_omits_plan() -> None:

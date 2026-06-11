@@ -127,7 +127,12 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
 
     # --- Workflow-Schritte (konditional) ----------------------------
     steps: list[str] = [
-        "1. Read the user's task and the project's `CLAUDE.md` + "
+        "1. Read the user's task. If the prompt contains "
+        "`## forge project memory`, treat it as authoritative orientation "
+        "for stable project layout, patterns, and prior plans — do not "
+        "re-read the whole codebase to rediscover those facts. Still read "
+        "task-specific acceptance criteria and Spec sections named in the "
+        "task. If no project memory block is present, read `CLAUDE.md` + "
         "`.forge/project.yaml`."
     ]
     n = 2

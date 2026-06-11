@@ -40,6 +40,11 @@ class ForgeContext:
     def open_blobs(self) -> BlobStore:
         return BlobStore(self.blobs_path)
 
+    @property
+    def memory_seed_path(self) -> Path:
+        """Optional operator-authored project memory seed (``.forge/memory.md``)."""
+        return self.forge_dir / "memory.md"
+
 
 class ContextError(RuntimeError):
     """Pfad-/Spec-Auflösung fehlgeschlagen."""

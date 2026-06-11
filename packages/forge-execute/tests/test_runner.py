@@ -365,6 +365,52 @@ def test_runner_plan_proposed_records_invoked_agents_over_config(
     store.close()
 
 
+def test_runner_emits_project_memory_artifact_when_seed_present(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """ProposalRequested records project_memory when .forge/memory.md exists."""
+    forge_dir = red_repo / ".forge"
+    forge_dir.mkdir()
+    seed = "Stable layout: src/ for code, tests/ for xUnit."
+    (forge_dir / "memory.md").write_text(seed, encoding="utf-8")
+
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+    agent = MockCodingAgent(callable_=_fix_callable)
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="fix_failing_test_v1",
+        initial_prompt="Fix the failing test in tests/test_calc.py.",
+        max_iterations=1,
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+    result = runner.run()
+    assert result.decision == "pr_created"
+
+    requested = [
+        e
+        for e in store.events_for_run(result.run_id)
+        if e.kind == EventKind.PROPOSAL_REQUESTED
+    ]
+    assert requested
+    evt = requested[0]
+    assert evt.payload["context_artifact_keys"] == ["prompt", "project_memory"]
+    assert "project_memory" in evt.artifacts
+    memory_text = blobs.get_text(evt.artifacts["project_memory"])
+    assert seed in memory_text
+
+    prompt_text = blobs.get_text(evt.artifacts["prompt"])
+    assert "## forge project memory" in prompt_text
+    assert seed in prompt_text
+
+    store.close()
+
+
 def test_runner_blocks_capability_violation(
     red_repo: Path, tmp_path: Path
 ) -> None:

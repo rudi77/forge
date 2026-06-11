@@ -48,6 +48,10 @@ _IS_WINDOWS = platform.system() == "Windows"
 # Default-Wallclock-Limit: ein Vielfaches der LLM-Latenz, falls budget_usd
 # nicht limitiert. Cost-Caps machen das eigentliche Limit aus.
 DEFAULT_TIMEOUT_S = 600
+# Multi-Agent-Orchestrierung (architect→developer→tester→reviewer) braucht
+# deutlich mehr Wallclock als ein Single-Agent-Run. 1 h Default, per
+# `--agent-timeout` überschreibbar.
+MULTI_AGENT_TIMEOUT_S = 3600
 
 # Read-only Tool-Set für den Judge — niemals Edit/Write. Der Judge
 # bewertet nur, er ändert nichts.
@@ -147,12 +151,16 @@ class ClaudeCodeCLIAgent:
             self.agents = ["developer"]
         self.multi_agent = roster_needs_orchestration(self.agents)
 
-        # Multi-Agent-Runs spawnen Subagents (architect/developer/tester),
-        # daher mehr Wallclock-Budget. Single-Agent-Runs reichen 10 Min.
-        if timeout_s is None:
-            self.timeout_s = 1500 if self.multi_agent else DEFAULT_TIMEOUT_S
-        else:
+        # Multi-Agent-Runs spawnen Subagents (architect/developer/tester/
+        # reviewer) und orchestrieren sie sequentiell — das volle Team gegen ein
+        # Greenfield-Workpaket sprengt 25 Min locker (Eval/Judge/Reviewer wurden
+        # sonst gekappt, obwohl der Developer fertig war). Default daher 1 h; per
+        # `timeout_s` (CLI: `--agent-timeout`) überschreibbar. Single-Agent-Runs
+        # reichen 10 Min.
+        if timeout_s is not None and timeout_s > 0:
             self.timeout_s = timeout_s
+        else:
+            self.timeout_s = MULTI_AGENT_TIMEOUT_S if self.multi_agent else DEFAULT_TIMEOUT_S
 
     def propose(
         self,

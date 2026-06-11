@@ -138,6 +138,42 @@ def test_claude_cli_satisfies_protocol() -> None:
     assert agent is not None
 
 
+def test_multi_agent_default_timeout_is_one_hour() -> None:
+    """Greenfield-Milestones mit vollem Roster brauchen mehr als 25 Min —
+    sonst kappt der Wallclock-Timeout Eval/Judge/Reviewer (Regression)."""
+    from forge_execute.agents.claude_cli import (
+        DEFAULT_TIMEOUT_S,
+        MULTI_AGENT_TIMEOUT_S,
+    )
+
+    multi = ClaudeCodeCLIAgent(agents=["architect", "developer", "tester"])
+    assert multi.timeout_s == MULTI_AGENT_TIMEOUT_S == 3600
+
+    single = ClaudeCodeCLIAgent(agents=["developer"])
+    assert single.timeout_s == DEFAULT_TIMEOUT_S == 600
+
+
+def test_explicit_timeout_overrides_default() -> None:
+    """`--agent-timeout` (→ timeout_s) schlägt den Default in beiden Modi."""
+    multi = ClaudeCodeCLIAgent(agents=["architect", "developer"], timeout_s=7200)
+    assert multi.timeout_s == 7200
+
+    single = ClaudeCodeCLIAgent(agents=["developer"], timeout_s=120)
+    assert single.timeout_s == 120
+
+
+def test_zero_or_none_timeout_falls_back_to_default() -> None:
+    """0/None (kein --agent-timeout gesetzt) ⇒ moduspezifischer Default."""
+    from forge_execute.agents.claude_cli import MULTI_AGENT_TIMEOUT_S
+
+    assert ClaudeCodeCLIAgent(agents=["developer", "tester"], timeout_s=None).timeout_s == (
+        MULTI_AGENT_TIMEOUT_S
+    )
+    assert ClaudeCodeCLIAgent(agents=["developer", "tester"], timeout_s=0).timeout_s == (
+        MULTI_AGENT_TIMEOUT_S
+    )
+
+
 def test_stage_untracked_makes_new_files_visible_in_diff(repo: Path) -> None:
     """Der Greenfield-Bug: neu angelegte Files fehlen ohne intent-to-add im
     `git diff` und damit im Proposal-Diff. `_stage_untracked_for_diff` macht

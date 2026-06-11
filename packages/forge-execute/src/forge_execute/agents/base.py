@@ -80,6 +80,11 @@ class ProposalResult:
     hat (aus dem `---FORGE-AGENTS-...---`-Block). None, wenn der Master nichts
     meldete oder Single-Agent-Run — dann fällt der Runner auf das konfigurierte
     Roster zurück. Macht Orchestrierungs-Treue messbar (config != reality)."""
+    stream_log: str | None = None
+    """Pfad zum stream-json-Log dieses propose-Aufrufs (ein Envelope
+    ``{"ts", "event"}`` pro claude-Event). Lebt unter ``.forge/logs/<run_id>/``
+    und überlebt DISCARD/Timeout — primäre Diagnosequelle, wenn ein Run lange
+    braucht oder gekappt wird. None bei Agents ohne Streaming (Mock)."""
 
     @property
     def has_changes(self) -> bool:

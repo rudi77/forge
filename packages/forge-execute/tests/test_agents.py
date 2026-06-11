@@ -174,6 +174,114 @@ def test_zero_or_none_timeout_falls_back_to_default() -> None:
     )
 
 
+# --- stream-json: Pump, Log, Result-Extraktion ---------------------------
+
+
+def test_pump_streaming_writes_envelopes_and_collects_lines(tmp_path: Path) -> None:
+    """Jede stdout-Zeile landet sofort als {"ts","event"}-Envelope im Log."""
+    import json
+    import subprocess
+    import sys
+
+    from forge_execute.agents.claude_cli import _pump_streaming
+
+    script = (
+        "import json\n"
+        "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'm'}))\n"
+        "print(json.dumps({'type': 'result', 'subtype': 'success', 'num_turns': 2}))\n"
+    )
+    log_path = tmp_path / "stream.jsonl"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    lines, stderr, timed_out = _pump_streaming(proc, timeout_s=30, log_path=log_path)
+
+    assert timed_out is False
+    assert stderr == ""
+    assert len(lines) == 2
+
+    envelopes = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert len(envelopes) == 2
+    assert all("ts" in e and "event" in e for e in envelopes)
+    assert envelopes[0]["event"]["subtype"] == "init"
+    assert envelopes[1]["event"]["type"] == "result"
+
+
+def test_pump_streaming_kills_on_timeout(tmp_path: Path) -> None:
+    """Deadline überschritten ⇒ Prozessbaum gekillt, timed_out=True, Log bleibt."""
+    import json
+    import subprocess
+    import sys
+    import time as time_mod
+
+    from forge_execute.agents.claude_cli import _pump_streaming
+
+    script = (
+        "import json, time, sys\n"
+        "print(json.dumps({'type': 'assistant'}), flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    log_path = tmp_path / "stream.jsonl"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    start = time_mod.monotonic()
+    lines, _stderr, timed_out = _pump_streaming(proc, timeout_s=2, log_path=log_path)
+    elapsed = time_mod.monotonic() - start
+
+    assert timed_out is True
+    assert elapsed < 30, "Kill muss deutlich vor den 60s des Kind-Prozesses greifen"
+    # Die vor dem Timeout emittierte Zeile ist gesichert — Diagnose bleibt möglich.
+    assert len(lines) == 1
+    assert json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])["event"][
+        "type"
+    ] == "assistant"
+
+
+def test_extract_result_event_finds_last_result() -> None:
+    import json
+
+    from forge_execute.agents.claude_cli import _extract_result_event
+
+    lines = [
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "assistant", "message": {}}),
+        json.dumps({"type": "result", "subtype": "success", "num_turns": 7}),
+    ]
+    raw = _extract_result_event(lines)
+    assert raw["num_turns"] == 7
+
+    assert _extract_result_event(lines[:2]) == {}
+    assert _extract_result_event(["kein json"]) == {}
+
+
+def test_stream_log_path_lands_in_forge_logs_for_run_worktrees(tmp_path: Path) -> None:
+    """Standard-Layout <repo>/.forge/worktrees/<run_id> ⇒ Log in .forge/logs/<run_id>/
+    (außerhalb des Worktrees — git clean -fdx bei DISCARD darf es nicht löschen)."""
+    from forge_execute.agents.claude_cli import _new_stream_log_path
+
+    wt = tmp_path / ".forge" / "worktrees" / "01RUNID"
+    wt.mkdir(parents=True)
+    log = _new_stream_log_path(wt, label="propose")
+    assert log.parent == tmp_path / ".forge" / "logs" / "01RUNID"
+    assert log.name.startswith("propose-")
+    assert log.suffix == ".jsonl"
+
+    # Fallback-Layout: beliebiges Verzeichnis ⇒ .claude/forge-logs/ im Worktree.
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    fallback = _new_stream_log_path(other, label="propose")
+    assert fallback.parent == other / ".claude" / "forge-logs"
+
+
 def test_stage_untracked_makes_new_files_visible_in_diff(repo: Path) -> None:
     """Der Greenfield-Bug: neu angelegte Files fehlen ohne intent-to-add im
     `git diff` und damit im Proposal-Diff. `_stage_untracked_for_diff` macht

@@ -13,15 +13,18 @@ wirkt im Subprozess, bevor der Agent etwas tun könnte. forges
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
 import shutil
 import subprocess
+import threading
 import time
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from forge_execute._venv import venv_aware_env
 from forge_execute.agents.base import (
@@ -180,12 +183,20 @@ class ClaudeCodeCLIAgent:
             _install_subagents(worktree, agents=self.agents)
             allowed_tools = _augment_tools_for_multi_agent(allowed_tools)
 
+        # stream-json statt json: claude emittiert pro Event eine JSON-Zeile
+        # (system/init, assistant inkl. tool_use-Blöcke, user/tool_results,
+        # result am Ende). Wir schreiben jede Zeile live + zeitgestempelt in
+        # ein Log unter .forge/logs/<run_id>/ — damit ist die Propose-Phase
+        # keine Blackbox mehr (`forge watch` zeigt daraus die Agent-Aktivität;
+        # `--verbose` ist im Print-Mode Pflicht für stream-json). Das finale
+        # result-Event hat exakt die Shape des alten json-Outputs.
         cmd = [
             self.claude_bin,
             "-p",
             prompt,
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
             "--max-turns",
             str(max_turns),
             "--permission-mode",
@@ -231,6 +242,8 @@ class ClaudeCodeCLIAgent:
         else:
             popen_kwargs["start_new_session"] = True
 
+        log_path = _new_stream_log_path(worktree, label="propose")
+
         start = time.monotonic()
         try:
             proc = subprocess.Popen(cmd, **popen_kwargs)
@@ -240,25 +253,18 @@ class ClaudeCodeCLIAgent:
                 "Install Claude Code CLI or set claude_bin to a valid path."
             ) from exc
 
-        timed_out = False
-        try:
-            stdout, stderr = proc.communicate(timeout=self.timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _kill_tree(proc.pid)
-            try:
-                stdout, stderr = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
+        lines, stderr, timed_out = _pump_streaming(
+            proc, timeout_s=self.timeout_s, log_path=log_path
+        )
         duration_ms = int((time.monotonic() - start) * 1000)
 
         if timed_out:
             raise CodingAgentTimeout(
-                f"claude exceeded {self.timeout_s}s wallclock budget"
+                f"claude exceeded {self.timeout_s}s wallclock budget "
+                f"(stream log: {log_path})"
             )
 
-        raw = _parse_json_output(stdout)
+        raw = _extract_result_event(lines)
 
         # `error_max_turns`/`tool_use` sind Soft-Fails: claude hat das
         # turn-Limit erreicht, aber im Worktree LIEGEN evtl. fertige
@@ -271,11 +277,12 @@ class ClaudeCodeCLIAgent:
         )
         if proc.returncode != 0 and not is_soft_fail:
             stderr_clean = stderr.strip()
-            stdout_clean = stdout.strip()
-            detail_parts = [p for p in [stderr_clean, stdout_clean] if p]
+            stdout_tail = "\n".join(lines[-5:]).strip()
+            detail_parts = [p for p in [stderr_clean, stdout_tail] if p]
             detail = " | ".join(detail_parts) if detail_parts else "(no output)"
             raise CodingAgentError(
-                f"claude exited {proc.returncode}: {detail[:800]}"
+                f"claude exited {proc.returncode}: {detail[:800]} "
+                f"(stream log: {log_path})"
             )
         # Neu angelegte (untracked) Files erscheinen weder in `git diff base
         # HEAD` noch in `git diff`. Ohne intent-to-add (`git add -N`) fehlten
@@ -326,6 +333,7 @@ class ClaudeCodeCLIAgent:
             error=None if proc.returncode == 0 else f"exit {proc.returncode}, subtype={raw.get('subtype')}",
             plan_md=plan_md,
             agents_invoked=agents_invoked,
+            stream_log=str(log_path),
         )
 
     def review(
@@ -511,6 +519,114 @@ def _augment_tools_for_multi_agent(allowed_tools: str | None) -> str:
     if "Task" in allowed_tools:
         return allowed_tools
     return f"{allowed_tools},Task"
+
+
+def _new_stream_log_path(worktree: Path, *, label: str) -> Path:
+    """Pfad für das Stream-Log dieses Aufrufs (Verzeichnis wird angelegt).
+
+    Standard-Layout: der Worktree liegt unter ``<repo>/.forge/worktrees/<run_id>/``
+    → Log nach ``<repo>/.forge/logs/<run_id>/<label>-<utc>.jsonl``. Bewusst
+    AUSSERHALB des Worktrees: ``revert()`` macht ``git clean -fdx`` und würde
+    Logs im Worktree bei DISCARD wegblasen — genau dann braucht man sie.
+    Fallback für andere Layouts (Tests, direkte Aufrufe): ``<worktree>/.claude/
+    forge-logs/`` (von Diff/Commit ohnehin ausgeschlossen).
+    """
+    wt = Path(worktree).resolve()
+    if wt.parent.name == "worktrees" and wt.parent.parent.name == ".forge":
+        log_dir = wt.parent.parent / "logs" / wt.name
+    else:
+        log_dir = wt / ".claude" / "forge-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    return log_dir / f"{label}-{stamp}.jsonl"
+
+
+def _pump_streaming(
+    proc: subprocess.Popen[str],
+    *,
+    timeout_s: int,
+    log_path: Path | None,
+) -> tuple[list[str], str, bool]:
+    """Liest stdout/stderr des laufenden claude-Prozesses zeilenweise.
+
+    Jede stdout-Zeile (= ein stream-json-Event) wird sofort als Envelope
+    ``{"ts": <UTC-ISO>, "event": <claude-event>}`` ins Log geschrieben und
+    geflusht — `forge watch` kann die Datei live tailen. Timestamps stammen
+    von uns (claude-Events tragen keine), damit sichtbar wird, WO die Zeit
+    verbraucht wird. Reader laufen in Threads (Windows kennt kein non-blocking
+    readline auf Pipes); die Deadline überwacht der Hauptthread via ``wait``.
+
+    Returns:
+        (stdout_lines, stderr_text, timed_out) — Zeilen ohne Newline.
+    """
+    lines: list[str] = []
+    stderr_chunks: list[str] = []
+
+    log_file: TextIO | None = None
+    if log_path is not None:
+        log_file = log_path.open("a", encoding="utf-8")
+
+    def _pump_stdout() -> None:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            lines.append(line)
+            if log_file is not None:
+                ts = datetime.now(UTC).isoformat(timespec="milliseconds")
+                try:
+                    event: Any = json.loads(line)
+                except json.JSONDecodeError:
+                    event = {"type": "raw_text", "text": line}
+                log_file.write(json.dumps({"ts": ts, "event": event}) + "\n")
+                log_file.flush()
+
+    def _pump_stderr() -> None:
+        assert proc.stderr is not None
+        for raw_line in proc.stderr:
+            stderr_chunks.append(raw_line)
+
+    t_out = threading.Thread(target=_pump_stdout, daemon=True)
+    t_err = threading.Thread(target=_pump_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(proc.pid)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+
+    # Pipes schließen nach Prozessende → Reader-Threads laufen aus.
+    t_out.join(timeout=10)
+    t_err.join(timeout=10)
+    if log_file is not None:
+        log_file.close()
+
+    return lines, "".join(stderr_chunks), timed_out
+
+
+def _extract_result_event(lines: list[str]) -> dict[str, Any]:
+    """Findet das finale ``result``-Event im stream-json-Output.
+
+    Das result-Event hat exakt die Shape des alten ``--output-format json``-
+    Outputs (subtype, num_turns, total_cost_usd, usage, result, stop_reason) —
+    der restliche propose-Pfad bleibt dadurch unverändert. Rückwärts gesucht,
+    weil es konstruktionsbedingt die letzte Zeile ist. Leeres Dict, wenn keins
+    existiert (Crash vor Abschluss) — Caller behandelt das wie bisher.
+    """
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            return obj
+    return {}
 
 
 def _stage_untracked_for_diff(worktree: Path) -> None:

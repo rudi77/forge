@@ -108,6 +108,18 @@ def run_command(
             help="Max. claude-Tool-Turns pro Generation. Default 8 ist knapp für Tasks mit black/isort/flake8 + pytest — bei error_max_turns auf 16+ erhöhen.",
         ),
     ] = 8,
+    agent_timeout: Annotated[
+        int | None,
+        typer.Option(
+            "--agent-timeout",
+            help=(
+                "Wallclock-Limit (Sekunden) pro Propose-Aufruf des Coding-Agents. "
+                "Default: 3600 für Multi-Agent-Runs, 600 sonst. Bei "
+                "stop_reason=timeout (Greenfield-Milestones) erhöhen — sonst werden "
+                "Eval/Judge/Reviewer gekappt, obwohl der Developer fertig ist."
+            ),
+        ),
+    ] = None,
     model: Annotated[
         str | None,
         typer.Option("--model", help="Claude-Modell (sonnet, opus). Default: aus Trigger-Config."),
@@ -239,6 +251,7 @@ def run_command(
         pr_number=pr_number,
         dry_run=dry_run,
         claude_bin=claude_bin,
+        agent_timeout=agent_timeout,
         multi_agent=multi_agent,
         agents=_split_agents(agents),
         create_pr=create_pr,
@@ -283,6 +296,7 @@ def execute_run(
     auto_merge: bool,
     announce: bool = False,
     agents: list[str] | None = None,
+    agent_timeout: int | None = None,
 ) -> RunOutcome:
     """Wie ``run_command``, aber ohne Typer-Layer und mit RunOutcome-Return.
 
@@ -333,6 +347,7 @@ def execute_run(
             claude_bin=claude_bin,
             default_model=model,
             agents=roster,
+            timeout_s=agent_timeout,
         )
 
     config = RunConfig(

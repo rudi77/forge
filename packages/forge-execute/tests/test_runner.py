@@ -53,6 +53,12 @@ def red_repo(tmp_path: Path) -> Path:
         "def test_add():\n    assert add(2, 3) == 5\n",
         encoding="utf-8",
     )
+    # Realistisch wie jedes Python-Repo: pytest-Artefakte ignorieren, damit der
+    # Eval-Lauf (der __pycache__/.pytest_cache erzeugt) den Worktree nicht mit
+    # untracked Junk verschmutzt, den changed_files() sonst meldet.
+    (repo / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n.pytest_cache/\n.coverage\n", encoding="utf-8"
+    )
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "initial (with red test)")
     return repo

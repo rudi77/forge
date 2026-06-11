@@ -176,6 +176,50 @@ def test_changed_files_lists_modifications(repo: Path) -> None:
         wm.cleanup(wt)
 
 
+def test_changed_files_lists_untracked_new_files(repo: Path) -> None:
+    """Neu angelegte (untracked) Files müssen erscheinen — der Greenfield-Bug.
+
+    Der Coding-Agent editiert den Worktree direkt und committet oft nicht;
+    neue Dateien sind dann untracked. `git diff base HEAD` sieht sie nicht —
+    `changed_files` muss sie trotzdem melden, sonst umgehen sie Capability-
+    Check und KEEP-Commit.
+    """
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="r1")
+    try:
+        # Eine neue Datei anlegen, NICHT committen.
+        (wt.path / "src" / "new_module.py").write_text(
+            "def f():\n    return 1\n", encoding="utf-8"
+        )
+        # Eine bestehende Datei ändern, NICHT committen.
+        (wt.path / "src" / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n", encoding="utf-8"
+        )
+        files = wm.changed_files(wt)
+        assert "src/new_module.py" in files  # untracked
+        assert "src/calc.py" in files  # uncommitted tracked
+    finally:
+        wm.cleanup(wt)
+
+
+def test_changed_files_excludes_claude_subagents(repo: Path) -> None:
+    """Transiente `.claude/`-Subagent-Markdowns dürfen nie auftauchen —
+    sonst landen sie im Capability-Check und im PR-Commit."""
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="r1")
+    try:
+        (wt.path / ".claude" / "agents").mkdir(parents=True)
+        (wt.path / ".claude" / "agents" / "architect.md").write_text(
+            "transient", encoding="utf-8"
+        )
+        (wt.path / "src" / "real.py").write_text("x = 1\n", encoding="utf-8")
+        files = wm.changed_files(wt)
+        assert "src/real.py" in files
+        assert not any(f.startswith(".claude/") for f in files)
+    finally:
+        wm.cleanup(wt)
+
+
 def test_has_changes_false_on_clean_worktree(repo: Path) -> None:
     wm = WorktreeManager(repo)
     wt = wm.create(run_id="r1")

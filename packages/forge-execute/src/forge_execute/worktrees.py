@@ -383,14 +383,43 @@ class WorktreeManager:
         return result.stdout
 
     def changed_files(self, worktree: Worktree) -> list[str]:
-        """Liste der Files, die sich gegenüber base_commit geändert haben."""
-        result = self._run(
-            ["git", "diff", "--name-only", worktree.base_commit, "HEAD"],
+        """Alle Files, die sich gegenüber base_commit geändert haben.
+
+        Erfasst drei Klassen in einem: **committed** Änderungen, **uncommitted**
+        (tracked) Änderungen und **neu angelegte** (untracked) Files. Letztere
+        fehlten früher (`git diff base HEAD` sieht weder uncommitted noch
+        untracked) — die Folge war, dass vom Coding-Agent neu erstellte Dateien
+        weder den Capability-Check durchliefen noch in den KEEP-Commit gelangten.
+
+        Die transienten Subagent-Markdowns unter `.claude/` (von
+        ``_install_subagents`` in den Worktree kopiert) werden ausgeschlossen —
+        sie sind forge-intern und gehören nie in Diff, Capability-Check oder PR.
+        """
+        # `git diff --name-only <base>` (ohne zweite Ref) vergleicht den
+        # Working Tree gegen base_commit — deckt committed + uncommitted ab.
+        tracked = self._run(
+            ["git", "diff", "--name-only", worktree.base_commit],
             cwd=worktree.path,
         )
-        if result.returncode != 0:
-            raise GitError(f"git diff --name-only failed: {result.stderr.strip()}")
-        return [line for line in result.stdout.splitlines() if line.strip()]
+        if tracked.returncode != 0:
+            raise GitError(f"git diff --name-only failed: {tracked.stderr.strip()}")
+        # Untracked Files separat — sie tauchen in keinem `git diff` auf.
+        untracked = self._run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=worktree.path,
+        )
+        if untracked.returncode != 0:
+            raise GitError(f"git ls-files --others failed: {untracked.stderr.strip()}")
+
+        seen: set[str] = set()
+        files: list[str] = []
+        for line in (*tracked.stdout.splitlines(), *untracked.stdout.splitlines()):
+            path = line.strip()
+            if not path or path.startswith(".claude/") or path in seen:
+                continue
+            seen.add(path)
+            files.append(path)
+        return files
 
     def has_changes(self, worktree: Worktree) -> bool:
         """True, wenn der Worktree gegenüber base_commit modifiziert wurde

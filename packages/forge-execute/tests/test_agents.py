@@ -138,6 +138,32 @@ def test_claude_cli_satisfies_protocol() -> None:
     assert agent is not None
 
 
+def test_stage_untracked_makes_new_files_visible_in_diff(repo: Path) -> None:
+    """Der Greenfield-Bug: neu angelegte Files fehlen ohne intent-to-add im
+    `git diff` und damit im Proposal-Diff. `_stage_untracked_for_diff` macht
+    sie sichtbar, `.claude/` bleibt ausgeschlossen."""
+    from forge_execute.agents.claude_cli import _git, _stage_untracked_for_diff
+
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    # Agent legt eine neue Datei an (untracked) und ein transientes Subagent-md.
+    (repo / "src" / "new_module.py").write_text(
+        "def f():\n    return 1\n", encoding="utf-8"
+    )
+    (repo / ".claude" / "agents").mkdir(parents=True)
+    (repo / ".claude" / "agents" / "architect.md").write_text("x", encoding="utf-8")
+
+    # Vor dem Fix: die neue Datei fehlt im Diff gegen base.
+    assert "new_module.py" not in _git(repo, "diff", base_sha)
+
+    _stage_untracked_for_diff(repo)
+    diff = _git(repo, "diff", base_sha)
+    assert "src/new_module.py" in diff
+    assert "+    return 1" in diff
+    # Transiente Subagent-Files dürfen nie im Diff landen.
+    assert ".claude/" not in diff
+    assert "architect.md" not in diff
+
+
 # --- Subagent installation -------------------------------------------------
 
 

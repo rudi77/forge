@@ -159,6 +159,11 @@ def feature_repo(tmp_path: Path) -> Path:
         "def test_greet():\n    assert greet('x') == 'hi x'\n",
         encoding="utf-8",
     )
+    # Realistisch wie jedes Python-Repo: pytest-Artefakte ignorieren, damit der
+    # Eval-Lauf den Worktree nicht mit untracked Junk verschmutzt.
+    (repo / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n.pytest_cache/\n.coverage\n", encoding="utf-8"
+    )
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "initial (green)")
     return repo

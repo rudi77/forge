@@ -269,11 +269,16 @@ class ClaudeCodeCLIAgent:
             raise CodingAgentError(
                 f"claude exited {proc.returncode}: {detail[:800]}"
             )
-        diff = _git(worktree, "diff", base_sha, "HEAD")
-        # Für noch nicht committete Änderungen ergänzen
-        wt_diff = _git(worktree, "diff")
-        if wt_diff.strip():
-            diff = (diff + ("\n" if diff and not diff.endswith("\n") else "") + wt_diff)
+        # Neu angelegte (untracked) Files erscheinen weder in `git diff base
+        # HEAD` noch in `git diff`. Ohne intent-to-add (`git add -N`) fehlten
+        # sie im Proposal-Diff — und damit im Judge-Input, im Capability-Check
+        # und im KEEP-Commit (genau der Greenfield-Bug). Wir markieren sie als
+        # intent-to-add (staget keinen Inhalt, nur die Existenz), schließen aber
+        # die transienten `.claude/`-Subagent-Markdowns aus.
+        _stage_untracked_for_diff(worktree)
+        # `git diff base_sha` (ohne zweite Ref) vergleicht den Working Tree
+        # gegen base — deckt committed + uncommitted + intent-added in einem ab.
+        diff = _git(worktree, "diff", base_sha)
 
         usage = raw.get("usage") or {}
         cost = _extract_cost(raw)
@@ -498,6 +503,24 @@ def _augment_tools_for_multi_agent(allowed_tools: str | None) -> str:
     if "Task" in allowed_tools:
         return allowed_tools
     return f"{allowed_tools},Task"
+
+
+def _stage_untracked_for_diff(worktree: Path) -> None:
+    """Markiert untrackte Files via `git add -N` als intent-to-add.
+
+    Damit erscheinen vom Coding-Agent neu angelegte Dateien im nachfolgenden
+    `git diff` (intent-to-add staget keinen Blob, nur die Existenz). Die
+    transienten Subagent-Markdowns unter `.claude/` bleiben ausgeschlossen —
+    sie sind forge-intern und dürfen nie im Diff oder PR landen.
+    """
+    untracked = _git(worktree, "ls-files", "--others", "--exclude-standard")
+    paths = [
+        line
+        for line in untracked.splitlines()
+        if line.strip() and not line.startswith(".claude/")
+    ]
+    if paths:
+        _git(worktree, "add", "-N", "--", *paths)
 
 
 def _git(worktree: Path, *args: str) -> str:

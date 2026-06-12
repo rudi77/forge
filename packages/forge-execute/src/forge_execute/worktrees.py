@@ -84,6 +84,42 @@ class WorktreeManager:
 
         return Worktree(path=path, branch=branch, base_commit=base_commit)
 
+    def attach(self, *, run_id: str) -> Worktree:
+        """Hängt sich an einen BESTEHENDEN Worktree (Resume nach Usage-Limit).
+
+        Anders als :meth:`create` legt das nichts Neues an: der Worktree unter
+        ``.forge/worktrees/<run_id>`` auf Branch ``forge/<run_id>`` muss
+        existieren — inklusive der Partial-Arbeit, die der unterbrochene Run als
+        ``forge:``-WIP-Commit gesichert hat. ``base_commit`` = aktueller HEAD,
+        damit DISCARDs während des Resume die bereits gesicherte Arbeit nicht
+        verlieren (der Resume baut auf dem WIP-Stand auf, nicht auf dem Run-Start).
+        """
+        path = self.worktree_root / run_id
+        branch = f"forge/{run_id}"
+        if not path.exists():
+            raise GitError(
+                f"cannot resume run {run_id}: worktree missing at {path}. "
+                "Der unterbrochene Run wurde evtl. schon aufgeräumt."
+            )
+        # Safety: stranded uncommittete Partial-Arbeit (z.B. ein VOR dem
+        # Resume-Feature unterbrochener Run, der noch keinen WIP-Commit machte)
+        # zuerst sichern — sonst würde ein DISCARD-``revert`` (git clean -fdx)
+        # während des Resume sie wegwerfen. Beim regulären Feature-Pfad ist der
+        # Worktree bereits sauber (HEAD = WIP-Commit) → no-op.
+        status = self._run(["git", "status", "--porcelain"], cwd=path)
+        if status.returncode == 0 and status.stdout.strip():
+            self._run(["git", "add", "-A"], cwd=path)
+            commit = self._run(
+                ["git", "commit", "-m", f"forge: WIP | {run_id} | resume safety commit"],
+                cwd=path,
+            )
+            if commit.returncode != 0:
+                raise GitError(
+                    f"resume safety commit failed for {run_id}: {commit.stderr.strip()}"
+                )
+        head = self._rev_parse("HEAD", cwd=path)
+        return Worktree(path=path, branch=branch, base_commit=head)
+
     def cleanup(self, worktree: Worktree) -> None:
         """Entfernt den Worktree (verzeichnis + git-internen Eintrag).
 
@@ -356,6 +392,19 @@ class WorktreeManager:
             add = self._run(["git", "add", "-A"], cwd=worktree.path)
         if add.returncode != 0:
             raise GitError(f"git add failed: {add.stderr.strip()}")
+
+        # Nichts gestaged + kein allow_empty? Dann hat der Agent seine Arbeit
+        # bereits SELBST committet (häufig in langen/resumeten Runs) — der
+        # aktuelle HEAD trägt die Änderungen schon. `git commit` würde hier mit
+        # "nothing to commit" (auf stdout, returncode≠0) failen; stattdessen ist
+        # HEAD der gesuchte KEEP-Commit. Diff-vs-base bleibt nicht-leer, der KEEP
+        # ist also real — nur eben vom Agenten committet statt vom Runner.
+        if not allow_empty:
+            staged = self._run(
+                ["git", "diff", "--cached", "--quiet"], cwd=worktree.path
+            )
+            if staged.returncode == 0:  # exit 0 = nichts gestaged
+                return self._rev_parse("HEAD", cwd=worktree.path)
 
         cmd = ["git", "commit", "-m", message]
         if allow_empty:

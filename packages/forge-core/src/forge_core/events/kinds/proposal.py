@@ -21,6 +21,7 @@ ProposalStopReason = Literal[
     "tool_use",
     "error",
     "timeout",
+    "rate_limited",
     "unknown",
 ]
 
@@ -42,7 +43,12 @@ class ProposalReceivedPayload(BaseModel):
     stop_reason: ProposalStopReason
     turns_used: int = 0
     files_touched: list[str] = Field(default_factory=list)
+    session_id: str | None = None
+    """claude-``session_id`` dieses propose-Aufrufs (aus dem stream-json).
+    Trägt den Resume-Anker für ``claude --resume``; ``None`` bei Agents ohne
+    Streaming (Mock) oder wenn die ID nicht extrahiert werden konnte."""
 
 
 register_payload(EventKind.PROPOSAL_REQUESTED, ProposalRequestedPayload, "1.0")
-register_payload(EventKind.PROPOSAL_RECEIVED, ProposalReceivedPayload, "1.0")
+# 1.1 (additiv): session_id ergänzt — alte 1.0-Events lesen weiter (Default None).
+register_payload(EventKind.PROPOSAL_RECEIVED, ProposalReceivedPayload, "1.1")

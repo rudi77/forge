@@ -22,6 +22,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -59,14 +60,16 @@ from ulid import ULID
 from forge_cli.conductor import (
     Blocked,
     DispatchOrder,
+    ResumeOrder,
     StageTransition,
     WorkItem,
+    derive_pending_resumes,
     derive_signals,
     run_conductor_tick,
 )
 from forge_cli.dependencies import parse_depends_on
 from forge_cli.heartbeat import HeartbeatStats, TickResult, run_heartbeat
-from forge_cli.run import RunOutcome, execute_run
+from forge_cli.run import _DEFAULT_RESUME_PROMPT, RunOutcome, execute_run
 from forge_cli.runtime import (
     ContextError,
     ForgeContext,
@@ -576,6 +579,93 @@ def _dispatch_design_run(
     )
 
 
+def _dispatch_resume(
+    *,
+    ctx: ForgeContext,
+    order: ResumeOrder,
+    params: _DispatchParams,
+    issue: ReadyIssue | None,
+) -> _PassResult:
+    """Setzt einen vom Usage-/Session-Limit unterbrochenen Run fort (Loop 2).
+
+    Reicht den Resume-Anker (run_id + session_id) an ``execute_run`` durch; der
+    Runner dockt an den eingefrorenen Worktree an (``claude --resume``) und führt
+    den Task zu Ende. Roster best-effort aus dem Issue-Label (wie der ursprüngliche
+    Dispatch); fehlt das Issue im aktuellen Board-Blick, greift der
+    ``execute_run``-Default. Mantra 3: das WANN kam aus der reinen
+    ``derive_pending_resumes``-Ableitung, nicht aus dem Runner.
+    """
+    roster = _roster_for_issue(ctx.spec, issue.labels) if issue is not None else None
+    title = issue.title if issue is not None else f"resume {order.run_id[:10]}"
+    console.print(
+        f"\n[bold blue]>>> board-loop[/bold blue] resume run "
+        f"[dim]{order.run_id[:10]}[/dim] (issue "
+        f"#{order.issue_number if order.issue_number else '?'} — session-limit reset erreicht)"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=_DEFAULT_RESUME_PROMPT,
+            prompt_template_id="resume",
+            trigger="schedule",
+            focus=f"resume:{order.run_id}",
+            base_ref=params.base_ref,
+            acceptance_criteria=None,
+            max_iterations=params.max_iterations,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=order.issue_number,
+            pr_number=None,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=params.multi_agent,
+            agents=roster,
+            create_pr=True,
+            pr_base=params.pr_base,
+            extra_labels=params.pr_label or [],
+            pr_draft=False,
+            auto_merge=params.auto_merge,
+            announce=False,
+            resume_run_id=order.run_id,
+            resume_session_id=order.resume_session_id,
+        )
+    except Exception as exc:
+        err_console.print(f"[red]error[/red] resuming run {order.run_id}: {exc}")
+        return _PassResult(
+            summaries=[
+                _LoopSummaryRow(
+                    issue_number=order.issue_number or 0,
+                    issue_title=title,
+                    decision="error",
+                    pr_url=None,
+                    auto_merge="-",
+                    error=str(exc),
+                )
+            ],
+            bailed=True,
+            dispatched=0,
+            skipped=0,
+        )
+
+    bailed = outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}
+    return _PassResult(
+        summaries=[
+            _LoopSummaryRow(
+                issue_number=order.issue_number or 0,
+                issue_title=title,
+                decision=outcome.result.decision,
+                pr_url=outcome.pr_url,
+                auto_merge="-",
+                error=outcome.pr_error,
+            )
+        ],
+        bailed=bailed,
+        dispatched=1,
+        skipped=0,
+    )
+
+
 def _heartbeat_session(
     *,
     ctx: ForgeContext,
@@ -626,6 +716,7 @@ def _heartbeat_session(
                     blocked=result.blocked,
                     skipped=result.skipped,
                     bailed=result.bailed,
+                    scheduled_resume_count=result.scheduled_resume_count,
                 ),
             )
         )
@@ -781,10 +872,31 @@ def _run_conductor_watch(
                 EventKind.PLAN_PROPOSED,
                 EventKind.PR_CREATED,
                 EventKind.PR_MERGED,
+                EventKind.RUN_RESUME_SCHEDULED,
             ):
                 events.extend(store.events_by_kind(kind))
 
             by_number = {i.number: i for i in issues}
+
+            # --- Fällige Resumes zuerst (Loop 2, Mantra 3) -----------------
+            # Vom Usage-Limit unterbrochene Runs, deren reset_at erreicht ist,
+            # rein aus dem Event-Strom abgeleitet und über denselben
+            # execute_run-Pfad mit --resume fortgesetzt. Dispatch ist synchron →
+            # der Resume emittiert ein neues RunStarted (gleiche run_id), das
+            # ihn im nächsten Tick als "schon fortgesetzt" markiert (at-most-once).
+            resume_count = 0
+            resume_bailed = False
+            for resume_order in derive_pending_resumes(events, datetime.now(UTC)):
+                res = _dispatch_resume(
+                    ctx=ctx,
+                    order=resume_order,
+                    params=params,
+                    issue=by_number.get(resume_order.issue_number or -1),
+                )
+                _print_loop_summary(res.summaries, bailed=res.bailed)
+                resume_count += res.dispatched
+                resume_bailed = resume_bailed or res.bailed
+
             items: list[WorkItem] = []
             for issue in issues:
                 stage = stage_of(issue.labels)
@@ -800,12 +912,15 @@ def _run_conductor_watch(
                     )
                 )
             if not items:
-                console.print(
-                    f"[dim]tick {tick_index}: keine aktiven Work-Items[/dim]"
+                if resume_count == 0:
+                    console.print(
+                        f"[dim]tick {tick_index}: keine aktiven Work-Items[/dim]"
+                    )
+                return TickResult(
+                    scheduled_resume_count=resume_count, bailed=resume_bailed
                 )
-                return TickResult()
 
-            counters = {"dispatched": 0, "bailed": False}
+            counters = {"dispatched": 0, "bailed": resume_bailed}
 
             def set_stage(t: StageTransition) -> None:
                 set_issue_stage_label(
@@ -853,6 +968,7 @@ def _run_conductor_watch(
                 dispatched=counters["dispatched"],
                 blocked=result.blocked,
                 bailed=bool(counters["bailed"]),
+                scheduled_resume_count=resume_count,
             )
 
         return tick_fn

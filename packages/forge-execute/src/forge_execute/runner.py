@@ -32,6 +32,7 @@ from forge_core.events import (
     ProposalReceivedPayload,
     ProposalRequestedPayload,
     RunFinishedPayload,
+    RunResumeScheduledPayload,
     RunStartedPayload,
     build_event,
 )
@@ -46,6 +47,7 @@ from ulid import ULID
 from forge_execute.agents.base import (
     CodingAgent,
     CodingAgentError,
+    CodingAgentRateLimited,
     CodingAgentTimeout,
     ProposalResult,
 )
@@ -151,6 +153,8 @@ class SequentialRunner:
         store: EventStore,
         blobs: BlobStore,
         worktrees: WorktreeManager | None = None,
+        run_id: str | None = None,
+        resume_session_id: str | None = None,
     ) -> None:
         self.config = config
         self.agent = agent
@@ -168,7 +172,13 @@ class SequentialRunner:
             JudgeEvaluator(agent) if config.spec.judge.enabled else None
         )
 
-        self.run_id = str(ULID())
+        # Resume (Inkr. 2): ein unterbrochener Run wird unter SEINER run_id
+        # fortgesetzt — gleiche Event-Linie, gleicher Worktree/Branch. Ein
+        # explizit übergebener run_id markiert den Resume; der Runner hängt sich
+        # dann an den bestehenden Worktree an, statt einen neuen anzulegen.
+        self._is_resume = run_id is not None
+        self.run_id = run_id or str(ULID())
+        self._resume_session_id = resume_session_id
         self._spec_version = config.spec.spec_version
         self._common = dict(
             project=config.project,
@@ -188,6 +198,10 @@ class SequentialRunner:
         self._baseline_gate_results: dict[str, bool] | None = None
         self._kept_outcomes: list[GenerationOutcome] = []
         self._all_outcomes: list[GenerationOutcome] = []
+        # Gesetzt, sobald ein propose-Aufruf in ein Usage-/Session-Limit lief —
+        # trägt den Resume-Anker (session_id, reset_at). Beendet den Run als
+        # `rate_limited` statt `no_improvement` (Mantra 1: echter Zustand).
+        self._rate_limit_anchor: CodingAgentRateLimited | None = None
         # Aktueller Commit, auf den DISCARD-Generations zurückrollen.
         # Bei Run-Start = worktree.base_commit; nach jeder KEEP-Generation
         # auf den dann commitierten HEAD aktualisiert. Sonst würde ein
@@ -203,10 +217,15 @@ class SequentialRunner:
     # --- Top-level run ---------------------------------------------------
 
     def run(self) -> RunResult:
-        worktree = self.worktrees.create(
-            run_id=self.run_id,
-            base_ref=self.config.base_ref,
-        )
+        if self._is_resume:
+            # Resume: an den eingefrorenen Worktree des unterbrochenen Runs
+            # andocken (inkl. WIP-Commit), nicht neu anlegen.
+            worktree = self.worktrees.attach(run_id=self.run_id)
+        else:
+            worktree = self.worktrees.create(
+                run_id=self.run_id,
+                base_ref=self.config.base_ref,
+            )
         try:
             return self._run_in_worktree(worktree)
         finally:
@@ -261,6 +280,10 @@ class SequentialRunner:
             if outcome.error == "cost_cap_hit":
                 decision = "cost_cap_hit"
                 break
+            if outcome.error == "rate_limited":
+                # Usage-/Session-Limit: Run ist fortsetzbar, nicht gescheitert.
+                decision = "rate_limited"
+                break
             if outcome.error == "self_terminated":
                 # Agent meldete "nothing more to do" — Run ist vollständig
                 # (Spec v0.3 Teil 6.8). Wenn KEPT-Generations existieren,
@@ -269,6 +292,10 @@ class SequentialRunner:
                 if not self._kept_outcomes:
                     decision = "self_terminated"
                 break
+
+        # --- Rate-Limit: fortsetzbar abschließen, kein revert -----------
+        if decision == "rate_limited":
+            return self._finish_rate_limited(worktree)
 
         # --- Abschluss --------------------------------------------------
         if decision == "no_improvement" and self._kept_outcomes:
@@ -317,6 +344,67 @@ class SequentialRunner:
             final_diff=diff,
         )
 
+    def _finish_rate_limited(self, worktree: Worktree) -> RunResult:
+        """Schließt einen vom Usage-Limit unterbrochenen Run als ``rate_limited`` ab.
+
+        Sichert die Partial-Arbeit als ``forge:``-WIP-Commit, hält den Resume-
+        Anker (session_id, reset_at, Worktree, WIP-Commit) als
+        ``RunResumeScheduled`` fest und beendet den Run — **ohne** revert, damit
+        ``claude --resume`` später exakt dort weitermacht. Mantra 3: der Runner
+        plant den Resume nicht, er legt nur den Anker; Loop 2 entscheidet das WANN.
+        """
+        anchor = self._rate_limit_anchor
+        assert anchor is not None  # nur über decision == "rate_limited" erreichbar
+
+        # Partial-Arbeit sichern. allow_empty: auch wenn claude vor der ersten
+        # Edit ins Limit lief, gibt es einen stabilen Anker-SHA, auf dem der
+        # Resume aufsetzt.
+        wip_commit = self.worktrees.commit(
+            worktree,
+            f"forge: WIP | {self.run_id} | session-limit (resume pending)",
+            allow_empty=True,
+        )
+
+        self._emit(
+            EventKind.RUN_RESUME_SCHEDULED,
+            RunResumeScheduledPayload(
+                original_run_id=self.run_id,
+                resume_session_id=anchor.session_id,
+                resume_at=anchor.reset_at,
+                resume_worktree=str(worktree.path),
+                wip_commit=wip_commit,
+                reason="session_limit",
+                issue_number=self.config.issue_number,
+            ),
+        )
+
+        self._emit(
+            EventKind.RUN_FINISHED,
+            RunFinishedPayload(
+                decision="rate_limited",
+                generations_count=len(self._all_outcomes),
+                final_score=None,
+                baseline_score=self._baseline_composite,
+                score_delta=None,
+                total_cost_usd=self._total_cost,
+                pr_number=self.config.pr_number,
+            ),
+        )
+
+        return RunResult(
+            run_id=self.run_id,
+            decision="rate_limited",
+            generations=list(self._all_outcomes),
+            final_score=None,
+            score_delta=None,
+            total_cost_usd=self._total_cost,
+            # Branch IMMER erhalten — der Resume baut darauf auf (anders als die
+            # kept-basierte Logik unten, die ohne KEEP keinen Branch zurückgibt).
+            branch=worktree.branch,
+            final_commit=wip_commit,
+            final_diff=None,
+        )
+
     # --- Generation ------------------------------------------------------
 
     def _run_one_generation(
@@ -339,8 +427,19 @@ class SequentialRunner:
         # --- Phase 1: Propose ----------------------------------------
         proposal = self._propose(worktree, gen_id, gen_idx)
         if proposal is None:
+            # Usage-/Session-Limit? Dann ist der Run fortsetzbar (eigener Pfad
+            # im Run-Loop) — sonst gewöhnlicher Propose-Fehler.
+            rate_limited = self._rate_limit_anchor is not None
             outcome = GenerationOutcome(
-                idx=gen_idx, kept=False, reason="propose_failed", error="error"
+                idx=gen_idx,
+                kept=False,
+                reason="rate_limited" if rate_limited else "propose_failed",
+                cost_usd=(
+                    self._rate_limit_anchor.cost_usd
+                    if rate_limited and self._rate_limit_anchor is not None
+                    else Decimal("0")
+                ),
+                error="rate_limited" if rate_limited else "error",
             )
             self._finish_generation(gen_id, outcome)
             return outcome
@@ -606,7 +705,11 @@ class SequentialRunner:
                 budget_usd=self.config.spec.cost_caps.per_generation_usd,
                 model=self.config.model,
                 allowed_tools=self.capabilities.allowed_tools_string(),
+                resume_session_id=self._resume_session_id,
             )
+            # Resume gilt nur für den ERSTEN propose nach dem Limit — danach
+            # läuft der Run regulär weiter (kein Doppel-Resume in Folge-Gens).
+            self._resume_session_id = None
             # Self-Termination-Signal (Spec v0.3 Teil 6.8): wenn der Agent
             # `forge: nothing more to do` im result-text gesendet hat, ist
             # der Run vollständig.
@@ -623,6 +726,27 @@ class SequentialRunner:
                         "error": "self_terminated",
                     }
                 )
+        except CodingAgentRateLimited as exc:
+            # Usage-/Session-Limit: kein gewöhnlicher Fehler. Echten Cost
+            # einbuchen (geht sonst verloren), Resume-Anker merken, Worktree
+            # NICHT anfassen (Partial-Arbeit bleibt). Der Run-Loop beendet
+            # den Run als `rate_limited` und emittiert RunResumeScheduled.
+            self._total_cost += exc.cost_usd
+            self._rate_limit_anchor = exc
+            self._emit(
+                EventKind.PROPOSAL_RECEIVED,
+                ProposalReceivedPayload(
+                    stop_reason="rate_limited",
+                    turns_used=exc.turns_used,
+                    session_id=exc.session_id,
+                ),
+                generation_id=gen_id,
+                cost_usd=exc.cost_usd,
+                error_class="CodingAgentRateLimited",
+                error_msg=str(exc),
+                success=False,
+            )
+            return None
         except CodingAgentTimeout as exc:
             self._emit(
                 EventKind.PROPOSAL_RECEIVED,

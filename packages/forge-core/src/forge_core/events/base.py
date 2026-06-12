@@ -46,6 +46,9 @@ class EventKind(StrEnum):
     CONDUCTOR_TICK_COMPLETED = "ConductorTickCompleted"
     WORK_ITEM_STAGE_CHANGED = "WorkItemStageChanged"
     WORK_ITEM_BLOCKED = "WorkItemBlocked"
+    # Resilienz: ein Run lief in ein Claude-Usage-/Session-Limit und kann
+    # später per `claude --resume` fortgesetzt werden (Anker für Loop 2).
+    RUN_RESUME_SCHEDULED = "RunResumeScheduled"
 
 
 class EventValidationError(ValueError):

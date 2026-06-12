@@ -57,6 +57,29 @@ def test_create_and_cleanup(repo: Path) -> None:
     assert not wt.path.exists()
 
 
+def test_commit_returns_head_when_agent_already_committed(repo: Path) -> None:
+    """Agent hat seine Arbeit SELBST committet (sauberer Working Tree).
+
+    Beobachtet bei einem resumeten Run: claude committete die WP7-Subtasks
+    selbst, dann scheiterte der Runner-KEEP-Commit an `git commit` (nothing to
+    commit, returncode≠0, stderr leer). commit() muss in diesem Fall den
+    aktuellen HEAD zurückgeben — er trägt die Änderungen bereits.
+    """
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="01HZXAGENTCOMMIT")
+    (wt.path / "src" / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n", encoding="utf-8"
+    )
+    _git(wt.path, "add", "-A")
+    _git(wt.path, "commit", "-m", "forge: WIP | agent self-commit")
+    head = wm._rev_parse("HEAD", cwd=wt.path)
+
+    # Runner-KEEP-Pfad mit den (bereits committeten) Files → kein Raise, HEAD.
+    sha = wm.commit(wt, "forge: keep | gen 0", paths=["src/calc.py"])
+    assert sha == head
+    wm.cleanup(wt)
+
+
 def test_three_parallel_worktrees(repo: Path) -> None:
     wm = WorktreeManager(repo)
     worktrees = [wm.create(run_id=f"r{i}") for i in range(3)]

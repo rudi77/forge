@@ -67,6 +67,7 @@ class MockCodingAgent:
         self._review_sequence = list(review_sequence) if review_sequence else None
         self._review_callable = review_callable
         self.calls: list[tuple[Path, str]] = []
+        self.resume_session_ids: list[str | None] = []
         self.review_calls: list[tuple[Path, str, str]] = []
 
     def propose(
@@ -79,8 +80,10 @@ class MockCodingAgent:
         model: str | None = None,
         allowed_tools: str | None = None,
         env: dict[str, str] | None = None,
+        resume_session_id: str | None = None,
     ) -> ProposalResult:
         self.calls.append((worktree, prompt))
+        self.resume_session_ids.append(resume_session_id)
 
         if self._static is not None:
             return self._static

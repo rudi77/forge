@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from forge_core.events import EventKind
 
@@ -248,3 +249,84 @@ def derive_signals(events: list, issue_number: int) -> StageSignals:
         has_open_pr=has_open_pr,
         has_merged_pr=has_merged_pr,
     )
+
+
+@dataclass(frozen=True)
+class ResumeOrder:
+    """Ein fälliger Resume eines vom Usage-/Session-Limit unterbrochenen Runs.
+
+    Vom Conductor rein aus dem Event-Strom abgeleitet; die Wiring-Schicht
+    dispatcht ihn als ``forge run --resume <run_id>`` (gleiche Run-Linie).
+    """
+
+    run_id: str
+    resume_session_id: str | None
+    resume_at: datetime
+    issue_number: int | None
+    worktree: str
+
+
+def _parse_iso(value: object) -> datetime | None:
+    """Parst einen ISO-Timestamp aus einem Event-Payload (Store liefert str)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def derive_pending_resumes(events: list, now: datetime) -> list[ResumeOrder]:
+    """Leitet **fällige** Run-Resumes rein aus dem Event-Strom ab (Mantra 3).
+
+    Ein ``RunResumeScheduled`` ist fällig, wenn:
+
+      1. seine ``resume_at`` gesetzt UND ``<= now`` ist (``None`` = Reset-Zeit war
+         nicht parsebar → **nur manueller** Resume, nie auto-dispatcht), und
+      2. der Run seither NICHT erneut gestartet wurde — d. h. es gibt kein
+         ``RunStarted`` mit demselben ``run_id`` und ``ts`` nach dem Anker
+         (at-most-once; ein Resume emittiert ein frisches RunStarted derselben
+         run_id).
+
+    Lief ein Run mehrfach ins Limit, zählt nur der **jüngste** Anker pro run_id.
+    Der Conductor entscheidet das WANN über diese reine Ableitung — er greift
+    nie in den Runner ein. ``events`` sind ``Event``-Objekte (``.kind``,
+    ``.run_id``, ``.ts``, ``.payload``).
+    """
+    latest_anchor: dict[str, object] = {}
+    for e in events:
+        if e.kind == EventKind.RUN_RESUME_SCHEDULED:
+            prev = latest_anchor.get(e.run_id)
+            if prev is None or e.ts > prev.ts:  # type: ignore[attr-defined]
+                latest_anchor[e.run_id] = e
+    if not latest_anchor:
+        return []
+
+    orders: list[ResumeOrder] = []
+    for run_id, anchor in latest_anchor.items():
+        anchor_ts = anchor.ts  # type: ignore[attr-defined]
+        already_resumed = any(
+            e.kind == EventKind.RUN_STARTED
+            and e.run_id == run_id
+            and e.ts > anchor_ts
+            for e in events
+        )
+        if already_resumed:
+            continue
+        payload = anchor.payload or {}  # type: ignore[attr-defined]
+        resume_at = _parse_iso(payload.get("resume_at"))
+        if resume_at is None or resume_at > now:
+            continue  # nicht parsebar (manuell) oder noch nicht fällig
+        orders.append(
+            ResumeOrder(
+                run_id=run_id,
+                resume_session_id=payload.get("resume_session_id"),
+                resume_at=resume_at,
+                issue_number=payload.get("issue_number"),
+                worktree=str(payload.get("resume_worktree", "")),
+            )
+        )
+    return sorted(orders, key=lambda o: o.run_id)

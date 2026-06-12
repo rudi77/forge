@@ -638,3 +638,86 @@ def test_extract_plan_returns_none_when_block_empty() -> None:
 
     text = "before\n---FORGE-PLAN-BEGIN---\n\n---FORGE-PLAN-END---\nafter"
     assert extract_plan_from_master_output(text) is None
+
+
+# --- Headless- & Kosten-Disziplin ------------------------------------------
+
+
+def test_build_orchestrator_prompt_has_discipline_section() -> None:
+    """Context-Handoff, gezielte Verifikation und Headless-Regel sind im
+    Orchestrator-Prompt — die drei gemessenen Kostentreiber orchestrierter
+    Runs (kalte Subagent-Re-Scans, volle Suiten pro Subtask, verworfene
+    interaktive Fragen)."""
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(["architect", "developer", "tester"])
+    assert "## Context & cost discipline" in prompt
+    assert "Context handoff" in prompt
+    assert "Targeted verification" in prompt
+    assert "AskUserQuestion" in prompt
+    assert "Design decisions" in prompt
+
+    # Auch ohne architect bleibt die Disziplin-Sektion erhalten.
+    no_architect = build_orchestrator_prompt(["developer", "tester"])
+    assert "AskUserQuestion" in no_architect
+    assert "Context handoff" in no_architect
+
+
+def test_propose_cmd_disallows_interactive_tools(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Harter Headless-Guard: `--disallowedTools AskUserQuestion` steht im
+    propose-Kommando — auch unter bypassPermissions, wo `--allowedTools`
+    allein nichts ausschließt."""
+    import forge_execute.agents.claude_cli as claude_cli_mod
+
+    captured: dict[str, list[str]] = {}
+    real_popen = claude_cli_mod.subprocess.Popen
+
+    def fake_popen(cmd: list[str], **kwargs: object):
+        # Nur den claude-Aufruf abfangen — `subprocess.run` (git) nutzt
+        # intern ebenfalls Popen und muss echt weiterlaufen.
+        if cmd and cmd[0] == "claude":
+            captured["cmd"] = cmd
+            raise FileNotFoundError("no claude binary in test")
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(claude_cli_mod.subprocess, "Popen", fake_popen)
+    agent = ClaudeCodeCLIAgent()
+    with pytest.raises(CodingAgentError):
+        agent.propose(
+            worktree=repo,
+            prompt="task",
+            max_turns=2,
+            budget_usd=Decimal("0.10"),
+        )
+    cmd = captured["cmd"]
+    idx = cmd.index("--disallowedTools")
+    assert "AskUserQuestion" in cmd[idx + 1]
+
+
+def test_install_subagents_warns_when_override_lacks_model(
+    repo: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ein Projekt-Override ohne `model:`-Frontmatter erbt das Master-Modell
+    (oft das teuerste) — `_install_subagents` warnt, bricht aber nicht ab."""
+    from forge_execute.agents.claude_cli import _install_subagents
+
+    override_dir = repo / ".forge" / "agents"
+    override_dir.mkdir(parents=True)
+    (override_dir / "architect.md").write_text(
+        "---\nname: architect\n---\n# custom, model fehlt\n", encoding="utf-8"
+    )
+    (override_dir / "developer.md").write_text(
+        "---\nname: developer\nmodel: sonnet\n---\n# custom mit model\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="forge_execute.agents.claude_cli"):
+        _install_subagents(repo)
+
+    warnings = [r for r in caplog.records if "model" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "architect.md" in warnings[0].getMessage()
+    # Installation läuft trotzdem durch.
+    assert (repo / ".claude" / "agents" / "architect.md").is_file()

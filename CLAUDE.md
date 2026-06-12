@@ -249,7 +249,19 @@ Welche Rollen mitwirken, steuert die `agents:[...]`-Roster aus der Trigger-Confi
 
 ### Modell pro Rolle: via Projekt-Override
 
-Die `.md`-Templates tragen `model: sonnet` im Frontmatter. Wer eine Rolle auf ein anderes Modell heben will (z.B. `architect` auf opus), legt ein Projekt-Override unter `<repo>/.forge/agents/<role>.md` mit eigenem Frontmatter ab — `_install_subagents` kopiert die ganze Datei (inkl. `model:`-Zeile) über den Default. Das funktioniert in BEIDEN Pfaden (`forge run` + board-loop), weil beide durch denselben Hybrid-Lookup gehen. Kein Spec-Feld nötig, kein zweiter Konfig-Ort.
+Die `.md`-Templates tragen `model: sonnet` im Frontmatter. Wer eine Rolle auf ein anderes Modell heben will (z.B. `architect` auf opus), legt ein Projekt-Override unter `<repo>/.forge/agents/<role>.md` mit eigenem Frontmatter ab — `_install_subagents` kopiert die ganze Datei (inkl. `model:`-Zeile) über den Default. Das funktioniert in BEIDEN Pfaden (`forge run` + board-loop), weil beide durch denselben Hybrid-Lookup gehen. Kein Spec-Feld nötig, kein zweiter Konfig-Ort. **Achtung:** ein Override OHNE `model:`-Zeile erbt das Master-Modell (oft opus) — in einem realen Run war genau das der größte Kostentreiber (~239K Opus-Output-Tokens ≈ $19). `_install_subagents` warnt via logging, wenn die Zeile fehlt.
+
+### Headless- & Kosten-Disziplin im propose-Pfad
+
+Drei gemessene Kostentreiber orchestrierter Runs (Analyse eines $19/57-min-Runs: 93 % der Wall-Zeit reine API-Inferenz, 13,7 Mio Cache-Read-Tokens durch kalt startende Subagents, die dieselben Files 9-11× lasen) sind adressiert:
+
+- **`--disallowedTools AskUserQuestion`** steht in beiden claude-Aufrufen (`propose` + Judge-`review`; `HEADLESS_DISALLOWED_TOOLS` in `claude_cli.py`). Interaktive Fragen werden im Print-Mode ohnehin auto-denied, kosten aber einen vollen API-Round-Trip — und `--allowedTools` allein schließt unter `bypassPermissions` nichts aus. Architect-Template + Orchestrator-Prompt sagen stattdessen: spec-treuen Default wählen und unter `Design decisions` dokumentieren. Der `Insufficient context`-Output bleibt der Weg bei fundamental fehlendem Kontext (finales Output, keine interaktive Frage).
+- **Context handoff** (Orchestrator-Prompt, Sektion „Context & cost discipline"): Subagents starten mit leerem Kontext — der Master pastet Memory-Auszug, bekannte Datei-Pfade und (für den developer) den Subtask-Block in jeden Task-Prompt, statt Subagents breit re-scannen zu lassen.
+- **Targeted verification**: pro Subtask nur gefilterte Tests / inkrementelle Builds (à la `--no-build`); die volle Suite läuft genau einmal, im finalen Tester-Schritt. Steht im Orchestrator-Prompt UND in den developer/tester-Templates.
+
+### Project memory: Erledigt-Status kommt aus dem Event-Strom
+
+`_project_memory.py` baut den Memory-Block aus drei Quellen: Operator-Seed (`.forge/memory.md`), **Recent run outcomes** (`RunStarted` + `RunFinished` + `PRMerged`, korreliert über `run_id`) und jüngsten Plan-Summaries. Die Outcomes existieren, weil der Seed zwangsläufig veraltet: `.forge/**` ist für den Agenten Forbidden Zone, forge selbst schreibt `memory.md` NIE (Operator-Datei) — ein „WP4 noch offen" im Seed bleibt also stehen, obwohl der PR längst gemerged ist. Der Addendum-Text legt fest: bei Widerspruch gewinnen die Run-Outcomes, nicht die Seed-Prosa. Wenn du hier erweiterst: Memory ist read-only-Auswertung des Event-Stroms (Mantra 3), keine neue Event-Logik.
 
 ### Was die Orchestrierung (noch) NICHT misst
 

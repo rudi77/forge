@@ -7,10 +7,13 @@ from pathlib import Path
 from forge_core.blobs import BlobStore
 from forge_core.events import EventKind, build_event
 from forge_core.events.kinds.plan import PlanProposedPayload
+from forge_core.events.kinds.pr import PRMergedPayload
+from forge_core.events.kinds.run import RunFinishedPayload, RunStartedPayload
 from forge_core.store import EventStore
 from forge_execute._project_memory import (
     build_project_memory,
     collect_recent_plan_summaries,
+    collect_recent_run_outcomes,
     load_memory_seed,
     render_project_memory_addendum,
 )
@@ -133,6 +136,141 @@ def test_collect_recent_plan_summaries_excludes_current_run(tmp_path: Path) -> N
             exclude_run_id="current-run",
         )
         assert summaries == []
+    finally:
+        store.close()
+
+
+def _append_run(
+    store: EventStore,
+    *,
+    run_id: str,
+    issue: int | None,
+    focus: str | None,
+    decision: str,
+    pr_number: int | None = None,
+    merged: bool = False,
+) -> None:
+    store.append(
+        build_event(
+            kind=EventKind.RUN_STARTED,
+            run_id=run_id,
+            payload=RunStartedPayload(
+                trigger="manual",
+                strategy="sequential",
+                config_hash="sha256:" + "0" * 64,
+                issue_number=issue,
+                focus=focus,
+            ),
+            **_COMMON,
+        )
+    )
+    store.append(
+        build_event(
+            kind=EventKind.RUN_FINISHED,
+            run_id=run_id,
+            payload=RunFinishedPayload(
+                decision=decision,  # type: ignore[arg-type]
+                generations_count=1,
+                pr_number=pr_number,
+            ),
+            **_COMMON,
+        )
+    )
+    if merged and pr_number is not None:
+        store.append(
+            build_event(
+                kind=EventKind.PR_MERGED,
+                run_id=run_id,
+                payload=PRMergedPayload(
+                    pr_number=pr_number,
+                    merger="operator",
+                    time_to_merge_s=120,
+                ),
+                **_COMMON,
+            )
+        )
+
+
+def test_collect_recent_run_outcomes_summarizes_runs(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        _append_run(
+            store,
+            run_id="run-wp4",
+            issue=12,
+            focus="WP4: render endpoint",
+            decision="pr_created",
+            pr_number=34,
+            merged=True,
+        )
+        _append_run(
+            store,
+            run_id="run-fail",
+            issue=13,
+            focus=None,
+            decision="no_improvement",
+        )
+        lines = collect_recent_run_outcomes(store, project="testproj")
+        assert len(lines) == 2
+        joined = "\n".join(lines)
+        assert "issue #12" in joined
+        assert "pr_created" in joined
+        assert "PR #34, merged" in joined
+        assert "WP4: render endpoint" in joined
+        assert "no_improvement" in joined
+    finally:
+        store.close()
+
+
+def test_collect_recent_run_outcomes_excludes_current_run(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        _append_run(
+            store,
+            run_id="current-run",
+            issue=1,
+            focus=None,
+            decision="pr_created",
+        )
+        assert (
+            collect_recent_run_outcomes(
+                store, project="testproj", exclude_run_id="current-run"
+            )
+            == []
+        )
+    finally:
+        store.close()
+
+
+def test_build_project_memory_includes_run_outcomes(tmp_path: Path) -> None:
+    forge_dir = tmp_path / ".forge"
+    forge_dir.mkdir()
+    # Bewusst veralteter Seed: der Event-Strom muss den Erledigt-Status
+    # liefern, auch wenn die Operator-Prosa nicht nachgepflegt wurde.
+    (forge_dir / "memory.md").write_text(
+        "## Noch offen\n- WP4 render endpoint", encoding="utf-8"
+    )
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+    try:
+        _append_run(
+            store,
+            run_id="run-wp4",
+            issue=12,
+            focus="WP4: render endpoint",
+            decision="pr_created",
+            pr_number=34,
+            merged=True,
+        )
+        md = build_project_memory(
+            forge_dir=forge_dir,
+            store=store,
+            blobs=blobs,
+            project="testproj",
+        )
+        assert "Recent run outcomes" in md
+        assert "issue #12" in md
+        assert "do not re-plan" in md
     finally:
         store.close()
 

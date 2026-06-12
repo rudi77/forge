@@ -20,6 +20,8 @@ from forge_execute._plan_parser import parse_plan
 _MAX_TOTAL_CHARS = 8000
 _MAX_PLAN_SNIPPET = 1500
 _MAX_RECENT_PLANS = 3
+_MAX_RECENT_OUTCOMES = 5
+_MAX_FOCUS_CHARS = 100
 _SEED_FILENAME = "memory.md"
 
 
@@ -82,6 +84,61 @@ def collect_recent_plan_summaries(
     return out
 
 
+def collect_recent_run_outcomes(
+    store: EventStore,
+    *,
+    project: str,
+    exclude_run_id: str | None = None,
+    limit: int = _MAX_RECENT_OUTCOMES,
+) -> list[str]:
+    """Eine Zusammenfassungs-Zeile pro kürzlich beendetem Run.
+
+    Korreliert rein aus dem Event-Strom: ``RunStarted`` (issue/focus) +
+    ``RunFinished`` (decision/PR) + ``PRMerged``, verknüpft über ``run_id``.
+    Damit veraltet der Erledigt-Status nie — auch wenn die Operator-Seed-
+    Prosa in ``memory.md`` („WP4 noch offen") nicht nachgepflegt wird,
+    sieht der nächste Run hier, was bereits gebaut und gemerged wurde.
+    """
+    rows = store.query(
+        """
+        SELECT f.run_id AS run_id,
+               json_extract_string(s.payload, '$.issue_number') AS issue_number,
+               json_extract_string(s.payload, '$.focus') AS focus,
+               json_extract_string(f.payload, '$.decision') AS decision,
+               json_extract_string(f.payload, '$.pr_number') AS pr_number,
+               EXISTS (
+                   SELECT 1 FROM events m
+                   WHERE m.run_id = f.run_id AND m.kind = 'PRMerged'
+               ) AS merged
+        FROM events f
+        JOIN events s ON s.run_id = f.run_id AND s.kind = 'RunStarted'
+        WHERE f.kind = 'RunFinished'
+          AND f.project = ?
+          AND (? IS NULL OR f.run_id != ?)
+        ORDER BY f.ts DESC, f.event_id DESC
+        LIMIT ?
+        """,
+        [project, exclude_run_id, exclude_run_id, limit],
+    )
+    out: list[str] = []
+    for row in rows:
+        run_id = str(row.get("run_id") or "")
+        head = [f"run `{run_id[:8]}`"]
+        issue = row.get("issue_number")
+        if issue not in (None, ""):
+            head.append(f"issue #{issue}")
+        decision = str(row.get("decision") or "unknown")
+        line = f"- {' — '.join(head)}: **{decision}**"
+        pr = row.get("pr_number")
+        if pr not in (None, ""):
+            line += f" (PR #{pr}{', merged' if row.get('merged') else ''})"
+        focus = str(row.get("focus") or "").strip()
+        if focus:
+            line += f" — {_one_line(focus)[:_MAX_FOCUS_CHARS]}"
+        out.append(line)
+    return out
+
+
 def build_project_memory(
     *,
     forge_dir: Path,
@@ -97,6 +154,21 @@ def build_project_memory(
     if seed:
         parts.append("## Operator seed\n")
         parts.append(seed)
+
+    outcomes = collect_recent_run_outcomes(
+        store,
+        project=project,
+        exclude_run_id=exclude_run_id,
+    )
+    if outcomes:
+        parts.append("## Recent run outcomes\n")
+        parts.append(
+            "Completion status from the event stream — current even when "
+            "the operator seed is stale. A workpaket listed here with "
+            "`pr_created` is already implemented; do not re-plan it.\n"
+        )
+        parts.extend(outcomes)
+        parts.append("")
 
     recent = collect_recent_plan_summaries(
         store,
@@ -126,7 +198,9 @@ def render_project_memory_addendum(memory_md: str) -> str:
         "## forge project memory — orientation from prior runs\n\n"
         "Use this to avoid re-discovering stable project facts. "
         "Still read task-specific Spec sections and acceptance criteria "
-        "for the current workpaket.\n\n"
+        "for the current workpaket. When the operator seed and the run "
+        "outcomes disagree about what is already done, the run outcomes "
+        "win — they come from the event stream and cannot go stale.\n\n"
         f"{memory_md}\n"
     )
 

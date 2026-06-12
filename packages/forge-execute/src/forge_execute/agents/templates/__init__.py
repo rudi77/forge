@@ -229,6 +229,42 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "```"
         )
 
+    # --- Kontext- & Kosten-Disziplin --------------------------------
+    # Adressiert die zwei gemessenen Kostentreiber orchestrierter Runs:
+    # Subagents starten kalt und re-scannen Files, die der Master schon
+    # kennt (Cache-Read-Explosion), und interaktive Fragen verbrennen im
+    # Headless-Mode einen vollen API-Round-Trip.
+    disciplines: list[str] = [
+        "- **Context handoff:** subagents start with an EMPTY context — "
+        "they see only what you put into the Task prompt. When dispatching "
+        "any subagent, paste in: the relevant `## forge project memory` "
+        "excerpt, the exact file paths and spec sections already "
+        "identified"
+        + (
+            ", and (for the developer) the full subtask block from the plan"
+            if has_architect
+            else ""
+        )
+        + ". A subagent that must rediscover files you already know wastes "
+        "a cold re-scan of the repo.",
+        "- **Targeted verification:** while working a subtask, run only the "
+        "tests/builds that subtask touches (single test file, filtered run, "
+        "incremental build — e.g. skip a rebuild when nothing compiled "
+        "changed). The FULL suite runs exactly once, at the final "
+        "verification step.",
+        "- **Headless run:** there is no operator to ask — interactive "
+        "questions (AskUserQuestion or similar) are auto-denied and burn a "
+        "full turn. Choose the spec-faithful default instead and record it"
+        + (
+            " (architect: under `Design decisions`, otherwise"
+            if has_architect
+            else ""
+        )
+        + " in the run summary"
+        + (")" if has_architect else "")
+        + ".",
+    ]
+
     # --- Verbote (konditional) --------------------------------------
     nevers = ["- Edit files yourself. Delegate to the developer subagent."]
     if has_architect:
@@ -270,6 +306,8 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
         + "\n".join(descriptions)
         + "\n\n## Your workflow\n\n"
         + "\n".join(steps)
+        + "\n\n## Context & cost discipline\n\n"
+        + "\n".join(disciplines)
         + "\n\n## What you NEVER do\n\n"
         + "\n".join(nevers)
         + "\n"

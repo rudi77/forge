@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -46,6 +48,16 @@ from forge_execute.agents.templates import (
 from forge_execute.evaluators.command import _kill_tree
 
 _IS_WINDOWS = platform.system() == "Windows"
+
+_log = logging.getLogger(__name__)
+
+# Interaktive Tools, die im Headless-Mode (`claude -p`) nie funktionieren
+# können: der Permission-Prompt wird automatisch verworfen, der Versuch
+# kostet aber einen vollen API-Round-Trip (beobachtet: architect stellt
+# AskUserQuestion, Frage wird verworfen, der Default gilt sowieso).
+# Hartes Deny via `--disallowedTools` — wirkt auch unter bypassPermissions,
+# wo `--allowedTools` allein nichts ausschließt.
+HEADLESS_DISALLOWED_TOOLS = "AskUserQuestion"
 
 
 # Default-Wallclock-Limit: ein Vielfaches der LLM-Latenz, falls budget_usd
@@ -201,6 +213,8 @@ class ClaudeCodeCLIAgent:
             str(max_turns),
             "--permission-mode",
             self.permission_mode,
+            "--disallowedTools",
+            HEADLESS_DISALLOWED_TOOLS,
         ]
         if self.multi_agent:
             cmd.extend(
@@ -370,6 +384,7 @@ class ClaudeCodeCLIAgent:
             "--max-turns", str(max_turns),
             "--permission-mode", self.permission_mode,
             "--allowedTools", tools,
+            "--disallowedTools", HEADLESS_DISALLOWED_TOOLS,
         ]
         chosen_model = model or self.default_model
         if chosen_model:
@@ -506,6 +521,36 @@ def _install_subagents(worktree: Path, agents: list[str] | None = None) -> None:
         shutil.copyfile(src, target / src.name)
     for name, src in project_overrides.items():
         shutil.copyfile(src, target / name)
+        # Ohne `model:`-Frontmatter erbt der Subagent das Master-Modell —
+        # meist das teuerste (opus). Die forge-Defaults tragen alle
+        # `model: sonnet`; ein Override ohne die Zeile ist fast immer ein
+        # Versehen und der größte Kostentreiber eines Runs.
+        if not _frontmatter_has_model(src):
+            _log.warning(
+                "project agent override %s has no `model:` frontmatter — "
+                "the subagent inherits the master model (often the most "
+                "expensive one). Add e.g. `model: sonnet` to %s.",
+                name,
+                src,
+            )
+
+
+def _frontmatter_has_model(path: Path) -> bool:
+    """True, wenn die Subagent-Markdown ein ``model:``-Frontmatter-Feld trägt.
+
+    Lesefehler werden als True behandelt — die Funktion speist nur eine
+    Warnung, sie darf die Installation nie scheitern lassen.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    if not text.startswith("---"):
+        return False
+    end = text.find("\n---", 3)
+    if end == -1:
+        return False
+    return bool(re.search(r"^model\s*:", text[3:end], re.MULTILINE))
 
 
 def _augment_tools_for_multi_agent(allowed_tools: str | None) -> str:

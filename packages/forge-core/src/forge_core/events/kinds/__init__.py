@@ -34,6 +34,7 @@ from forge_core.events.kinds.proposal import (
     ProposalReceivedPayload,
     ProposalRequestedPayload,
 )
+from forge_core.events.kinds.resume import RunResumeScheduledPayload
 from forge_core.events.kinds.run import RunFinishedPayload, RunStartedPayload
 from forge_core.events.kinds.triage import IssueTriagedPayload, TriageDecision
 from forge_core.events.kinds.workitem import (
@@ -64,6 +65,7 @@ __all__ = [
     "ProposalRequestedPayload",
     "RiskLevel",
     "RunFinishedPayload",
+    "RunResumeScheduledPayload",
     "RunStartedPayload",
     "SubtaskStatus",
     "TriageDecision",

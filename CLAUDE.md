@@ -229,9 +229,11 @@ Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
 - Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
 - Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
 
-Vor jeder Schema-Änderung: `len(EventKind) == 18` und `len(_PAYLOAD_REGISTRY) == 18` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED`).
+Vor jeder Schema-Änderung: `len(EventKind) == 22` und `len(_PAYLOAD_REGISTRY) == 22` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22).
 
 `PlanProposed` steht auf Schema **1.1** (additiv: `subtasks: list[PlanSubtask]` + `agents_used: list[str]`). Alte 1.0-Events lesen weiter, weil beide Felder Defaults haben — siehe `test_plan_proposed_schema_is_v1_1_with_additive_fields`.
+
+`RunFinished` (1.1: Decision `rate_limited`), `ProposalReceived` (1.1: `session_id`) und `ConductorTickCompleted` (1.1: `scheduled_resume_count`) sind additiv gebumpt für die Session-Limit-Resilienz (s. u.).
 
 ## CodingAgent ist Plug-in, nicht Fundament
 
@@ -269,6 +271,16 @@ Drei gemessene Kostentreiber orchestrierter Runs (Analyse eines $19/57-min-Runs:
 - **„Zwei Runden max"** bei roter Verifikation/BLOCKING-Findings ist bewusst eine Prompt-Instruktion, **kein** vom Runner gezähltes Limit: die harte Ressourcen-Grenze sind Cost-Caps + `max_turns` (`_check_run_cost_cap`). Würde der Runner die Retry-Runden zählen, müsste er die Orchestrierungs-Schritte kennen → Mantra-3-Bruch.
 
 Ein einsamer `["developer"]` braucht keine Orchestrierung (`roster_needs_orchestration`) — das ist der klassische Single-Agent-Run (kein Task-Tool, kein Plan). Das alte `multi_agent: bool` bleibt rückwärtskompatibel (`True` = Default-Roster, `False` = `["developer"]`).
+
+### Session-Limit-Resilienz: erkennen → sichern → fortsetzen
+
+Läuft ein orchestrierter Run mitten in der Arbeit in ein Claude-Usage-/Session-Limit, ist das **kein** Fehlschlag, sondern ein **fortsetzbarer** Zustand. Das Signal ist tückisch: claude meldet es als `result`-Event mit `subtype: "success"` ABER `is_error: true` + `api_error_status: 429` und Text `"You've hit your session limit · resets <zeit>"`. Erkennung darum NICHT über `subtype`/returncode, sondern in `claude_cli._is_rate_limited` (`is_error` + 429, Text-Fallback). Drei Schichten, strikt getrennt (Mantra 3):
+
+1. **Erkennen & sichern (Loop 1, `claude_cli` + `runner`).** `propose()` wirft `CodingAgentRateLimited` (trägt `session_id` aus dem stream-json init-Event, `reset_at` via `_parse_reset_time` → nächste UTC-Occurrence der genannten Lokalzeit, echten `cost_usd`). Der Runner fängt sie **vor** `CodingAgentError`, bucht den echten Cost ein (sonst $0-Bug), beendet den Run als Decision **`rate_limited`** und ruft `_finish_rate_limited`: Partial-Arbeit als `forge: WIP`-Commit (`allow_empty=True`) sichern, **kein** `revert()`/`git clean -fdx`, Branch + Worktree bleiben. Anker als **`RunResumeScheduled`**-Event (original_run_id, resume_session_id, resume_at, resume_worktree, wip_commit, issue_number). `ProposalReceived` trägt jetzt `session_id` (Schema 1.1).
+2. **Fortsetzen (Loop 1 + CLI).** `forge run --resume <run_id>` lädt den Anker (`_load_resume_anchor`), der Runner dockt via `worktrees.attach()` an den eingefrorenen Worktree an (`base_commit` = WIP-HEAD, nicht Run-Start) und ruft `propose(resume_session_id=…)` → `claude --resume <id>` setzt die Session mit vollem Kontext fort. Ein übergebener `run_id` (statt frisch generiertem ULID) IST das Resume-Signal (`SequentialRunner(run_id=…)` → `_is_resume`). `resume_session_id` ist ein optionaler Param am `CodingAgent`-Protocol — Plug-in-safe, Agents ohne Resume ignorieren ihn.
+3. **Auto-warten & dispatchen (Loop 2 / Conductor).** Der Runner plant den Resume **nie selbst**. `conductor.derive_pending_resumes(events, now)` leitet fällige Resumes **rein aus dem Event-Strom** ab (analog `derive_signals`): jüngster `RunResumeScheduled` pro `run_id`, dessen `resume_at <= now` und der seither **kein** neues `RunStarted` (gleiche run_id, `ts >` Anker) hat — at-most-once, weil der synchrone Resume-Dispatch sofort ein frisches `RunStarted` derselben run_id emittiert. `resume_at == None` (Reset-Zeit unparsebar) = **nur manuell**, nie auto. Der board-loop-Conductor-Tick (`_run_conductor_watch` → `_dispatch_resume`) feuert fällige Resumes über denselben `execute_run --resume`-Pfad, zählt sie in `ConductorTickCompleted.scheduled_resume_count` (Schema 1.1).
+
+`tzdata` ist Pflicht-Dependency von forge-execute (Windows liefert keine IANA-DB; ohne sie wäre `reset_at` immer `None` → kein Auto-Resume). Tests: `test_rate_limit_resume.py` (Erkennung + Runner-Pfad + End-to-End-Resume), `test_conductor_resume.py` (pure Ableitung).
 
 ## Sicherheit — vier Schichten
 

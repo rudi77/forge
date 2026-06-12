@@ -41,6 +41,7 @@ RunDecision = Literal[
     "preflight_blocked",
     "guardrail_blocked",
     "self_terminated",
+    "rate_limited",
     "error",
 ]
 
@@ -60,4 +61,6 @@ class RunFinishedPayload(BaseModel):
 
 
 register_payload(EventKind.RUN_STARTED, RunStartedPayload, "1.0")
-register_payload(EventKind.RUN_FINISHED, RunFinishedPayload, "1.0")
+# 1.1 (additiv): RunDecision um "rate_limited" erweitert (Usage-Limit-Abbruch);
+# alte 1.0-Events lesen weiter, da der Decision-Wertebereich nur erweitert wurde.
+register_payload(EventKind.RUN_FINISHED, RunFinishedPayload, "1.1")

@@ -23,15 +23,17 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, TextIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from forge_execute._venv import venv_aware_env
 from forge_execute.agents.base import (
     CodingAgent,
     CodingAgentError,
+    CodingAgentRateLimited,
     CodingAgentTimeout,
     ProposalResult,
     ReviewResult,
@@ -187,6 +189,7 @@ class ClaudeCodeCLIAgent:
         model: str | None = None,
         allowed_tools: str | None = None,
         env: dict[str, str] | None = None,
+        resume_session_id: str | None = None,
     ) -> ProposalResult:
         # Multi-Agent: nur die Subagent-Markdowns des aktiven Rosters in den
         # Worktree kopieren, bevor Claude Code startet — dann werden sie via
@@ -216,6 +219,11 @@ class ClaudeCodeCLIAgent:
             "--disallowedTools",
             HEADLESS_DISALLOWED_TOOLS,
         ]
+        # Resume nach Usage-Limit (Inkr. 2): claude setzt die frühere Session
+        # mit vollem Kontext fort; der `prompt` ist die Continue-Anweisung und
+        # der Worktree enthält bereits die Partial-Arbeit des unterbrochenen Laufs.
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
         if self.multi_agent:
             cmd.extend(
                 ["--append-system-prompt", build_orchestrator_prompt(self.agents)]
@@ -279,6 +287,29 @@ class ClaudeCodeCLIAgent:
             )
 
         raw = _extract_result_event(lines)
+
+        # session_id früh ziehen — sie steht im init-`system`-Event (ab Start
+        # vorhanden) und nochmal im result-Event. Resume-Anker für alle Pfade.
+        session_id = _extract_session_id(lines) or (raw.get("session_id") or None)
+
+        # Usage-/Session-Limit (HTTP 429) ZUERST prüfen: claude meldet das als
+        # result-Event mit subtype "success" — aber is_error=true +
+        # api_error_status=429 (irreführend; NICHT über subtype/returncode
+        # erkennbar). Eigene Exception mit dem Resume-Anker, damit der Runner den
+        # Run als fortsetzbar festhält statt als generischen Fehler mit verlorenem
+        # Cost zu verbuchen. Muss VOR dem returncode-Check stehen, sonst greift
+        # darunter der generische CodingAgentError.
+        if _is_rate_limited(raw):
+            result_text = str(raw.get("result") or "").strip()
+            raise CodingAgentRateLimited(
+                f"claude hit a usage/session limit: {result_text[:200]} "
+                f"(stream log: {log_path})",
+                session_id=session_id,
+                reset_at=_parse_reset_time(result_text),
+                cost_usd=_extract_cost(raw),
+                turns_used=int(raw.get("num_turns", 0) or 0),
+                stream_log=str(log_path),
+            )
 
         # `error_max_turns`/`tool_use` sind Soft-Fails: claude hat das
         # turn-Limit erreicht, aber im Worktree LIEGEN evtl. fertige
@@ -348,6 +379,7 @@ class ClaudeCodeCLIAgent:
             plan_md=plan_md,
             agents_invoked=agents_invoked,
             stream_log=str(log_path),
+            session_id=session_id,
         )
 
     def review(
@@ -672,6 +704,79 @@ def _extract_result_event(lines: list[str]) -> dict[str, Any]:
         if isinstance(obj, dict) and obj.get("type") == "result":
             return obj
     return {}
+
+
+def _extract_session_id(lines: list[str]) -> str | None:
+    """Zieht die claude-``session_id`` aus dem stream-json.
+
+    Bevorzugt das erste Event mit ``session_id`` (das init-``system``-Event steht
+    ab Sekunde 1 fest). Resume-Anker für ``claude --resume``; None, wenn keine
+    ID im Stream auftaucht (Crash vor dem init-Event).
+    """
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("session_id"):
+            return str(obj["session_id"])
+    return None
+
+
+def _is_rate_limited(raw: dict[str, Any]) -> bool:
+    """Erkennt ein Claude-Usage-/Session-Limit (HTTP 429) im result-Event.
+
+    Das Signal ist tückisch: ``subtype`` bleibt ``"success"``, aber
+    ``is_error=true`` und ``api_error_status=429``. Fallback über den result-Text
+    (``"session limit"`` / ``"usage limit"`` / ``"resets"``), falls eine CLI-
+    Version den Status nicht mitliefert. Nur dann True, wenn überhaupt ein Fehler
+    vorliegt — ein normaler Erfolg wird nie als rate-limited fehlklassifiziert.
+    """
+    if not raw.get("is_error"):
+        return False
+    if raw.get("api_error_status") == 429:
+        return True
+    text = str(raw.get("result") or "").lower()
+    return "session limit" in text or "usage limit" in text or "resets" in text
+
+
+# "...resets 1pm (Europe/Vienna)" / "resets 09:30 (UTC)" / "resets 1 pm"
+_RESET_TIME_RE = re.compile(
+    r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?",
+    re.IGNORECASE,
+)
+
+
+def _parse_reset_time(text: str, *, now: datetime | None = None) -> datetime | None:
+    """Best-effort: parst ``"...resets 1pm (Europe/Vienna)"`` → nächster UTC-Zeitpunkt.
+
+    Liefert den **nächsten** Zeitpunkt mit dieser Lokalzeit (rollt auf morgen,
+    wenn die Uhrzeit heute schon vorbei ist). None, wenn der Text nicht parsebar
+    ist oder die Zeitzone unbekannt (z. B. fehlendes ``tzdata`` auf Windows) —
+    dann muss der Resume manuell ausgelöst werden. ``now`` ist für Tests injizierbar.
+    """
+    match = _RESET_TIME_RE.search(text or "")
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or "").lower()
+    tz_name = (match.group(4) or "").strip()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    try:
+        tz = ZoneInfo(tz_name) if tz_name else UTC
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    base = (now or datetime.now(UTC)).astimezone(tz)
+    target = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= base:
+        target = target + timedelta(days=1)
+    return target.astimezone(UTC)
 
 
 def _stage_untracked_for_diff(worktree: Path) -> None:

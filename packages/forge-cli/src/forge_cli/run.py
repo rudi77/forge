@@ -47,6 +47,34 @@ class RunOutcome:
     auto_merge_error: str | None = None
 
 
+_DEFAULT_RESUME_PROMPT = (
+    "Resume the previous run that was interrupted by a Claude usage/session "
+    "limit. Your earlier work is already present in this worktree (saved as a "
+    "`forge: WIP` commit). Inspect what you completed via `git log` and "
+    "`git diff`, then continue exactly where you left off until the task is done."
+)
+
+
+def _load_resume_anchor(ctx: ForgeContext, run_id: str) -> dict | None:
+    """Lädt den jüngsten ``RunResumeScheduled``-Anker eines Runs aus dem Store.
+
+    Liefert den Payload (resume_session_id, resume_at, resume_worktree,
+    wip_commit, …) oder ``None``, wenn der Run nie in ein Usage-Limit lief.
+    """
+    from forge_core.events import EventKind
+
+    store = ctx.open_store()
+    try:
+        anchors = [
+            e
+            for e in store.events_for_run(run_id)
+            if e.kind == EventKind.RUN_RESUME_SCHEDULED
+        ]
+    finally:
+        store.close()
+    return anchors[-1].payload if anchors else None
+
+
 def run_command(
     focus: Annotated[
         str | None,
@@ -196,6 +224,31 @@ def run_command(
             ),
         ),
     ] = False,
+    resume: Annotated[
+        str | None,
+        typer.Option(
+            "--resume",
+            help=(
+                "run_id eines vom Usage-/Session-Limit unterbrochenen Runs "
+                "fortsetzen (`claude --resume` im eingefrorenen Worktree). "
+                "Lädt den Anker aus dem Event-Store; --prompt optional als "
+                "Continue-Anweisung."
+            ),
+        ),
+    ] = None,
+    resume_session_id: Annotated[
+        str | None,
+        typer.Option(
+            "--resume-session-id",
+            help=(
+                "claude session_id explizit angeben (überschreibt/ersetzt den "
+                "gespeicherten Anker). Nötig, um einen Run fortzusetzen, der OHNE "
+                "RunResumeScheduled-Anker abbrach (z.B. vor diesem Feature) — die "
+                "session_id steht im stream-json-Log unter .forge/logs/<run_id>/. "
+                "Erfordert, dass der Worktree des Runs noch existiert."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Implementierung von `forge run`."""
     try:
@@ -222,6 +275,25 @@ def run_command(
     except typer.BadParameter as exc:
         err_console.print(f"[red]error[/red]: {exc}")
         raise typer.Exit(code=2) from None
+
+    # Resume: session_id aus dem Store-Anker ODER explizit via
+    # --resume-session-id (für Runs ohne Anker, z.B. vor diesem Feature). Ohne
+    # expliziten Prompt eine Continue-Anweisung als Default verwenden.
+    effective_session_id: str | None = resume_session_id
+    if resume is not None:
+        anchor = _load_resume_anchor(ctx, resume)
+        if anchor is not None and effective_session_id is None:
+            effective_session_id = anchor.get("resume_session_id")
+        if anchor is None and resume_session_id is None:
+            err_console.print(
+                f"[red]error[/red]: kein RunResumeScheduled-Anker für run_id "
+                f"{resume!r} im Store. Gib [bold]--resume-session-id <id>[/bold] an "
+                f"(steht im stream-json-Log unter .forge/logs/{resume}/), um den "
+                f"Run trotzdem fortzusetzen."
+            )
+            raise typer.Exit(code=2)
+        if rendered_prompt is None:
+            rendered_prompt = _DEFAULT_RESUME_PROMPT
 
     if rendered_prompt is None:
         err_console.print(
@@ -260,6 +332,8 @@ def run_command(
         pr_draft=pr_draft,
         auto_merge=auto_merge,
         announce=True,
+        resume_run_id=resume,
+        resume_session_id=effective_session_id,
     )
 
     _print_post_run_summary(outcome)
@@ -297,6 +371,8 @@ def execute_run(
     announce: bool = False,
     agents: list[str] | None = None,
     agent_timeout: int | None = None,
+    resume_run_id: str | None = None,
+    resume_session_id: str | None = None,
 ) -> RunOutcome:
     """Wie ``run_command``, aber ohne Typer-Layer und mit RunOutcome-Return.
 
@@ -378,7 +454,14 @@ def execute_run(
     blobs = ctx.open_blobs()
     outcome = RunOutcome(result=None)  # type: ignore[arg-type]
     try:
-        runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+        runner = SequentialRunner(
+            config=config,
+            agent=agent,
+            store=store,
+            blobs=blobs,
+            run_id=resume_run_id,
+            resume_session_id=resume_session_id,
+        )
         outcome.result = runner.run()
 
         if create_pr and outcome.result.decision == "pr_created":

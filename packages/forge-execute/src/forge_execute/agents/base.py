@@ -12,6 +12,7 @@ sync. Async wird relevant in v2 (Population-Strategie).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -23,6 +24,38 @@ class CodingAgentError(RuntimeError):
 
 class CodingAgentTimeout(CodingAgentError):
     """Agent-Aufruf hat Budget oder Wallclock überschritten."""
+
+
+class CodingAgentRateLimited(CodingAgentError):
+    """Agent traf ein Claude-Usage-/Session-Limit (HTTP 429).
+
+    Kein gewöhnlicher Fehler: der Worktree enthält i. d. R. Partial-Arbeit, und
+    die claude-``session_id`` erlaubt ein späteres ``claude --resume``. Die
+    Exception trägt den **Resume-Anker** (session_id, reset_at, echter Cost),
+    damit der Runner ihn als ``RunResumeScheduled`` festhalten kann — statt den
+    Run als ``no_improvement`` mit verlorenem Cost zu verbuchen.
+
+    Subklasse von :class:`CodingAgentError`, damit bestehende
+    ``except CodingAgentError`` weiter als Fallback greifen; der Runner fängt
+    sie aber spezifischer ab.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        session_id: str | None,
+        reset_at: datetime | None,
+        cost_usd: Decimal,
+        turns_used: int = 0,
+        stream_log: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+        self.reset_at = reset_at
+        self.cost_usd = cost_usd
+        self.turns_used = turns_used
+        self.stream_log = stream_log
 
 
 @dataclass(frozen=True)
@@ -85,6 +118,9 @@ class ProposalResult:
     ``{"ts", "event"}`` pro claude-Event). Lebt unter ``.forge/logs/<run_id>/``
     und überlebt DISCARD/Timeout — primäre Diagnosequelle, wenn ein Run lange
     braucht oder gekappt wird. None bei Agents ohne Streaming (Mock)."""
+    session_id: str | None = None
+    """claude-``session_id`` dieses Aufrufs (aus dem stream-json init-/result-
+    Event). Resume-Anker für ``claude --resume``; None bei Agents ohne Streaming."""
 
     @property
     def has_changes(self) -> bool:
@@ -110,8 +146,14 @@ class CodingAgent(Protocol):
         model: str | None = None,
         allowed_tools: str | None = None,
         env: dict[str, str] | None = None,
+        resume_session_id: str | None = None,
     ) -> ProposalResult:
-        """Schickt einen Vorschlag an den Agent. Modifiziert den Worktree."""
+        """Schickt einen Vorschlag an den Agent. Modifiziert den Worktree.
+
+        ``resume_session_id`` setzt einen früheren, vom Usage-Limit
+        unterbrochenen Lauf fort (agent-spezifisch, z. B. ``claude --resume``).
+        Agents ohne Resume-Fähigkeit ignorieren den Parameter.
+        """
         ...
 
     def review(

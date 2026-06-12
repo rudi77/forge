@@ -32,6 +32,9 @@ class TickResult:
     skipped: int = 0
     """Übersprungene Items (z.B. Triage-Filter)."""
 
+    scheduled_resume_count: int = 0
+    """Fällige Resume-Dispatches (vom Usage-Limit unterbrochene Runs)."""
+
     bailed: bool = False
     """True, wenn der Board-Pass abbrach (Cost-Cap/Guardrail/Fehler)."""
 

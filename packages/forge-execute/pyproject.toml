@@ -8,6 +8,9 @@ dependencies = [
     "pydantic>=2.7",
     "anyio>=4.4",
     "pathspec>=0.12",
+    # IANA-Zeitzonen-DB für zoneinfo — Windows liefert sie nicht mit, wird aber
+    # für das Parsen der Limit-Reset-Zeit ("resets 1pm (Europe/Vienna)") gebraucht.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

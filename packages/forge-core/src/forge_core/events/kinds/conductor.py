@@ -42,7 +42,12 @@ class ConductorTickCompletedPayload(BaseModel):
     bailed: bool = False
     """True, wenn der Board-Pass abbrach (Cost-Cap/Guardrail/Fehler)."""
 
+    scheduled_resume_count: int = Field(default=0, ge=0)
+    """Wie viele vom Usage-/Session-Limit unterbrochene Runs in diesem Tick
+    fällig waren und per ``forge run --resume`` wieder angestoßen wurden."""
 
+
+# 1.1 (additiv): scheduled_resume_count ergänzt — alte 1.0-Events lesen weiter.
 register_payload(
-    EventKind.CONDUCTOR_TICK_COMPLETED, ConductorTickCompletedPayload, "1.0"
+    EventKind.CONDUCTOR_TICK_COMPLETED, ConductorTickCompletedPayload, "1.1"
 )

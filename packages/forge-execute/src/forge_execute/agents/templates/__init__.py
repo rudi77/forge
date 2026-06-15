@@ -151,7 +151,14 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
     else:
         subtask_src = "the task"
 
-    sub_lines = [f"{n}. For each subtask in {subtask_src}, in order:"]
+    sub_lines = [
+        f"{n}. Work the subtasks in {subtask_src}. Subtasks that touch "
+        "DISJOINT files and have no data dependency on each other may run in "
+        "PARALLEL: issue several **developer** Task calls in a SINGLE message "
+        "and let them run concurrently. Subtasks that share files or depend on "
+        "a prior subtask's output run in dependency order. For each subtask (or "
+        "each parallel batch):"
+    ]
     letter = ord("a")
     if has_tester:
         sub_lines.append(
@@ -162,7 +169,7 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
     sub_lines.append(
         f"   {chr(letter)}. Call the **developer** subagent"
         + (" with the subtask number" if has_architect else "")
-        + "."
+        + " (one developer per subtask; batch independent ones in one message)."
     )
     letter += 1
     if has_architect:
@@ -252,6 +259,12 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
         "incremental build — e.g. skip a rebuild when nothing compiled "
         "changed). The FULL suite runs exactly once, at the final "
         "verification step.",
+        "- **Parallel safety:** all subagents share ONE worktree. Run "
+        "developers concurrently ONLY when their subtasks edit disjoint files "
+        "and neither needs the other's output — otherwise serialize. Never let "
+        "two developers write the same file in the same batch (lost-update "
+        "race). A subtask's tester waits for that subtask's developer. When in "
+        "doubt, serialize: a correct slow run beats a corrupted fast one.",
         "- **Headless run:** there is no operator to ask — interactive "
         "questions (AskUserQuestion or similar) are auto-denied and burn a "
         "full turn. Choose the spec-faithful default instead and record it"

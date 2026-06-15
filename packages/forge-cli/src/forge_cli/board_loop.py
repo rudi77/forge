@@ -1068,34 +1068,48 @@ def _run_conductor_watch(
             def _run_order(order: DispatchOrder) -> _PassResult | None:
                 """Effektiert EINEN DispatchOrder (Team nach Stage). Thread-safe:
                 Worktree pro Run isoliert, Event-Writes über den geteilten,
-                RLock-serialisierten ``store``."""
-                issue = by_number.get(order.number)
-                if issue is None:
-                    return None
-                # design → architect-Run (Plan, kein PR); qa → Review-Merge-Agent
-                # (PRReviewed/PRMerged, kein neuer PR); sonst → Dev-Loop (PR).
-                if order.stage == Stage.DESIGN:
-                    return _dispatch_design_run(
-                        ctx=ctx, issue=issue, params=params, store=store
-                    )
-                if order.stage == Stage.QA:
-                    pr_num = pr_number_for_issue(events, order.number)
-                    if pr_num is None:
-                        err_console.print(
-                            f"[yellow]skip[/yellow] qa #{order.number}: kein offener PR gefunden"
-                        )
+                RLock-serialisierten ``store``.
+
+                Fängt jede Exception ab und gibt sie als ``bailed``-Result
+                zurück — ein einzelner kaputter Run darf den parallelen Tick
+                (``pool.map`` re-raised sonst) und damit den Heartbeat nicht
+                killen."""
+                try:
+                    issue = by_number.get(order.number)
+                    if issue is None:
                         return None
-                    return _dispatch_review_run(
-                        ctx=ctx, issue=issue, pr_number=pr_num, params=params, store=store
+                    # design → architect-Run (Plan, kein PR); qa → Review-Merge-Agent
+                    # (PRReviewed/PRMerged, kein neuer PR); sonst → Dev-Loop (PR).
+                    if order.stage == Stage.DESIGN:
+                        return _dispatch_design_run(
+                            ctx=ctx, issue=issue, params=params, store=store
+                        )
+                    if order.stage == Stage.QA:
+                        pr_num = pr_number_for_issue(events, order.number)
+                        if pr_num is None:
+                            err_console.print(
+                                f"[yellow]skip[/yellow] qa #{order.number}: kein offener PR gefunden"
+                            )
+                            return None
+                        return _dispatch_review_run(
+                            ctx=ctx, issue=issue, pr_number=pr_num, params=params, store=store
+                        )
+                    return _dispatch_issues(
+                        ctx=ctx,
+                        issues=[issue],
+                        params=params,
+                        triager=triager,
+                        capabilities=capabilities,
+                        store=store,
                     )
-                return _dispatch_issues(
-                    ctx=ctx,
-                    issues=[issue],
-                    params=params,
-                    triager=triager,
-                    capabilities=capabilities,
-                    store=store,
-                )
+                except Exception as exc:
+                    err_console.print(
+                        f"[red]error[/red] dispatching #{order.number} "
+                        f"({order.stage.value}): {exc}"
+                    )
+                    return _PassResult(
+                        summaries=[], bailed=True, dispatched=0, skipped=0
+                    )
 
             # Bei capacity>1 werden die Dispatch-Orders nebenläufig effektiert.
             # run_conductor_tick ruft set_stage (alle Übergänge) VOR dispatch —

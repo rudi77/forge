@@ -575,7 +575,7 @@ def summarize_ci(rollup: list[dict[str, Any]]) -> str:
                 return "fail"
             if state in {"PENDING"}:
                 saw_pending = True
-            elif state in _CI_PASS or state == "SUCCESS":
+            elif state in _CI_PASS:
                 saw_pass = True
             else:
                 saw_pending = True

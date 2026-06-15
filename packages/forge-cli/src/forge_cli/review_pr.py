@@ -84,6 +84,7 @@ def execute_pr_review(
     model: str | None = None,
     gh_bin: str = "gh",
     issue_body: str | None = None,
+    allow_missing_ci: bool = False,
     dry_run: bool = False,
     store=None,
 ) -> PRReviewRunOutcome:
@@ -126,6 +127,7 @@ def execute_pr_review(
         ci_status=meta.ci_status,
         threshold=eff_threshold,
         capability_enabled=capability_enabled and merge,
+        allow_missing_ci=allow_missing_ci,
     )
     # Konflikt-Guard: GitHub meldet CONFLICTING → niemals mergen.
     if decision.merge and meta.mergeable == "CONFLICTING":
@@ -271,6 +273,16 @@ def review_pr_command(
     method: Annotated[
         str, typer.Option("--method", help="Merge-Methode: squash|merge|rebase.")
     ] = "squash",
+    allow_missing_ci: Annotated[
+        bool,
+        typer.Option(
+            "--allow-missing-ci",
+            help=(
+                "Erlaubt Merge auch ohne konfigurierte CI-Checks (ci_status "
+                "'none'). Default: aus — ohne grünen CI wird nicht gemergt."
+            ),
+        ),
+    ] = False,
     delete_branch: Annotated[
         bool, typer.Option("--delete-branch/--keep-branch", help="Branch nach Merge löschen.")
     ] = True,
@@ -285,6 +297,8 @@ def review_pr_command(
     ] = False,
 ) -> None:
     """Reviewt einen offenen PR mit einem Agent und merged ihn opt-in."""
+    if method not in ("squash", "merge", "rebase"):
+        raise typer.BadParameter("--method must be one of: squash, merge, rebase")
     try:
         ctx = load_context(spec_path=spec_path)
     except ContextError as exc:
@@ -314,6 +328,7 @@ def review_pr_command(
             model=model,
             gh_bin=gh_bin,
             issue_body=issue_body,
+            allow_missing_ci=allow_missing_ci,
             dry_run=dry_run,
         )
     except (ContextError, GitHubError) as exc:

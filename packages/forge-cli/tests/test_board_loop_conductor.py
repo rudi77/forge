@@ -276,6 +276,34 @@ def test_conductor_parallel_dispatches_two_ready_items(
     assert sorted(dispatched) == [5, 6]
 
 
+def test_conductor_parallel_worker_exception_does_not_crash_tick(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # Ein Dispatch wirft → der parallele Tick (pool.map) darf NICHT den
+    # Heartbeat killen; der Fehler wird als bailed-Result eingesammelt.
+    ctx = _make_ctx(tmp_path)
+    monkeypatch.setattr(
+        bl,
+        "list_stage_items",
+        lambda **k: [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
+    )
+    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+
+    def boom(**k):
+        raise RuntimeError("dispatch exploded")
+
+    monkeypatch.setattr(bl, "_dispatch_issues", boom)
+
+    # Darf nicht propagieren — Heartbeat läuft den Tick zu Ende.
+    stats = bl._run_conductor_watch(
+        ctx=ctx, repo_owner="x", repo_name="y", max_issues=3, interval_s=0,
+        params=_params(), triager=None, capabilities=None, max_ticks=1,
+        max_parallel=2,
+    )
+    assert stats.ticks == 1
+    assert stats.total_dispatched == 0  # beide Dispatches scheiterten
+
+
 def test_conductor_qa_stage_dispatches_review_run(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

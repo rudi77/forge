@@ -47,14 +47,16 @@ def _ctx(tmp_path: Path, *, merge_pr: bool) -> _Ctx:
                 store_path=tmp_path / "events.duckdb")
 
 
-_PR_JSON = (
-    '{{"number": 7, "title": "Fix bug", "body": "Closes #1", "state": "OPEN", '
-    '"baseRefName": "main", "headRefName": "forge/x", "mergeable": "{mergeable}", '
-    '"statusCheckRollup": [{{"status": "COMPLETED", "conclusion": "{ci}"}}]}}'
-)
+def _pr_json(*, mergeable: str, ci: str, no_ci: bool) -> str:
+    rollup = "[]" if no_ci else f'[{{"status": "COMPLETED", "conclusion": "{ci}"}}]'
+    return (
+        f'{{"number": 7, "title": "Fix bug", "body": "Closes #1", "state": "OPEN", '
+        f'"baseRefName": "main", "headRefName": "forge/x", "mergeable": "{mergeable}", '
+        f'"statusCheckRollup": {rollup}}}'
+    )
 
 
-def _fake_gh(*, mergeable: str = "MERGEABLE", ci: str = "SUCCESS"):
+def _fake_gh(*, mergeable: str = "MERGEABLE", ci: str = "SUCCESS", no_ci: bool = False):
     """run_subprocess-Fake, der nach gh-Subcommand verzweigt."""
     calls: list[list[str]] = []
 
@@ -62,7 +64,7 @@ def _fake_gh(*, mergeable: str = "MERGEABLE", ci: str = "SUCCESS"):
         calls.append(list(cmd))
         joined = " ".join(cmd)
         if "pr view" in joined or ("view" in cmd and "pr" in cmd):
-            out = _PR_JSON.format(mergeable=mergeable, ci=ci)
+            out = _pr_json(mergeable=mergeable, ci=ci, no_ci=no_ci)
             return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
         if "diff" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="--- a\n+++ b\n", stderr="")
@@ -133,6 +135,28 @@ def test_review_does_not_merge_when_ci_red(tmp_path: Path) -> None:
     )
     assert out.merged is False
     assert out.merge_decision.reason == "ci_not_green:fail"
+
+
+def test_review_no_ci_blocks_merge_by_default(tmp_path: Path) -> None:
+    # Repo ohne Checks (ci_status "none") → kein Merge, solange allow_missing_ci
+    # nicht gesetzt ist (Safety-Default: ohne grünen CI wird nicht gemergt).
+    ctx = _ctx(tmp_path, merge_pr=True)
+    out = execute_pr_review(
+        ctx, pr_number=7, agent=_agent(0.95, "pass"),
+        run_subprocess=_fake_gh(no_ci=True), threshold=0.8,
+    )
+    assert out.ci_status == "none"
+    assert out.merged is False
+    assert out.merge_decision.reason == "ci_not_green:none"
+
+
+def test_review_no_ci_merges_when_explicitly_allowed(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path, merge_pr=True)
+    out = execute_pr_review(
+        ctx, pr_number=7, agent=_agent(0.95, "pass"),
+        run_subprocess=_fake_gh(no_ci=True), threshold=0.8, allow_missing_ci=True,
+    )
+    assert out.merged is True
 
 
 def test_review_request_changes_blocks_merge(tmp_path: Path) -> None:

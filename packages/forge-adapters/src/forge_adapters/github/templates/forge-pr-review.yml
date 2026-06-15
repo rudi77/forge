@@ -1,0 +1,80 @@
+name: forge — agent PR review + merge
+
+# Reaktive Schicht (Inkrement 1c) zum deterministischen Conductor-QA-Pfad:
+# Sobald ein forge:auto-PR geöffnet/aktualisiert wird ODER seine Checks
+# fertig sind, lässt ein Agent ihn reviewen (`forge review-pr`). Bei
+# `synchronize` (neue Commits auf einen `request_changes`-PR) wird so erneut
+# reviewt — das deckt den Fall ab, den der Conductor wegen `review_done`
+# bewusst NICHT re-dispatcht.
+#
+# Der Merge selbst bleibt opt-in: forge merged nur, wenn `capabilities.merge_pr`
+# in der project.yaml auf `true` steht UND der Agent `approve` gibt UND der CI
+# grün ist. Steht merge_pr auf false (Default), reviewt der Workflow nur.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  forge-review:
+    # Nur forge:auto-PRs; bei check_suite über die assoziierten PRs iterieren.
+    if: >-
+      ${{ (github.event_name == 'pull_request'
+           && contains(github.event.pull_request.labels.*.name, 'forge:auto'))
+       || (github.event_name == 'check_suite'
+           && github.event.check_suite.conclusion == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: forge-review-${{ github.event.pull_request.number || github.event.check_suite.id }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv + forge + claude
+        run: |
+          pip install uv
+          uv pip install --system forge-cli
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Resolve target PR numbers
+        id: prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "numbers=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          else
+            # check_suite: alle assoziierten, offenen forge:auto-PRs.
+            nums=$(gh pr list --state open --label 'forge:auto' \
+              --json number --jq '[.[].number] | join(" ")')
+            echo "numbers=$nums" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Agent review (+ opt-in merge)
+        if: ${{ steps.prs.outputs.numbers != '' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for n in ${{ steps.prs.outputs.numbers }}; do
+            echo "::group::forge review-pr #$n"
+            forge review-pr "$n" --model sonnet || echo "review of #$n failed (non-fatal)"
+            echo "::endgroup::"
+          done

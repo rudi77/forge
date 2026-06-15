@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,14 @@ class GitError(RuntimeError):
 
 class PatchApplyError(GitError):
     """`git apply` ist fehlgeschlagen — der Diff passt nicht auf den Worktree."""
+
+
+# `git worktree add/remove/prune` nimmt einen kurzen Lock auf die gemeinsame
+# `.git/worktrees`-Metadaten des Haupt-Repos. Bei parallelem board-loop
+# (mehrere Runs gleichzeitig) können nebenläufige Adds daran kollidieren — daher
+# serialisieren wir NUR die schnelle git-worktree-Operation (nicht den Run) über
+# einen prozess-globalen Lock. Single-Thread-Betrieb ist davon unberührt.
+_WORKTREE_GIT_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -76,7 +85,8 @@ class WorktreeManager:
         base_commit = self._rev_parse(base_ref)
 
         cmd = ["git", "worktree", "add", "-b", branch, str(path), base_commit]
-        result = self._run(cmd, cwd=self.repo_root)
+        with _WORKTREE_GIT_LOCK:
+            result = self._run(cmd, cwd=self.repo_root)
         if result.returncode != 0:
             raise GitError(
                 f"git worktree add failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -128,15 +138,16 @@ class WorktreeManager:
         """
         # `git worktree remove --force` räumt auch dann auf, wenn der Worktree
         # uncommittete Änderungen hat (z.B. mid-mutation ein Crash).
-        result = self._run(
-            ["git", "worktree", "remove", "--force", str(worktree.path)],
-            cwd=self.repo_root,
-        )
-        if result.returncode != 0:
-            # Fallback: Verzeichnis manuell entfernen + prune
-            if worktree.path.exists():
-                shutil.rmtree(worktree.path, ignore_errors=True)
-            self._run(["git", "worktree", "prune"], cwd=self.repo_root)
+        with _WORKTREE_GIT_LOCK:
+            result = self._run(
+                ["git", "worktree", "remove", "--force", str(worktree.path)],
+                cwd=self.repo_root,
+            )
+            if result.returncode != 0:
+                # Fallback: Verzeichnis manuell entfernen + prune
+                if worktree.path.exists():
+                    shutil.rmtree(worktree.path, ignore_errors=True)
+                self._run(["git", "worktree", "prune"], cwd=self.repo_root)
 
     def cleanup_branch(self, worktree: Worktree) -> None:
         """Optional: löscht den Branch nach Cleanup."""

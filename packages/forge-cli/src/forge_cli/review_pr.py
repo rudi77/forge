@@ -85,6 +85,7 @@ def execute_pr_review(
     gh_bin: str = "gh",
     issue_body: str | None = None,
     dry_run: bool = False,
+    store=None,
 ) -> PRReviewRunOutcome:
     """Reviewed (und merged opt-in) einen offenen PR. Effektiert via Events.
 
@@ -158,7 +159,8 @@ def execute_pr_review(
         except GitHubError as exc:
             result.review_post_error = str(exc)
 
-    store = ctx.open_store()
+    owns_store = store is None
+    store = store if store is not None else ctx.open_store()
     try:
         if decision.merge:
             try:
@@ -224,7 +226,8 @@ def execute_pr_review(
             )
         )
     finally:
-        store.close()
+        if owns_store:
+            store.close()
 
     return result
 

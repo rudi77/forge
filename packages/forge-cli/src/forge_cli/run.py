@@ -22,6 +22,7 @@ from forge_adapters.github import (
     queue_auto_merge,
     render_pr_body,
 )
+from forge_core.store import EventStore
 from forge_execute.agents import ClaudeCodeCLIAgent, MockCodingAgent
 from forge_execute.runner import RunConfig, RunResult, SequentialRunner
 from rich.panel import Panel
@@ -373,6 +374,7 @@ def execute_run(
     agent_timeout: int | None = None,
     resume_run_id: str | None = None,
     resume_session_id: str | None = None,
+    store: EventStore | None = None,
 ) -> RunOutcome:
     """Wie ``run_command``, aber ohne Typer-Layer und mit RunOutcome-Return.
 
@@ -450,7 +452,11 @@ def execute_run(
     if announce:
         _print_pre_run_summary(config, ctx)
 
-    store = ctx.open_store()
+    # Bei parallelem board-loop teilen sich alle Runs EINE EventStore-Connection
+    # (DuckDB: eine Connection, Writes RLock-serialisiert). Dann gehört der Store
+    # dem Caller — nicht hier schließen.
+    owns_store = store is None
+    store = store if store is not None else ctx.open_store()
     blobs = ctx.open_blobs()
     outcome = RunOutcome(result=None)  # type: ignore[arg-type]
     try:
@@ -483,7 +489,8 @@ def execute_run(
                 except GitHubError as exc:
                     outcome.auto_merge_error = str(exc)
     finally:
-        store.close()
+        if owns_store:
+            store.close()
 
     return outcome
 

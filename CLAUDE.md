@@ -106,6 +106,12 @@ uv run forge doctor --spec examples/pinta/.forge/project.yaml
 
 Single-row INSERT via Python-Binding kostet ~12 ms each, auch in-Memory. Das ist ein bekanntes Issue von DuckDB; nicht versuchen, mit Indexes oder PRAGMA zu fighten. Für Bulk → `executemany`. Für Tests, die Zeit messen, statt 1000 Events lieber 10 nehmen.
 
+### DuckDB Single-Writer: Threads ja, Prozesse nein
+
+DuckDB nimmt einen **Datei-Lock pro Prozess**: zwei *Prozesse* können dieselbe `.duckdb` nicht gleichzeitig read-write öffnen. *Innerhalb* eines Prozesses sind mehrere Connections erlaubt, aber eine einzelne Connection ist nicht nebenläufig benutzbar. Deshalb ist `EventStore` seit dem Parallel-board-loop **thread-sicher**: ein `threading.RLock` serialisiert alle `_conn`-Zugriffe (`store.py`). Der parallele Conductor (`--max-parallel N`) teilt **eine** `EventStore`-Instanz über alle Worker-Threads — Writes serialisieren über den Lock (~ms, vernachlässigbar gegen Minuten-Runs). Echte Subprozess-Parallelität (mehrere `forge run`-Prozesse) ginge wegen des Datei-Locks **nicht** ohne Single-Writer-Daemon oder per-Run-Event-Sinks + Merge — bewusst nicht in dieser Stufe (eigener großer Schritt, v2/M2). Wer parallel arbeitet, reicht den geteilten Store in `execute_run`/`execute_pr_review` über den `store=`-Parameter herein (default `None` = öffnet/schließt selbst, unveränderter Single-Pass-Pfad).
+
+Worktree-Create/Remove (`git worktree add/remove`) nimmt einen kurzen Lock auf die `.git/worktrees`-Metadaten — parallele Adds würden kollidieren. `worktrees.py` serialisiert NUR diese schnelle git-Operation über `_WORKTREE_GIT_LOCK` (prozess-global), nicht den Run.
+
 ### Conductor / Heartbeat ist Loop 2 — über der Loop, nie darin
 
 Die Fabrik-Orchestrierung (`board-loop --watch`) lebt in `forge-cli`

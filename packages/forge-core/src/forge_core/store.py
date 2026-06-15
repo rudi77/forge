@@ -4,14 +4,18 @@ Eine append-only `events`-Tabelle plus indizierte Views auf häufig gefragte
 Aggregationen (Spec Teil 4.3). DuckDB schluckt 100M+ Events ohne Server, hat
 First-Class-JSON-Support, exportiert nach Parquet für spätere Aggregation.
 
-Lokale Datei: `.forge/events.duckdb` per Default. Geöffnet wird die DB on-demand;
-mehrere Prozesse können nicht gleichzeitig schreiben (DuckDB-Limitation), aber für
-v1 läuft nur ein forge-Prozess pro Repo.
+Lokale Datei: `.forge/events.duckdb` per Default. Mehrere **Prozesse** können
+nicht gleichzeitig auf dieselbe DB schreiben (DuckDB-Datei-Lock pro Prozess).
+Mehrere **Threads** im selben Prozess teilen sich eine `EventStore`-Instanz; alle
+`_conn`-Zugriffe sind über einen `RLock` serialisiert (eine DuckDB-Connection ist
+nicht nebenläufig benutzbar). So kann der board-loop mehrere Runs parallel
+fahren, ohne dass die Event-Writes kollidieren.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -250,12 +254,16 @@ class EventStore:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-entrant, weil append_many BEGIN/COMMIT um mehrere _conn-Calls legt
+        # und Reads sich in Writes verschachteln können sollen.
+        self._lock = threading.RLock()
         self._conn: duckdb.DuckDBPyConnection = duckdb.connect(str(self.db_path))
         self._init_schema()
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
 
     def __enter__(self) -> EventStore:
         return self
@@ -296,7 +304,8 @@ class EventStore:
 
     def append(self, event: Event) -> None:
         """Schreibt ein einzelnes Event. Idempotent über `event_id`."""
-        self._conn.execute(self._INSERT_SQL, _event_to_row(event))
+        with self._lock:
+            self._conn.execute(self._INSERT_SQL, _event_to_row(event))
 
     def append_many(self, events: list[Event]) -> None:
         """Bulk-Insert via DuckDB `executemany`.
@@ -308,38 +317,42 @@ class EventStore:
         """
         if not events:
             return
-        conn = self._conn
         rows = [_event_to_row(evt) for evt in events]
-        conn.execute("BEGIN TRANSACTION")
-        try:
-            conn.executemany(self._INSERT_SQL, rows)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        with self._lock:
+            conn = self._conn
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.executemany(self._INSERT_SQL, rows)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     # --- Reads ----------------------------------------------------------
 
     def count(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM events").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM events").fetchone()
         return int(row[0]) if row else 0
 
     def events_for_run(self, run_id: str) -> list[Event]:
-        cur = self._conn.execute(
-            "SELECT * FROM events WHERE run_id = ? ORDER BY ts ASC, event_id ASC",
-            [run_id],
-        )
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM events WHERE run_id = ? ORDER BY ts ASC, event_id ASC",
+                [run_id],
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
         return [_row_to_event(dict(zip(cols, r, strict=True))) for r in rows]
 
     def events_by_kind(self, kind: EventKind, *, limit: int = 1000) -> list[Event]:
-        cur = self._conn.execute(
-            "SELECT * FROM events WHERE kind = ? ORDER BY ts DESC LIMIT ?",
-            [kind.value, limit],
-        )
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM events WHERE kind = ? ORDER BY ts DESC LIMIT ?",
+                [kind.value, limit],
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
         return [_row_to_event(dict(zip(cols, r, strict=True))) for r in rows]
 
     def referenced_artifact_hashes(self, *, since_days: int | None = None) -> set[str]:
@@ -352,7 +365,8 @@ class EventStore:
         params: list[Any] = []
         if since_days is not None:
             sql += f" WHERE ts >= now() - INTERVAL '{int(since_days)} days'"
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         out: set[str] = set()
         for (artifacts_json,) in rows:
             if not artifacts_json:
@@ -368,9 +382,10 @@ class EventStore:
 
     def query(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
         """Read-only SQL für `forge analyze`. Liefert Liste von Dicts."""
-        cur = self._conn.execute(sql, params or [])
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
+        with self._lock:
+            cur = self._conn.execute(sql, params or [])
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r, strict=True)) for r in rows]
 
 

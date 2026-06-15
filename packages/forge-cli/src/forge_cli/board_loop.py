@@ -21,6 +21,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +44,7 @@ from forge_core.events import (
     WorkItemStageChangedPayload,
     build_event,
 )
+from forge_core.store import EventStore
 from forge_execute.capabilities import Capabilities
 from forge_execute.triage import (
     IssueTriager,
@@ -215,10 +217,22 @@ def board_loop_command(
                 "abzuarbeiten, fährt forge die Stage-State-Machine über alle "
                 "`forge:`-Stage-Labels — Übergänge (design→ready→in-dev→qa→"
                 "release), Dependency-Reihenfolge (`Depends-On: #N` im Body) "
-                "und Dispatch mit Kapazität 1."
+                "und Dispatch mit Kapazität --max-parallel."
             ),
         ),
     ] = False,
+    max_parallel: Annotated[
+        int,
+        typer.Option(
+            "--max-parallel",
+            help=(
+                "Conductor-Kapazität (nur --conductor): bis zu N Runs pro Tick "
+                "nebenläufig (eigener Worktree je Run, geteilter Event-Store). "
+                "Default 1 = sequenziell wie bisher."
+            ),
+            min=1,
+        ),
+    ] = 1,
 ) -> None:
     """Pull ready issues from the configured GitHub Project, dispatch each
     via the standard issue_label trigger pipeline."""
@@ -281,17 +295,34 @@ def board_loop_command(
                 "Spec."
             )
             raise typer.Exit(code=2)
-        watch_fn = _run_conductor_watch if conductor else _run_watch
-        stats = watch_fn(
-            ctx=ctx,
-            repo_owner=repo_owner,
-            repo_name=repo_name,
-            max_issues=max_issues,
-            interval_s=interval,
-            params=params,
-            triager=triager,
-            capabilities=capabilities,
-        )
+        if max_parallel > 1 and not conductor:
+            err_console.print(
+                "[red]error[/red]: --max-parallel > 1 braucht --conductor."
+            )
+            raise typer.Exit(code=2)
+        if conductor:
+            stats = _run_conductor_watch(
+                ctx=ctx,
+                repo_owner=repo_owner,
+                repo_name=repo_name,
+                max_issues=max_issues,
+                interval_s=interval,
+                params=params,
+                triager=triager,
+                capabilities=capabilities,
+                max_parallel=max_parallel,
+            )
+        else:
+            stats = _run_watch(
+                ctx=ctx,
+                repo_owner=repo_owner,
+                repo_name=repo_name,
+                max_issues=max_issues,
+                interval_s=interval,
+                params=params,
+                triager=triager,
+                capabilities=capabilities,
+            )
         console.print(
             f"\n[bold]heartbeat gestoppt[/bold] ({stats.stopped_reason}) — "
             f"{stats.ticks} Ticks, {stats.total_dispatched} Runs dispatcht."
@@ -389,6 +420,7 @@ def _dispatch_issues(
     params: _DispatchParams,
     triager: IssueTriager | None,
     capabilities: Capabilities | None,
+    store: EventStore | None = None,
 ) -> _PassResult:
     """Arbeitet eine Liste ready-Issues ab (Triage → execute_run → Summary).
 
@@ -409,6 +441,7 @@ def _dispatch_issues(
                 issue=issue,
                 triager=triager,
                 capabilities=capabilities,
+                store=store,
             )
             if not triage_outcome.dispatch:
                 summaries.append(triage_outcome.summary_row)
@@ -457,6 +490,7 @@ def _dispatch_issues(
                 pr_draft=False,
                 auto_merge=params.auto_merge,
                 announce=False,
+                store=store,
             )
         except Exception as exc:
             summaries.append(
@@ -496,6 +530,7 @@ def _dispatch_design_run(
     ctx: ForgeContext,
     issue: ReadyIssue,
     params: _DispatchParams,
+    store: EventStore | None = None,
 ) -> _PassResult:
     """Dispatcht den **Design-Stage**-Run eines Work-Items (Team = architect).
 
@@ -542,6 +577,7 @@ def _dispatch_design_run(
             pr_draft=False,
             auto_merge=False,
             announce=False,
+            store=store,
         )
     except Exception as exc:
         err_console.print(
@@ -587,6 +623,7 @@ def _dispatch_resume(
     order: ResumeOrder,
     params: _DispatchParams,
     issue: ReadyIssue | None,
+    store: EventStore | None = None,
 ) -> _PassResult:
     """Setzt einen vom Usage-/Session-Limit unterbrochenen Run fort (Loop 2).
 
@@ -631,6 +668,7 @@ def _dispatch_resume(
             announce=False,
             resume_run_id=order.run_id,
             resume_session_id=order.resume_session_id,
+            store=store,
         )
     except Exception as exc:
         err_console.print(f"[red]error[/red] resuming run {order.run_id}: {exc}")
@@ -801,6 +839,7 @@ def _dispatch_review_run(
     issue: ReadyIssue,
     pr_number: int,
     params: _DispatchParams,
+    store: EventStore | None = None,
 ) -> _PassResult:
     """Dispatcht den **QA-Stage**-Run: Agent reviewed den offenen PR + merged opt-in.
 
@@ -830,6 +869,7 @@ def _dispatch_review_run(
             merge=True,
             model=params.model,
             issue_body=acceptance,
+            store=store,
         )
     except Exception as exc:
         err_console.print(
@@ -884,14 +924,21 @@ def _run_conductor_watch(
     triager: IssueTriager | None,
     capabilities: Capabilities | None,
     max_ticks: int | None = None,
+    max_parallel: int = 1,
 ) -> HeartbeatStats:
     """Conductor-Dauerbetrieb (Phase C): fährt die Stage-State-Machine.
 
     Pro Tick: alle ``forge:``-Stage-Issues laden, ``WorkItem``-Liste bauen
     (Stage aus Labels, Deps aus Body, Signale aus dem Event-Strom), Tick planen
     und effektieren — Label-Übergänge via gh, Dispatch über den bestehenden
-    ``execute_run``-Pfad, Kapazität 1. Übergänge und Blockaden werden als
+    ``execute_run``-Pfad. Übergänge und Blockaden werden als
     ``WorkItemStageChanged``/``WorkItemBlocked`` persistiert.
+
+    ``max_parallel`` = Conductor-Kapazität: bis zu N Items werden pro Tick
+    dispatcht. Bei ``>1`` laufen sie nebenläufig in einem ThreadPool, jeweils im
+    eigenen Worktree; alle Event-Writes teilen sich die EINE (RLock-serialisierte)
+    EventStore-Connection des Heartbeats. Default ``1`` = exakt das bisherige
+    sequenzielle Verhalten.
     """
     stage_labels = [s.value for s in Stage]
 
@@ -973,6 +1020,7 @@ def _run_conductor_watch(
                     order=resume_order,
                     params=params,
                     issue=by_number.get(resume_order.issue_number or -1),
+                    store=store,
                 )
                 _print_loop_summary(res.summaries, bailed=res.bailed)
                 resume_count += res.dispatched
@@ -1017,45 +1065,73 @@ def _run_conductor_watch(
                     f"{t.to_stage.value} ([dim]{t.reason}[/dim])"
                 )
 
-            def dispatch(order: DispatchOrder) -> None:
+            def _run_order(order: DispatchOrder) -> _PassResult | None:
+                """Effektiert EINEN DispatchOrder (Team nach Stage). Thread-safe:
+                Worktree pro Run isoliert, Event-Writes über den geteilten,
+                RLock-serialisierten ``store``."""
                 issue = by_number.get(order.number)
                 if issue is None:
-                    return
-                # Team nach Stage: design → architect-Run (Plan, kein PR),
-                # qa → Review-Merge-Agent (PRReviewed/PRMerged, kein neuer PR),
-                # in-dev → der bestehende Dev-Loop (PR). Alle teilen sich die
-                # Tick-Kapazität (sequenziell in v1).
+                    return None
+                # design → architect-Run (Plan, kein PR); qa → Review-Merge-Agent
+                # (PRReviewed/PRMerged, kein neuer PR); sonst → Dev-Loop (PR).
                 if order.stage == Stage.DESIGN:
-                    res = _dispatch_design_run(ctx=ctx, issue=issue, params=params)
-                elif order.stage == Stage.QA:
+                    return _dispatch_design_run(
+                        ctx=ctx, issue=issue, params=params, store=store
+                    )
+                if order.stage == Stage.QA:
                     pr_num = pr_number_for_issue(events, order.number)
                     if pr_num is None:
                         err_console.print(
                             f"[yellow]skip[/yellow] qa #{order.number}: kein offener PR gefunden"
                         )
-                        return
-                    res = _dispatch_review_run(
-                        ctx=ctx, issue=issue, pr_number=pr_num, params=params
+                        return None
+                    return _dispatch_review_run(
+                        ctx=ctx, issue=issue, pr_number=pr_num, params=params, store=store
                     )
-                else:
-                    res = _dispatch_issues(
-                        ctx=ctx,
-                        issues=[issue],
-                        params=params,
-                        triager=triager,
-                        capabilities=capabilities,
-                    )
-                _print_loop_summary(res.summaries, bailed=res.bailed)
-                counters["dispatched"] += res.dispatched
-                counters["bailed"] = counters["bailed"] or res.bailed
+                return _dispatch_issues(
+                    ctx=ctx,
+                    issues=[issue],
+                    params=params,
+                    triager=triager,
+                    capabilities=capabilities,
+                    store=store,
+                )
+
+            # Bei capacity>1 werden die Dispatch-Orders nebenläufig effektiert.
+            # run_conductor_tick ruft set_stage (alle Übergänge) VOR dispatch —
+            # die Reihenfolge (Label erst, dann Run) bleibt also gewahrt; nur die
+            # Run-Effekte selbst überlappen. Ergebnisse werden nach dem Tick
+            # eingesammelt und seriell ausgegeben.
+            pending: list[DispatchOrder] = []
+
+            def dispatch(order: DispatchOrder) -> None:
+                pending.append(order)
 
             result = run_conductor_tick(
                 items=items,
-                capacity=1,
+                capacity=max_parallel,
                 set_stage=set_stage,
                 dispatch=dispatch,
                 on_blocked=_emit_blocked,
             )
+
+            pass_results: list[_PassResult] = []
+            if max_parallel > 1 and len(pending) > 1:
+                with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+                    for res in pool.map(_run_order, pending):
+                        if res is not None:
+                            pass_results.append(res)
+            else:
+                for order in pending:
+                    res = _run_order(order)
+                    if res is not None:
+                        pass_results.append(res)
+
+            for res in pass_results:
+                _print_loop_summary(res.summaries, bailed=res.bailed)
+                counters["dispatched"] += res.dispatched
+                counters["bailed"] = counters["bailed"] or res.bailed
+
             return TickResult(
                 dispatched=counters["dispatched"],
                 blocked=result.blocked,
@@ -1104,6 +1180,7 @@ def _run_triage(
     issue: ReadyIssue,
     triager: IssueTriager,
     capabilities: Capabilities,
+    store: EventStore | None = None,
 ) -> _TriageOutcome:
     """Triagiert ein Issue, emittiert das Event und führt optionale
     Side-Effects (Kommentar/Close) aus.
@@ -1128,7 +1205,7 @@ def _run_triage(
         )
 
     run_id = str(ULID())
-    _emit_triage_event(ctx=ctx, issue=issue, result=result, run_id=run_id)
+    _emit_triage_event(ctx=ctx, issue=issue, result=result, run_id=run_id, store=store)
 
     if result.is_relevant:
         console.print(
@@ -1208,6 +1285,7 @@ def _emit_triage_event(
     issue: ReadyIssue,
     result: TriageResult,
     run_id: str,
+    store: EventStore | None = None,
 ) -> None:
     """Schreibt genau ein ``IssueTriaged``-Event in den Store.
 
@@ -1234,11 +1312,13 @@ def _emit_triage_event(
         cost_usd=result.cost_usd,
         model=result.model,
     )
-    store = ctx.open_store()
+    owns_store = store is None
+    store = store if store is not None else ctx.open_store()
     try:
         store.append(evt)
     finally:
-        store.close()
+        if owns_store:
+            store.close()
 
 
 def _format_triage_comment(result: TriageResult) -> str:

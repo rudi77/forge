@@ -115,7 +115,7 @@ def test_conductor_dispatches_ready_item_and_records_transition(
     monkeypatch.setattr(bl, "set_issue_stage_label", set_label)
     dispatched: list[int] = []
 
-    def fake_dispatch(*, ctx, issues, params, triager, capabilities):
+    def fake_dispatch(*, ctx, issues, params, triager, capabilities, store=None):
         dispatched.extend(i.number for i in issues)
         return bl._PassResult(
             summaries=[], bailed=False, dispatched=len(issues), skipped=0
@@ -177,7 +177,7 @@ def test_conductor_dispatches_when_dependency_done(
     monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
     dispatched: list[int] = []
 
-    def fake_dispatch(*, ctx, issues, params, triager, capabilities):
+    def fake_dispatch(*, ctx, issues, params, triager, capabilities, store=None):
         dispatched.extend(i.number for i in issues)
         return bl._PassResult(
             summaries=[], bailed=False, dispatched=len(issues), skipped=0
@@ -203,7 +203,7 @@ def test_conductor_dispatches_design_stage_to_design_run(
 
     design_runs: list[int] = []
 
-    def fake_design(*, ctx, issue, params):
+    def fake_design(*, ctx, issue, params, store=None):
         design_runs.append(issue.number)
         return bl._PassResult(
             summaries=[], bailed=False, dispatched=1, skipped=0
@@ -239,3 +239,127 @@ def test_conductor_empty_board_emits_tick_only(
     assert stats.total_dispatched == 0
     assert _events_of_kind(ctx, "ConductorTickCompleted") == 2
     assert _events_of_kind(ctx, "WorkItemStageChanged") == 0
+
+
+def test_conductor_parallel_dispatches_two_ready_items(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # max_parallel=2: zwei ready-Items werden in EINEM Tick nebenläufig dispatcht.
+    import threading
+
+    ctx = _make_ctx(tmp_path)
+    monkeypatch.setattr(
+        bl,
+        "list_stage_items",
+        lambda **k: [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
+    )
+    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+
+    lock = threading.Lock()
+    dispatched: list[int] = []
+
+    def fake_dispatch(*, ctx, issues, params, triager, capabilities, store=None):
+        with lock:
+            dispatched.extend(i.number for i in issues)
+        return bl._PassResult(
+            summaries=[], bailed=False, dispatched=len(issues), skipped=0
+        )
+
+    monkeypatch.setattr(bl, "_dispatch_issues", fake_dispatch)
+
+    stats = bl._run_conductor_watch(
+        ctx=ctx, repo_owner="x", repo_name="y", max_issues=3, interval_s=0,
+        params=_params(), triager=None, capabilities=None, max_ticks=1,
+        max_parallel=2,
+    )
+    assert stats.total_dispatched == 2
+    assert sorted(dispatched) == [5, 6]
+
+
+def test_conductor_parallel_worker_exception_does_not_crash_tick(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # Ein Dispatch wirft → der parallele Tick (pool.map) darf NICHT den
+    # Heartbeat killen; der Fehler wird als bailed-Result eingesammelt.
+    ctx = _make_ctx(tmp_path)
+    monkeypatch.setattr(
+        bl,
+        "list_stage_items",
+        lambda **k: [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
+    )
+    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+
+    def boom(**k):
+        raise RuntimeError("dispatch exploded")
+
+    monkeypatch.setattr(bl, "_dispatch_issues", boom)
+
+    # Darf nicht propagieren — Heartbeat läuft den Tick zu Ende.
+    stats = bl._run_conductor_watch(
+        ctx=ctx, repo_owner="x", repo_name="y", max_issues=3, interval_s=0,
+        params=_params(), triager=None, capabilities=None, max_ticks=1,
+        max_parallel=2,
+    )
+    assert stats.ticks == 1
+    assert stats.total_dispatched == 0  # beide Dispatches scheiterten
+
+
+def test_conductor_qa_stage_dispatches_review_run(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # Ein qa-Item mit offenem PR → der Review-Merge-Run läuft mit der via
+    # Event-Strom aufgelösten PR-Nummer; kein Dev-Loop.
+    from forge_core.events import (
+        EventKind,
+        PRCreatedPayload,
+        RunStartedPayload,
+        build_event,
+    )
+
+    ctx = _make_ctx(tmp_path)
+    # Event-Strom seeden: Run für Issue #8 hat PR #42 erzeugt.
+    store = ctx.open_store()
+    common = dict(
+        project="testproj", project_fingerprint="sha256:test",
+        factory_version="git:test", spec_version="1.0",
+    )
+    store.append(build_event(
+        kind=EventKind.RUN_STARTED, run_id="r8",
+        payload=RunStartedPayload(
+            trigger="issue_label", strategy="sequential", config_hash="c",
+            issue_number=8,
+        ),
+        **common,
+    ))
+    store.append(build_event(
+        kind=EventKind.PR_CREATED, run_id="r8",
+        payload=PRCreatedPayload(pr_number=42, branch="forge/r8"),
+        **common,
+    ))
+    store.close()
+
+    monkeypatch.setattr(
+        bl, "list_stage_items", lambda **k: [_issue(8, ["forge:qa"])]
+    )
+    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+
+    reviews: list[int] = []
+
+    def fake_review(*, ctx, issue, pr_number, params, store=None):
+        reviews.append(pr_number)
+        return bl._PassResult(
+            summaries=[], bailed=False, dispatched=1, skipped=0
+        )
+
+    dev_runs: list[int] = []
+    monkeypatch.setattr(bl, "_dispatch_review_run", fake_review)
+    monkeypatch.setattr(
+        bl, "_dispatch_issues",
+        lambda **k: dev_runs.append(1)
+        or bl._PassResult(summaries=[], bailed=False, dispatched=1, skipped=0),
+    )
+
+    stats = _run(ctx)
+    assert reviews == [42]  # PR-Nummer via pr_number_for_issue aufgelöst
+    assert dev_runs == []
+    assert stats.total_dispatched == 1

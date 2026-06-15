@@ -27,7 +27,8 @@ def test_all_event_kinds_have_registered_payload_schemas() -> None:
     # + Loop 2: ConductorTickCompleted, WorkItemStageChanged,
     #   WorkItemBlocked = 21.
     # + Resilienz: RunResumeScheduled = 22.
-    assert len(EventKind) == 22
+    # + Agent-Review-Merge: PRReviewed = 23.
+    assert len(EventKind) == 23
     for kind in EventKind:
         assert kind in _PAYLOAD_REGISTRY, f"missing schema for {kind}"
 

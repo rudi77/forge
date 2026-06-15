@@ -18,6 +18,7 @@ from forge_cli import board_loop as board_loop_mod
 from forge_cli import doctor as doctor_mod
 from forge_cli import plan as plan_mod
 from forge_cli import replay as replay_mod
+from forge_cli import review_pr as review_pr_mod
 from forge_cli import run as run_mod
 from forge_cli import watch as watch_mod
 
@@ -65,6 +66,14 @@ app.command(
     name="watch",
     help="Live-Tracking eines laufenden Runs (Worktree-Aktivität + Event-Chronik).",
 )(watch_mod.watch_command)
+
+app.command(
+    name="review-pr",
+    help=(
+        "Ein Agent reviewed einen offenen PR und merged ihn opt-in "
+        "(approve + grüner CI + capabilities.merge_pr)."
+    ),
+)(review_pr_mod.review_pr_command)
 
 
 def main() -> None:

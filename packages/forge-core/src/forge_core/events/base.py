@@ -37,6 +37,7 @@ class EventKind(StrEnum):
     EVAL_FINISHED = "EvalFinished"
     DECISION_MADE = "DecisionMade"
     PR_CREATED = "PRCreated"
+    PR_REVIEWED = "PRReviewed"
     PR_MERGED = "PRMerged"
     PR_REVERTED = "PRReverted"
     COST_CAP_HIT = "CostCapHit"

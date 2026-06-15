@@ -105,8 +105,16 @@ class SurfaceConfig(BaseModel):
 class CapabilitiesConfig(BaseModel):
     """Aktions-Erlaubnisse für die Maschine (Spec Teil 5.2).
 
-    `merge_pr`, `push_to_main` und `push_force` sind in v1 hardcoded `false`.
-    Eine spec, die sie auf `true` setzt, wird abgelehnt.
+    `push_to_main` und `push_force` sind weiterhin hardcoded `false` — eine
+    Spec, die sie auf `true` setzt, wird abgelehnt.
+
+    `merge_pr` ist seit dem Agent-Review-Merge **opt-in** (`bool`, default
+    `false`). Steht es auf `true`, darf forge einen offenen PR nach einem
+    Agent-Review (verdict ``approve``) und bei grünem CI selbst mergen
+    (``gh pr merge``). Das ist eine bewusste Abkehr vom kategorischen
+    v1-Ausschluss: Operatoren, die das nicht wollen, lassen es auf dem
+    Default `false`. Der eigentliche Merge bleibt zusätzlich durch
+    CI-grün + Score-Schwelle abgesichert (siehe `forge review-pr`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -124,7 +132,10 @@ class CapabilitiesConfig(BaseModel):
     """Erlaubt ``gh issue close`` (z.B. um veraltete Issues per Triage
     zu schließen). Default ``True``, aber praktisch nur wirksam, wenn
     ``spec.triage.enabled`` opt-in aktiviert ist."""
-    merge_pr: Literal[False] = False
+    merge_pr: bool = False
+    """Opt-in: erlaubt forge, einen offenen PR nach Agent-Review selbst zu
+    mergen (``gh pr merge``). Default ``false``. Zusätzlich CI-grün +
+    Score-Schwelle abgesichert."""
     push_to_main: Literal[False] = False
     push_force: Literal[False] = False
 
@@ -132,13 +143,13 @@ class CapabilitiesConfig(BaseModel):
         default_factory=lambda: ["api.anthropic.com", "api.github.com"]
     )
 
-    @field_validator("merge_pr", "push_to_main", "push_force", mode="before")
+    @field_validator("push_to_main", "push_force", mode="before")
     @classmethod
     def _reject_true(cls, value: Any, info: Any) -> Any:
         if value is True:
             raise SpecValidationError(
                 f"capabilities.{info.field_name} must be false in v1 — "
-                "auto-merge / push-to-main / push-force are categorically disabled "
+                "push-to-main / push-force are categorically disabled "
                 "(Spec Teil 5.2, 7.5)"
             )
         return value

@@ -48,3 +48,17 @@ def test_nightly_supports_workflow_dispatch() -> None:
     """Operator soll den nightly-Run manuell triggern können (für Smoke-Tests)."""
     tpl = (templates_path() / "forge-nightly.yml").read_text(encoding="utf-8")
     assert "workflow_dispatch" in tpl
+
+
+def test_pr_review_template_present_and_reactive() -> None:
+    """Reaktiver Review-Merge-Workflow (Inkrement 1c): triggert auf PR-Updates
+    und auf abgeschlossene Checks, ruft `forge review-pr`."""
+    names = {p.name for p in list_templates()}
+    assert "forge-pr-review.yml" in names
+    tpl = (templates_path() / "forge-pr-review.yml").read_text(encoding="utf-8")
+    assert "forge review-pr" in tpl
+    # Re-Review nach neuen Commits + nach CI-Abschluss.
+    assert "synchronize" in tpl
+    assert "check_suite" in tpl
+    # Nur forge:auto-PRs.
+    assert "forge:auto" in tpl

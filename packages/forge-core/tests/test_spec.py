@@ -55,9 +55,12 @@ def test_pinta_reference_spec_loads(tmp_path: Path) -> None:
     assert spec.cost_caps.per_run_usd == Decimal("1.50")
 
 
-def test_merge_pr_true_rejected() -> None:
-    with pytest.raises((ValueError, SpecValidationError)):
-        CapabilitiesConfig(merge_pr=True)  # type: ignore[arg-type]
+def test_merge_pr_opt_in_accepted() -> None:
+    # Agent-Review-Merge: merge_pr ist opt-in (bool), nicht mehr Literal[False].
+    caps = CapabilitiesConfig(merge_pr=True)
+    assert caps.merge_pr is True
+    # Default bleibt False.
+    assert CapabilitiesConfig().merge_pr is False
 
 
 def test_push_to_main_true_rejected() -> None:

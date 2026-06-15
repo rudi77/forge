@@ -145,11 +145,14 @@ def test_triage_actions_denyable_via_spec() -> None:
     assert caps.check_action("close_issue").allowed is False
 
 
-def test_merge_pr_categorically_disabled() -> None:
-    caps = Capabilities(_spec())
-    r = caps.check_action("merge_pr")
-    assert r.allowed is False
-    assert "categorically" in (r.detail or "")
+def test_merge_pr_opt_in_follows_spec_flag() -> None:
+    # Default-Spec: merge_pr=False → denied (folgt der Flag, kein Hard-Deny).
+    spec = _spec()
+    caps = Capabilities(spec)
+    assert caps.check_action("merge_pr").allowed is False
+    # Opt-in aktiviert → erlaubt.
+    spec.capabilities.merge_pr = True
+    assert Capabilities(spec).check_action("merge_pr").allowed is True
 
 
 def test_push_to_main_categorically_disabled() -> None:

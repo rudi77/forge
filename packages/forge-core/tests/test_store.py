@@ -230,3 +230,41 @@ def test_context_manager_closes(tmp_path: Path) -> None:
         assert s.count() == 0
     # Nach close() ist die DB-Datei freigegeben (Windows: kein Lock)
     assert db.exists()
+
+
+def test_concurrent_appends_are_thread_safe(tmp_path: Path) -> None:
+    """Mehrere Threads schreiben gleichzeitig in EINE EventStore-Instanz.
+
+    Der RLock serialisiert die DuckDB-Connection — alle Events landen, keine
+    Race/Corruption. Grundlage für den parallelen board-loop (capacity>1).
+    """
+    import threading
+
+    s = EventStore(tmp_path / "events.duckdb")
+    try:
+        n_threads, per_thread = 8, 25
+
+        def worker(tid: int) -> None:
+            for i in range(per_thread):
+                s.append(
+                    build_event(
+                        kind=EventKind.RUN_STARTED,
+                        run_id=f"r{tid}-{i}",
+                        payload=RunStartedPayload(
+                            trigger="manual",
+                            strategy="sequential",
+                            config_hash="sha256:cfg",
+                        ),
+                        **COMMON,
+                    )
+                )
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert s.count() == n_threads * per_thread
+    finally:
+        s.close()

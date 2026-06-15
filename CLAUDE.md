@@ -19,7 +19,8 @@ Die drei Mantras:
 
 Diese Punkte sind **kategorisch ausgeschlossen** — nicht aus Vorsicht, sondern weil zuerst Daten gesammelt werden müssen, bevor sie sich rechtfertigen:
 
-- Auto-Merge (`capabilities.merge_pr`, `push_to_main`, `push_force` sind als `Literal[False]` typisiert, nicht runtime-konfigurierbar)
+- `push_to_main` / `push_force` (als `Literal[False]` typisiert, nicht runtime-konfigurierbar)
+- ~~Auto-Merge~~ — **geändert**: `capabilities.merge_pr` ist seit dem Agent-Review-Merge **opt-in** (`bool`, default `false`). forge darf einen offenen PR nach Agent-Review (verdict `approve`) + grünem CI selbst mergen (`forge review-pr`, `gh pr merge`). Siehe Abschnitt „Agent-Review-Merge". Das ist die bewusste Abkehr vom ursprünglichen kategorischen v1-Ausschluss.
 - Population-Based Search (kommt mit v2, nach 100+ Runs)
 - Bandit / Bayesian Optimization (kommt mit v3, nach 300+ Runs)
 - Self-Improvement: forge ändert ihre eigene Konfiguration NIE (Prinzip 3, Spec Teil 7.4)
@@ -105,6 +106,12 @@ uv run forge doctor --spec examples/pinta/.forge/project.yaml
 
 Single-row INSERT via Python-Binding kostet ~12 ms each, auch in-Memory. Das ist ein bekanntes Issue von DuckDB; nicht versuchen, mit Indexes oder PRAGMA zu fighten. Für Bulk → `executemany`. Für Tests, die Zeit messen, statt 1000 Events lieber 10 nehmen.
 
+### DuckDB Single-Writer: Threads ja, Prozesse nein
+
+DuckDB nimmt einen **Datei-Lock pro Prozess**: zwei *Prozesse* können dieselbe `.duckdb` nicht gleichzeitig read-write öffnen. *Innerhalb* eines Prozesses sind mehrere Connections erlaubt, aber eine einzelne Connection ist nicht nebenläufig benutzbar. Deshalb ist `EventStore` seit dem Parallel-board-loop **thread-sicher**: ein `threading.RLock` serialisiert alle `_conn`-Zugriffe (`store.py`). Der parallele Conductor (`--max-parallel N`) teilt **eine** `EventStore`-Instanz über alle Worker-Threads — Writes serialisieren über den Lock (~ms, vernachlässigbar gegen Minuten-Runs). Echte Subprozess-Parallelität (mehrere `forge run`-Prozesse) ginge wegen des Datei-Locks **nicht** ohne Single-Writer-Daemon oder per-Run-Event-Sinks + Merge — bewusst nicht in dieser Stufe (eigener großer Schritt, v2/M2). Wer parallel arbeitet, reicht den geteilten Store in `execute_run`/`execute_pr_review` über den `store=`-Parameter herein (default `None` = öffnet/schließt selbst, unveränderter Single-Pass-Pfad).
+
+Worktree-Create/Remove (`git worktree add/remove`) nimmt einen kurzen Lock auf die `.git/worktrees`-Metadaten — parallele Adds würden kollidieren. `worktrees.py` serialisiert NUR diese schnelle git-Operation über `_WORKTREE_GIT_LOCK` (prozess-global), nicht den Run.
+
 ### Conductor / Heartbeat ist Loop 2 — über der Loop, nie darin
 
 Die Fabrik-Orchestrierung (`board-loop --watch`) lebt in `forge-cli`
@@ -124,18 +131,27 @@ Label, kein zweiter Konfig-Ort.
 **Stage-spezifischer Dispatch (verschiedene Teams pro Stage):** Die **Stage**
 bestimmt das **Team** und die **Run-Art**. `plan_tick` liefert
 `list[DispatchOrder]` (`number` + `stage`), nicht mehr nur `list[int]`.
-`stages.IN_PLACE_WORK_STAGES` (= `{design}`) markiert Stages, in denen ein Team
-*in-place* arbeitet (kein Stage-Wechsel beim Dispatch, anders als
+`stages.IN_PLACE_WORK_STAGES` (= `{design, qa}`) markiert Stages, in denen ein
+Team *in-place* arbeitet (kein Stage-Wechsel beim Dispatch, anders als
 `ready→in-dev`) und seinen Advance-Auslöser produziert; `advance` schreibt das
 Item nächsten Tick fort, sobald das Signal vorliegt. `_run_conductor_watch`
-verzweigt nach `DispatchOrder.stage`: `design` → `_dispatch_design_run`
-(architect-Roster, `create_pr=False`, Output `PlanProposed` → `has_plan` →
-`design→ready`), sonst → der bestehende Dev-Loop (`_dispatch_issues`, PR). Neue
-executable Stage = Eintrag in `IN_PLACE_WORK_STAGES` **+** Advance-Signal in
-`StageSignals`/`advance` **+** Dispatch-Zweig. `requirements`/`release` fehlt
-jeweils noch ihr „fertig"-Signal (Inkrement 2). **Noch offen:** Live-Verifikation
-der gh-Kommandos gegen ein echtes Board (bisher nur Stub-getestet);
-Re-Dispatch/Eskalation eines `in-dev`-Items, dessen Run keinen PR produzierte.
+verzweigt nach `DispatchOrder.stage`:
+- `design` → `_dispatch_design_run` (architect-Roster, `create_pr=False`, Output
+  `PlanProposed` → `has_plan` → `design→ready`),
+- `qa` → `_dispatch_review_run` (Review-Merge-Agent, `execute_pr_review`, Output
+  `PRReviewed`/`PRMerged` → `has_merged_pr` → `qa→release`; PR-Nummer via
+  `conductor.pr_number_for_issue`),
+- sonst → der bestehende Dev-Loop (`_dispatch_issues`, PR).
+
+Der QA-Dispatch ist zusätzlich durch `StageSignals.review_done` gegated: ein
+bereits gereviewter (aber nicht gemergter, z.B. `request_changes`) PR wird nicht
+jeden Tick erneut reviewt — sonst teure Endlosschleife. Neue executable Stage =
+Eintrag in `IN_PLACE_WORK_STAGES` **+** Advance-Signal in `StageSignals`/`advance`
+**+** Dispatch-Zweig. `requirements`/`release` fehlt jeweils noch ihr
+„fertig"-Signal. **Noch offen:** Live-Verifikation der gh-Kommandos gegen ein
+echtes Board (bisher nur Stub-getestet); Re-Dispatch/Eskalation eines
+`in-dev`-Items, dessen Run keinen PR produzierte; Re-Review nach neuen Commits
+auf einem `request_changes`-PR (reaktiv, Inkrement 1c).
 
 Mantra 3: der Heartbeat taktet das Dispatchen von Runs
 (`execute_run`), greift aber nie in Runner/Scoring/Gates ein. Die
@@ -199,27 +215,35 @@ Nutze `GitIgnoreSpec.from_lines(...)` (modern API), nicht `PathSpec.from_lines(G
 
 Windows-Default. Ignorieren. Wenn du sie wirklich loswerden willst: `git config core.autocrlf false`. Inhalte bleiben identisch.
 
-### Auto-Merge ist Spec-Grauzone, nicht Spec-Bruch
+### Zwei Merge-Wege: GitHub-Auto-Merge (Grauzone) UND Agent-Review-Merge (opt-in)
 
+**Weg 1 — GitHub-Auto-Merge (Spec-Grauzone, unverändert).**
 `forge board-loop --auto-merge` und `forge run --auto-merge` rufen
 `gh pr merge --auto --squash --delete-branch` auf. Das **queued** den
 Merge bei GitHub — der eigentliche Merge passiert server-seitig, von
 GitHubs Bots, asynchron, sobald alle required Checks grün sind. forge
-selbst führt **keinen** synchronen `merge`-Subprozess aus.
+selbst führt hier **keinen** synchronen `merge`-Subprozess aus
+(`forge_adapters.github.pr.queue_auto_merge`).
 
-Das ist die erlaubte Lesart der `merge_pr`-Capability (typed
-`Literal[False]`): die Capability verbietet, dass forge selbst mergt
-(forge ruft nicht `gh pr merge <N>` ohne `--auto` auf). GitHub mergt
-auf Operator-Anfrage hin, nicht auf forge-Anfrage. Gleiche Logik wie
-`release.on_main_green: auto_tag` — Tagging ist erlaubt (kein Code-
-Change), und Auto-Merge ist erlaubt-via-GitHub-Feature, nicht erlaubt-
-via-forge-Subprozess.
+**Weg 2 — Agent-Review-Merge (opt-in, forge merged selbst).**
+`forge review-pr <N>` lässt einen Agent einen **offenen** PR bewerten
+(`PRReviewer` → `agent.review`, fail-closed) und merged ihn **synchron
+selbst** (`gh pr merge <N>` ohne `--auto`, `forge_adapters.github.pr.merge_pr`),
+WENN alle drei Bedingungen erfüllt sind (`pr_review.decide_merge`, rein):
+1. `capabilities.merge_pr` ist opt-in `true` (default `false`),
+2. das Review-Verdikt ist `approve` und `score >= threshold`,
+3. der CI ist grün (`summarize_ci` == `pass`; `none` nur mit `allow_missing_ci`).
+Zusätzlich Konflikt-Guard (`mergeable == CONFLICTING` → nie). Events:
+`PRReviewed` (immer) + `PRMerged` (`merged_by_forge=True`) beim Merge.
 
-Wenn du das nicht willst: einfach `--auto-merge` weglassen. PR wird
-geöffnet, Operator mergt manuell. Default-Verhalten bleibt **kein**
-Auto-Merge — der Flag ist explizit opt-in pro Aufruf.
+Das ist die **bewusste Abkehr** vom ursprünglichen kategorischen
+`merge_pr=Literal[False]`-Ausschluss (Operator-Entscheidung). `merge_pr`
+ist jetzt `bool` in der Spec, der Hard-Deny in `Capabilities.check_action`
+gilt nur noch für `push_to_main`/`push_force`. Mantra 3 bleibt intakt:
+der Agent **urteilt**, forge **entscheidet/effektiert** deterministisch.
 
-Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
+Wer das nicht will: `capabilities.merge_pr` auf `false` lassen (Default) —
+dann reviewed `forge review-pr` nur und merged nie.
 
 ## Event-Schema — Achtung, irreversibel
 
@@ -229,7 +253,9 @@ Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
 - Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
 - Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
 
-Vor jeder Schema-Änderung: `len(EventKind) == 22` und `len(_PAYLOAD_REGISTRY) == 22` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22).
+Vor jeder Schema-Änderung: `len(EventKind) == 23` und `len(_PAYLOAD_REGISTRY) == 23` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22; + Agent-Review-Merge: `PRReviewed` = 23).
+
+`PRMerged` steht auf Schema **1.1** (additiv: `merged_by_forge` + `merge_method` für forge-initiierte Merges). Alte 1.0-Events lesen weiter (Defaults).
 
 `PlanProposed` steht auf Schema **1.1** (additiv: `subtasks: list[PlanSubtask]` + `agents_used: list[str]`). Alte 1.0-Events lesen weiter, weil beide Felder Defaults haben — siehe `test_plan_proposed_schema_is_v1_1_with_additive_fields`.
 
@@ -242,6 +268,8 @@ Vor jeder Schema-Änderung: `len(EventKind) == 22` und `len(_PAYLOAD_REGISTRY) =
 ### Multi-Agent ist Plug-in-intern, nicht Runner-Sache
 
 Das Subagent-Team (architect → developer → tester → reviewer) wird **vom Master-`claude` orchestriert**, nicht vom Runner. Der Runner ruft ein einziges `propose()` auf; die Rollen-Choreografie lebt komplett im `ClaudeCodeCLIAgent`. Würde der Runner die Schritte selbst takten, müsste die Loop die Agent-Rollen kennen — das bricht Mantra 3 und das Plug-in-Prinzip.
+
+**Parallele Subtasks (intra-Run, Plug-in-intern).** Der Orchestrator-Prompt (`build_orchestrator_prompt`) weist den Master an, **unabhängige** Subtasks (disjunkte Files, keine Daten-Abhängigkeit) **parallel** zu dispatchen — mehrere `developer`-Task-Calls in EINER Nachricht — und nur abhängige/Datei-teilende Subtasks zu serialisieren. Sicherheits-Leitplanke im Prompt (`Parallel safety`): alle Subagents teilen EINEN Worktree, also nie zwei Developer auf dieselbe Datei in einem Batch (Lost-Update-Race); im Zweifel serialisieren. Das ist die zweite Parallelitäts-Ebene neben dem parallelen Conductor (`--max-parallel`, Run-Ebene): hier laufen Rollen *innerhalb* eines Runs nebenläufig. Bewusst eine reine Prompt-Instruktion — der Runner taktet die Subagents nicht (Mantra 3), Claudes Task-Tool führt die parallelen Calls aus.
 
 Der **reviewer** ist das opt-in 4. Arbeitspferd (`KNOWN_AGENTS`, aber **nicht** in `DEFAULT_AGENTS`): read-only (`Read, Glob, Grep, Bash`), läuft als LETZTER Schritt nach der Tester-Verifikation und liest den kumulativen Diff kritisch gegen (Korrektheit, Surfaces/Forbidden, Security, Test-Qualität). Er editiert nichts — BLOCKING-Findings gehen zurück an den Developer (zwei Runden max), dann re-verifiziert der Tester. Damit bleibt Mantra 3 intakt: der reviewer urteilt, er entscheidet nicht und schreibt keinen Code. **Abgrenzung zum Judge:** Der Judge (`evaluators/judge.py`, `review()`) ist die *fail-closed, gescorte* Loop-Phase, die `llm_judge_score` in ein Gate füttert und keep/discard mitentscheidet — read-only, **außerhalb** der Orchestrierung. Der reviewer ist *in-Orchestrierung*, qualitativ, und verbessert den Diff *bevor* er den Worktree verlässt. Sie sind komplementär, nicht redundant.
 
@@ -289,7 +317,9 @@ Läuft ein orchestrierter Run mitten in der Arbeit in ein Claude-Usage-/Session-
 3. **Cost-Caps** (Ressourcen-Ebene) — `SequentialRunner._check_run_cost_cap`
 4. **Subprocess-Isolation** (Prozess-Ebene) — Worktree pro Run, separate venv kommt in M2
 
-`merge_pr` / `push_to_main` / `push_force` sind dreifach gesichert: in der Spec via `Literal[False]`, in `Capabilities.check_action` als hartkodiertes Deny, und im PR-Body steht der Hinweis explizit.
+`push_to_main` / `push_force` sind dreifach gesichert: in der Spec via `Literal[False]`, in `Capabilities.check_action` als hartkodiertes Deny, und im PR-Body steht der Hinweis explizit.
+
+`merge_pr` ist **nicht** mehr hart-deny (Agent-Review-Merge): `bool` in der Spec, gefolgt von `Capabilities.check_action`. Die Sicherheit liegt hier in der **Mehrfach-Bedingung** vor dem Merge (`pr_review.decide_merge`): opt-in-Capability **und** Agent-`approve` **und** `score >= threshold` **und** grüner CI **und** kein Merge-Konflikt. Fail-closed: scheitert der Review-Agent, gilt `request_changes`/`0.0` → kein Merge.
 
 ## Wenn du nicht sicher bist
 

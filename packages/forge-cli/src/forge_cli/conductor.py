@@ -124,7 +124,12 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             continue
         eff = effective[w.number]
         if w.stage in IN_PLACE_WORK_STAGES and eff == w.stage:
-            # design (noch ohne Plan): Team arbeitet in-place, kein Übergang.
+            # In-Place-Team arbeitet, kein Übergang (advance schreibt fort,
+            # sobald das Auslöser-Signal vorliegt). QA ist zusätzlich durch
+            # review_done gegated: ein bereits gereviewter (aber nicht
+            # gemergter) PR wird nicht jeden Tick erneut reviewt.
+            if w.stage == Stage.QA and w.signals.review_done:
+                continue
             target = w.stage
         elif w.stage == Stage.READY:
             # Warteschlange → Dev-Team; Übergang folgt beim Dispatch.
@@ -244,11 +249,48 @@ def derive_signals(events: list, issue_number: int) -> StageSignals:
         and (e.payload or {}).get("pr_number") in pr_numbers
         for e in events
     )
+    review_done = any(
+        e.kind == EventKind.PR_REVIEWED
+        and (e.payload or {}).get("pr_number") in pr_numbers
+        for e in events
+    )
     return StageSignals(
         has_plan=has_plan,
         has_open_pr=has_open_pr,
         has_merged_pr=has_merged_pr,
+        review_done=review_done,
     )
+
+
+def pr_number_for_issue(events: list, issue_number: int) -> int | None:
+    """Die offene PR-Nummer eines Issues aus dem Event-Strom, oder ``None``.
+
+    Korreliert ``RunStarted.issue_number`` → ``run_id`` → ``PRCreated.pr_number``
+    (analog :func:`derive_signals`) und schließt bereits gemergte PRs aus.
+    Wählt bei mehreren offenen PRs die höchste Nummer (jüngster PR). Die
+    QA-Wiring-Schicht braucht das, um ``forge review-pr <N>`` zu dispatchen.
+    """
+    run_ids = {
+        e.run_id
+        for e in events
+        if e.kind == EventKind.RUN_STARTED
+        and (e.payload or {}).get("issue_number") == issue_number
+    }
+    if not run_ids:
+        return None
+    pr_numbers = {
+        (e.payload or {}).get("pr_number")
+        for e in events
+        if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+    }
+    pr_numbers.discard(None)
+    merged = {
+        (e.payload or {}).get("pr_number")
+        for e in events
+        if e.kind == EventKind.PR_MERGED
+    }
+    open_prs = [n for n in pr_numbers if n not in merged]
+    return max(open_prs) if open_prs else None
 
 
 @dataclass(frozen=True)

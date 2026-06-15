@@ -472,6 +472,16 @@ def test_build_orchestrator_prompt_full_roster_has_plan_markers() -> None:
     assert "forge project memory" in prompt
 
 
+def test_build_orchestrator_prompt_describes_parallel_subtasks() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(["architect", "developer", "tester"])
+    # Parallel-Dispatch unabhängiger Subtasks + Worktree-Safety-Hinweis.
+    assert "PARALLEL" in prompt
+    assert "disjoint files" in prompt
+    assert "Parallel safety" in prompt
+
+
 def test_build_orchestrator_prompt_without_architect_omits_plan() -> None:
     from forge_execute.agents.templates import (
         PLAN_BEGIN_MARKER,

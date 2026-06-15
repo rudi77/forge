@@ -7,9 +7,10 @@ Aus der Spec Teil 5.2:
 Forbidden Zones sagen *was* nicht angefasst werden darf, Capabilities sagen
 *welche Aktionen* erlaubt sind. Beide Schichten müssen unabhängig grün sein.
 
-`merge_pr`/`push_to_main`/`push_force` sind hart deaktiviert — schon im
-Spec-Loader durchgesetzt; hier nochmal, weil die Capability-Klasse die letzte
-Verteidigungslinie ist, bevor eine Aktion stattfindet.
+`push_to_main`/`push_force` sind hart deaktiviert — schon im Spec-Loader
+durchgesetzt; hier nochmal, weil die Capability-Klasse die letzte
+Verteidigungslinie ist, bevor eine Aktion stattfindet. `merge_pr` ist seit
+dem Agent-Review-Merge opt-in (folgt der Spec-Flag, nicht mehr hart-deny).
 
 Diese Klasse emittiert KEINE Events selbst. Sie liefert ein `CheckResult`
 zurück; der Caller (Runner) entscheidet, ob er eine `GuardrailViolation`
@@ -160,8 +161,9 @@ class Capabilities:
         """Prüft eine boolesche Capability."""
         # Hart deaktivierte Aktionen IMMER ablehnen — auch wenn die Spec
         # fehlerhaft true sagt (sollte vom Spec-Loader nicht durchkommen,
-        # aber Defense-in-depth).
-        if action in ("merge_pr", "push_to_main", "push_force"):
+        # aber Defense-in-depth). `merge_pr` steht hier NICHT mehr: es ist
+        # seit dem Agent-Review-Merge opt-in und folgt der Spec-Flag (unten).
+        if action in ("push_to_main", "push_force"):
             return CheckResult(
                 allowed=False,
                 guardrail_id="capability_denied",

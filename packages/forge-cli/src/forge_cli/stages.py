@@ -69,12 +69,24 @@ class StageSignals:
     has_merged_pr: bool = False
     """Der PR des Items wurde gemergt (``PRMerged``)."""
 
+    review_done: bool = False
+    """Für den offenen PR liegt bereits ein ``PRReviewed`` vor (Agent hat
+    geurteilt). Gate gegen teures Endlos-Re-Review in der ``qa``-Stage:
+    nach einem ``request_changes`` (kein Merge) wird NICHT erneut dispatcht,
+    bis neue Commits/ein neuer PR den Review-Stand zurücksetzen (Loop 1c)."""
+
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
 # Advance-Auslöser produziert (``design`` → architect-Team → ``PlanProposed`` →
 # ``has_plan`` → ``design→ready``). Der Conductor dispatcht so ein Item, ohne es
 # zu bewegen; ``advance`` schreibt es fort, sobald das Signal vorliegt. Das ist
 # der „verschiedene-Teams"-Kern: jede Stage hier bekommt ihr eigenes Roster.
+#
+# ``qa`` arbeitet ebenfalls in-place: das Review-Merge-Team (``forge review-pr``)
+# bewertet den offenen PR und merged ihn opt-in → ``PRMerged`` → ``has_merged_pr``
+# → ``advance`` schreibt ``qa→release`` fort. Anders als ``design`` ist der
+# QA-Dispatch durch ``signals.review_done`` gegated (s. ``StageSignals``), damit
+# ein ``request_changes`` nicht jeden Tick ein teures Re-Review auslöst.
 #
 # ``in-dev`` steht bewusst NICHT hier: es wird beim ``ready→in-dev``-Übergang
 # *gekoppelt* dispatcht (genau einmal). Re-Dispatch/Eskalation bei
@@ -84,7 +96,7 @@ class StageSignals:
 # Wächst die Liste (``requirements``/``release``), braucht jede neue Stage
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
 # Dispatch-Zweig in der board-loop-Wiring-Schicht.
-IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset({Stage.DESIGN})
+IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset({Stage.DESIGN, Stage.QA})
 
 
 def stage_of(labels: list[str]) -> Stage | None:

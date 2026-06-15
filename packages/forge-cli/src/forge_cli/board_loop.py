@@ -65,10 +65,12 @@ from forge_cli.conductor import (
     WorkItem,
     derive_pending_resumes,
     derive_signals,
+    pr_number_for_issue,
     run_conductor_tick,
 )
 from forge_cli.dependencies import parse_depends_on
 from forge_cli.heartbeat import HeartbeatStats, TickResult, run_heartbeat
+from forge_cli.review_pr import execute_pr_review
 from forge_cli.run import _DEFAULT_RESUME_PROMPT, RunOutcome, execute_run
 from forge_cli.runtime import (
     ContextError,
@@ -793,6 +795,84 @@ def _run_watch(
     )
 
 
+def _dispatch_review_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    pr_number: int,
+    params: _DispatchParams,
+) -> _PassResult:
+    """Dispatcht den **QA-Stage**-Run: Agent reviewed den offenen PR + merged opt-in.
+
+    Anders als design/in-dev produziert dieser Run keinen Plan/PR, sondern ein
+    ``PRReviewed`` (+ ggf. ``PRMerged``). Bei Merge leitet ``derive_signals`` im
+    nächsten Tick ``has_merged_pr`` ab → ``advance`` schreibt ``qa→release`` fort.
+    Bei ``request_changes`` setzt ``review_done`` weitere QA-Dispatches aus, bis
+    neue Commits/ein neuer PR den Review-Stand zurücksetzen.
+
+    Der Merge bleibt durch ``capabilities.merge_pr`` + Score-Schwelle + grünen
+    CI gegated (``execute_pr_review``/``decide_merge``) — der board-loop entscheidet
+    das nicht selbst.
+    """
+    from forge_execute.agents import ClaudeCodeCLIAgent
+
+    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    console.print(
+        f"\n[bold magenta]>>> board-loop[/bold magenta] qa review for issue "
+        f"#{issue.number} (PR #{pr_number}) [italic]{issue.title}[/italic]"
+    )
+    try:
+        agent = ClaudeCodeCLIAgent(default_model=params.model, claude_bin=params.claude_bin)
+        outcome = execute_pr_review(
+            ctx,
+            pr_number=pr_number,
+            agent=agent,
+            merge=True,
+            model=params.model,
+            issue_body=acceptance,
+        )
+    except Exception as exc:
+        err_console.print(
+            f"[red]error[/red] in qa review for issue #{issue.number}: {exc}"
+        )
+        return _PassResult(
+            summaries=[
+                _LoopSummaryRow(
+                    issue_number=issue.number,
+                    issue_title=issue.title,
+                    decision="error",
+                    pr_url=None,
+                    auto_merge="-",
+                    error=str(exc),
+                )
+            ],
+            bailed=True,
+            dispatched=0,
+            skipped=0,
+        )
+
+    merge_note = "merged" if outcome.merged else (outcome.merge_decision.reason or "no-merge")
+    console.print(
+        f"  [cyan]#{issue.number}[/cyan] review: {outcome.verdict} "
+        f"(score {outcome.score:.2f}, ci {outcome.ci_status}) → {merge_note}"
+    )
+    return _PassResult(
+        summaries=[
+            _LoopSummaryRow(
+                issue_number=issue.number,
+                issue_title=issue.title,
+                decision=f"review:{outcome.verdict}",
+                pr_url=f"#{pr_number}",
+                auto_merge="merged" if outcome.merged else "-",
+                error=outcome.merge_error,
+            )
+        ],
+        bailed=False,
+        dispatched=1,
+        skipped=0,
+    )
+
+
 def _run_conductor_watch(
     *,
     ctx: ForgeContext,
@@ -871,6 +951,7 @@ def _run_conductor_watch(
                 EventKind.RUN_STARTED,
                 EventKind.PLAN_PROPOSED,
                 EventKind.PR_CREATED,
+                EventKind.PR_REVIEWED,
                 EventKind.PR_MERGED,
                 EventKind.RUN_RESUME_SCHEDULED,
             ):
@@ -941,10 +1022,21 @@ def _run_conductor_watch(
                 if issue is None:
                     return
                 # Team nach Stage: design → architect-Run (Plan, kein PR),
-                # in-dev → der bestehende Dev-Loop (PR). Beide teilen sich die
+                # qa → Review-Merge-Agent (PRReviewed/PRMerged, kein neuer PR),
+                # in-dev → der bestehende Dev-Loop (PR). Alle teilen sich die
                 # Tick-Kapazität (sequenziell in v1).
                 if order.stage == Stage.DESIGN:
                     res = _dispatch_design_run(ctx=ctx, issue=issue, params=params)
+                elif order.stage == Stage.QA:
+                    pr_num = pr_number_for_issue(events, order.number)
+                    if pr_num is None:
+                        err_console.print(
+                            f"[yellow]skip[/yellow] qa #{order.number}: kein offener PR gefunden"
+                        )
+                        return
+                    res = _dispatch_review_run(
+                        ctx=ctx, issue=issue, pr_number=pr_num, params=params
+                    )
                 else:
                     res = _dispatch_issues(
                         ctx=ctx,

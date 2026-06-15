@@ -9,6 +9,7 @@ from forge_cli.conductor import (
     WorkItem,
     derive_signals,
     plan_tick,
+    pr_number_for_issue,
     run_conductor_tick,
 )
 from forge_cli.dependencies import (
@@ -162,6 +163,37 @@ def test_plan_tick_design_with_plan_advances_not_dispatched() -> None:
     ]
 
 
+def test_plan_tick_dispatches_qa_in_place_for_open_pr() -> None:
+    # qa mit offenem PR, noch kein Review → in-place dispatcht (Review-Merge-Team).
+    plan = plan_tick(
+        [_wi(1, Stage.QA, signals=StageSignals(has_open_pr=True))], capacity=5
+    )
+    assert plan.dispatch == [DispatchOrder(1, Stage.QA)]
+    assert plan.transitions == []  # bleibt qa, bis gemergt
+
+
+def test_plan_tick_qa_review_done_not_redispatched() -> None:
+    # qa, Review schon gelaufen (request_changes, nicht gemergt) → kein Re-Review.
+    plan = plan_tick(
+        [_wi(1, Stage.QA, signals=StageSignals(has_open_pr=True, review_done=True))],
+        capacity=5,
+    )
+    assert plan.dispatch == []
+    assert plan.transitions == []
+
+
+def test_plan_tick_qa_merged_advances_to_release() -> None:
+    # qa + gemergt → advance qa→release, NICHT im selben Tick re-dispatcht.
+    plan = plan_tick(
+        [_wi(1, Stage.QA, signals=StageSignals(has_merged_pr=True, review_done=True))],
+        capacity=5,
+    )
+    assert plan.dispatch == []
+    assert plan.transitions == [
+        StageTransition(1, Stage.QA, Stage.RELEASE, "pr_merged")
+    ]
+
+
 def test_plan_tick_design_blocked_on_unmet_deps() -> None:
     # design #2 hängt an #1 (nicht done) → blocked, kein Design-Run.
     items = [_wi(1, Stage.IN_DEV), _wi(2, Stage.DESIGN, deps=[1])]
@@ -288,3 +320,39 @@ def test_derive_signals_insufficient_context_is_no_plan() -> None:
         _Evt(EK.PLAN_PROPOSED, "r1", {"insufficient_context": True}),
     ]
     assert derive_signals(events, 1).has_plan is False
+
+
+def test_derive_signals_review_done_from_pr_reviewed() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 42}),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}),
+        _Evt(EK.PR_REVIEWED, "rX", {"pr_number": 100, "verdict": "request_changes"}),
+    ]
+    sig = derive_signals(events, 42)
+    assert sig.has_open_pr is True
+    assert sig.review_done is True
+    assert sig.has_merged_pr is False
+
+
+def test_pr_number_for_issue_resolves_open_pr() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 42}),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}),
+    ]
+    assert pr_number_for_issue(events, 42) == 100
+    assert pr_number_for_issue(events, 99) is None
+
+
+def test_pr_number_for_issue_excludes_merged() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 42}),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}),
+        _Evt(EK.PR_MERGED, "rX", {"pr_number": 100}),
+    ]
+    assert pr_number_for_issue(events, 42) is None

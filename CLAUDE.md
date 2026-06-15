@@ -19,7 +19,8 @@ Die drei Mantras:
 
 Diese Punkte sind **kategorisch ausgeschlossen** — nicht aus Vorsicht, sondern weil zuerst Daten gesammelt werden müssen, bevor sie sich rechtfertigen:
 
-- Auto-Merge (`capabilities.merge_pr`, `push_to_main`, `push_force` sind als `Literal[False]` typisiert, nicht runtime-konfigurierbar)
+- `push_to_main` / `push_force` (als `Literal[False]` typisiert, nicht runtime-konfigurierbar)
+- ~~Auto-Merge~~ — **geändert**: `capabilities.merge_pr` ist seit dem Agent-Review-Merge **opt-in** (`bool`, default `false`). forge darf einen offenen PR nach Agent-Review (verdict `approve`) + grünem CI selbst mergen (`forge review-pr`, `gh pr merge`). Siehe Abschnitt „Agent-Review-Merge". Das ist die bewusste Abkehr vom ursprünglichen kategorischen v1-Ausschluss.
 - Population-Based Search (kommt mit v2, nach 100+ Runs)
 - Bandit / Bayesian Optimization (kommt mit v3, nach 300+ Runs)
 - Self-Improvement: forge ändert ihre eigene Konfiguration NIE (Prinzip 3, Spec Teil 7.4)
@@ -199,27 +200,35 @@ Nutze `GitIgnoreSpec.from_lines(...)` (modern API), nicht `PathSpec.from_lines(G
 
 Windows-Default. Ignorieren. Wenn du sie wirklich loswerden willst: `git config core.autocrlf false`. Inhalte bleiben identisch.
 
-### Auto-Merge ist Spec-Grauzone, nicht Spec-Bruch
+### Zwei Merge-Wege: GitHub-Auto-Merge (Grauzone) UND Agent-Review-Merge (opt-in)
 
+**Weg 1 — GitHub-Auto-Merge (Spec-Grauzone, unverändert).**
 `forge board-loop --auto-merge` und `forge run --auto-merge` rufen
 `gh pr merge --auto --squash --delete-branch` auf. Das **queued** den
 Merge bei GitHub — der eigentliche Merge passiert server-seitig, von
 GitHubs Bots, asynchron, sobald alle required Checks grün sind. forge
-selbst führt **keinen** synchronen `merge`-Subprozess aus.
+selbst führt hier **keinen** synchronen `merge`-Subprozess aus
+(`forge_adapters.github.pr.queue_auto_merge`).
 
-Das ist die erlaubte Lesart der `merge_pr`-Capability (typed
-`Literal[False]`): die Capability verbietet, dass forge selbst mergt
-(forge ruft nicht `gh pr merge <N>` ohne `--auto` auf). GitHub mergt
-auf Operator-Anfrage hin, nicht auf forge-Anfrage. Gleiche Logik wie
-`release.on_main_green: auto_tag` — Tagging ist erlaubt (kein Code-
-Change), und Auto-Merge ist erlaubt-via-GitHub-Feature, nicht erlaubt-
-via-forge-Subprozess.
+**Weg 2 — Agent-Review-Merge (opt-in, forge merged selbst).**
+`forge review-pr <N>` lässt einen Agent einen **offenen** PR bewerten
+(`PRReviewer` → `agent.review`, fail-closed) und merged ihn **synchron
+selbst** (`gh pr merge <N>` ohne `--auto`, `forge_adapters.github.pr.merge_pr`),
+WENN alle drei Bedingungen erfüllt sind (`pr_review.decide_merge`, rein):
+1. `capabilities.merge_pr` ist opt-in `true` (default `false`),
+2. das Review-Verdikt ist `approve` und `score >= threshold`,
+3. der CI ist grün (`summarize_ci` == `pass`; `none` nur mit `allow_missing_ci`).
+Zusätzlich Konflikt-Guard (`mergeable == CONFLICTING` → nie). Events:
+`PRReviewed` (immer) + `PRMerged` (`merged_by_forge=True`) beim Merge.
 
-Wenn du das nicht willst: einfach `--auto-merge` weglassen. PR wird
-geöffnet, Operator mergt manuell. Default-Verhalten bleibt **kein**
-Auto-Merge — der Flag ist explizit opt-in pro Aufruf.
+Das ist die **bewusste Abkehr** vom ursprünglichen kategorischen
+`merge_pr=Literal[False]`-Ausschluss (Operator-Entscheidung). `merge_pr`
+ist jetzt `bool` in der Spec, der Hard-Deny in `Capabilities.check_action`
+gilt nur noch für `push_to_main`/`push_force`. Mantra 3 bleibt intakt:
+der Agent **urteilt**, forge **entscheidet/effektiert** deterministisch.
 
-Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
+Wer das nicht will: `capabilities.merge_pr` auf `false` lassen (Default) —
+dann reviewed `forge review-pr` nur und merged nie.
 
 ## Event-Schema — Achtung, irreversibel
 
@@ -229,7 +238,9 @@ Source: `forge_adapters.github.pr.queue_auto_merge` Docstring.
 - Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
 - Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
 
-Vor jeder Schema-Änderung: `len(EventKind) == 22` und `len(_PAYLOAD_REGISTRY) == 22` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22).
+Vor jeder Schema-Änderung: `len(EventKind) == 23` und `len(_PAYLOAD_REGISTRY) == 23` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22; + Agent-Review-Merge: `PRReviewed` = 23).
+
+`PRMerged` steht auf Schema **1.1** (additiv: `merged_by_forge` + `merge_method` für forge-initiierte Merges). Alte 1.0-Events lesen weiter (Defaults).
 
 `PlanProposed` steht auf Schema **1.1** (additiv: `subtasks: list[PlanSubtask]` + `agents_used: list[str]`). Alte 1.0-Events lesen weiter, weil beide Felder Defaults haben — siehe `test_plan_proposed_schema_is_v1_1_with_additive_fields`.
 
@@ -289,7 +300,9 @@ Läuft ein orchestrierter Run mitten in der Arbeit in ein Claude-Usage-/Session-
 3. **Cost-Caps** (Ressourcen-Ebene) — `SequentialRunner._check_run_cost_cap`
 4. **Subprocess-Isolation** (Prozess-Ebene) — Worktree pro Run, separate venv kommt in M2
 
-`merge_pr` / `push_to_main` / `push_force` sind dreifach gesichert: in der Spec via `Literal[False]`, in `Capabilities.check_action` als hartkodiertes Deny, und im PR-Body steht der Hinweis explizit.
+`push_to_main` / `push_force` sind dreifach gesichert: in der Spec via `Literal[False]`, in `Capabilities.check_action` als hartkodiertes Deny, und im PR-Body steht der Hinweis explizit.
+
+`merge_pr` ist **nicht** mehr hart-deny (Agent-Review-Merge): `bool` in der Spec, gefolgt von `Capabilities.check_action`. Die Sicherheit liegt hier in der **Mehrfach-Bedingung** vor dem Merge (`pr_review.decide_merge`): opt-in-Capability **und** Agent-`approve` **und** `score >= threshold` **und** grüner CI **und** kein Merge-Konflikt. Fail-closed: scheitert der Review-Agent, gilt `request_changes`/`0.0` → kein Merge.
 
 ## Wenn du nicht sicher bist
 

@@ -10,9 +10,14 @@ import pytest
 from forge_adapters.github.pr import (
     GitHubError,
     _extract_pr_number,
+    fetch_pr_metadata,
+    gh_current_login,
+    merge_pr,
+    post_pr_review,
     queue_auto_merge,
     render_pr_body,
     repo_supports_auto_merge,
+    summarize_ci,
 )
 
 
@@ -35,7 +40,7 @@ def test_render_pr_body_minimal() -> None:
     assert "+0.0400" in body or "0.04" in body
     assert "src/calc.py" in body
     assert "git:abc123" in body
-    assert "Auto-merge is categorically disabled" in body
+    assert "after an agent review" in body
 
 
 def test_render_pr_body_no_focus_no_delta() -> None:
@@ -285,3 +290,103 @@ def test_queue_auto_merge_raises_on_gh_merge_failure(tmp_path: Path) -> None:
     )
     with pytest.raises(GitHubError, match="gh pr merge --auto failed"):
         queue_auto_merge(repo=tmp_path, pr_number=999, run_subprocess=runner)
+
+
+# --- summarize_ci (rein) ----------------------------------------------------
+
+
+def test_summarize_ci_empty_is_none() -> None:
+    assert summarize_ci([]) == "none"
+
+
+def test_summarize_ci_all_success_checkruns() -> None:
+    rollup = [
+        {"status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"status": "COMPLETED", "conclusion": "SKIPPED"},
+    ]
+    assert summarize_ci(rollup) == "pass"
+
+
+def test_summarize_ci_failure_dominates() -> None:
+    rollup = [
+        {"status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"status": "COMPLETED", "conclusion": "FAILURE"},
+        {"status": "IN_PROGRESS", "conclusion": ""},
+    ]
+    assert summarize_ci(rollup) == "fail"
+
+
+def test_summarize_ci_pending_when_not_completed() -> None:
+    rollup = [
+        {"status": "COMPLETED", "conclusion": "SUCCESS"},
+        {"status": "IN_PROGRESS", "conclusion": ""},
+    ]
+    assert summarize_ci(rollup) == "pending"
+
+
+def test_summarize_ci_status_context_shape() -> None:
+    # StatusContext nutzt `state` statt status/conclusion.
+    assert summarize_ci([{"state": "SUCCESS"}]) == "pass"
+    assert summarize_ci([{"state": "FAILURE"}]) == "fail"
+    assert summarize_ci([{"state": "PENDING"}]) == "pending"
+
+
+# --- fetch_pr_metadata / merge_pr / post_pr_review --------------------------
+
+
+def test_fetch_pr_metadata_parses_json(tmp_path: Path) -> None:
+    payload = (
+        '{"number": 12, "title": "Fix bug", "body": "Closes #3", '
+        '"state": "OPEN", "baseRefName": "main", "headRefName": "forge/x", '
+        '"mergeable": "MERGEABLE", '
+        '"statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}]}'
+    )
+    runner = _stub_runner(_ok(stdout=payload))
+    meta = fetch_pr_metadata(repo=tmp_path, pr_number=12, run_subprocess=runner)
+    assert meta.number == 12
+    assert meta.state == "OPEN"
+    assert meta.ci_status == "pass"
+    assert meta.mergeable == "MERGEABLE"
+
+
+def test_merge_pr_happy_path_squash(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _ok(),                      # gh pr merge
+        _ok(stdout="forgebot\n"),   # gh api user (merger login)
+    )
+    res = merge_pr(repo=tmp_path, pr_number=42, run_subprocess=runner)
+    assert res.merged is True
+    assert res.merger == "forgebot"
+    assert res.method == "squash"
+    merge_cmd = runner.calls[0]  # type: ignore[attr-defined]
+    assert "merge" in merge_cmd and "42" in merge_cmd
+    assert "--squash" in merge_cmd and "--delete-branch" in merge_cmd
+    assert "--auto" not in merge_cmd  # synchroner Merge, kein queue
+
+
+def test_merge_pr_raises_on_failure(tmp_path: Path) -> None:
+    runner = _stub_runner(_fail("not mergeable"))
+    with pytest.raises(GitHubError, match="gh pr merge 9 failed"):
+        merge_pr(repo=tmp_path, pr_number=9, run_subprocess=runner)
+
+
+def test_gh_current_login_fallback(tmp_path: Path) -> None:
+    runner = _stub_runner(_fail("no auth"))
+    assert gh_current_login(repo=tmp_path, run_subprocess=runner) == "forge"
+
+
+def test_post_pr_review_approve(tmp_path: Path) -> None:
+    runner = _stub_runner(_ok())
+    post_pr_review(
+        repo=tmp_path, pr_number=5, approve=True, body="lgtm", run_subprocess=runner
+    )
+    cmd = runner.calls[0]  # type: ignore[attr-defined]
+    assert "review" in cmd and "--approve" in cmd
+
+
+def test_post_pr_review_request_changes_raises_on_failure(tmp_path: Path) -> None:
+    runner = _stub_runner(_fail("cannot review own pr"))
+    with pytest.raises(GitHubError, match="gh pr review"):
+        post_pr_review(
+            repo=tmp_path, pr_number=5, approve=False, body="no", run_subprocess=runner
+        )

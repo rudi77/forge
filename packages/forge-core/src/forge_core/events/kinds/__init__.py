@@ -28,6 +28,7 @@ from forge_core.events.kinds.pr import (
     PRCreatedPayload,
     PRMergedPayload,
     PRRevertedPayload,
+    PRReviewedPayload,
 )
 from forge_core.events.kinds.preflight import PreflightFailedPayload
 from forge_core.events.kinds.proposal import (
@@ -58,6 +59,7 @@ __all__ = [
     "PRCreatedPayload",
     "PRMergedPayload",
     "PRRevertedPayload",
+    "PRReviewedPayload",
     "PlanProposedPayload",
     "PlanSubtask",
     "PreflightFailedPayload",

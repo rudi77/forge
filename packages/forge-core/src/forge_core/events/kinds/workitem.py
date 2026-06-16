@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from forge_core.events.base import EventKind, register_payload
 
-BlockedKind = Literal["deps", "cycle", "error"]
+BlockedKind = Literal["deps", "cycle", "error", "dev_exhausted"]
 
 
 class WorkItemStageChangedPayload(BaseModel):
@@ -43,7 +43,8 @@ class WorkItemBlockedPayload(BaseModel):
     issue_number: int = Field(gt=0)
     kind: BlockedKind
     """``deps`` = wartet auf offene Dependencies, ``cycle`` = Zyklus im
-    Dependency-Graph, ``error`` = Dispatch/Adapter-Fehler."""
+    Dependency-Graph, ``error`` = Dispatch/Adapter-Fehler, ``dev_exhausted`` =
+    in-dev-Run produzierte nach mehreren Versuchen keinen PR (eskaliert)."""
 
     blocked_by: list[int] = Field(default_factory=list)
     """Issue-Nummern, die das Item blockieren (bei ``deps``/``cycle``)."""
@@ -54,4 +55,7 @@ class WorkItemBlockedPayload(BaseModel):
 register_payload(
     EventKind.WORK_ITEM_STAGE_CHANGED, WorkItemStageChangedPayload, "1.0"
 )
-register_payload(EventKind.WORK_ITEM_BLOCKED, WorkItemBlockedPayload, "1.0")
+# 1.1 (additiv): BlockedKind um "dev_exhausted" erweitert (in-dev-Eskalation
+# nach erschöpften Re-Dispatch-Versuchen). Alte 1.0-Events lesen weiter, da der
+# Wertebereich nur erweitert wurde.
+register_payload(EventKind.WORK_ITEM_BLOCKED, WorkItemBlockedPayload, "1.1")

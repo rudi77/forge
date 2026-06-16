@@ -5,10 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from forge_cli.conductor import (
+    MAX_DEV_RETRIES,
     Blocked,
     DispatchOrder,
     StageTransition,
     WorkItem,
+    derive_dev_failure,
     derive_signals,
     plan_tick,
     pr_number_for_issue,
@@ -196,6 +198,54 @@ def test_plan_tick_qa_merged_advances_to_release() -> None:
     ]
 
 
+# --- A1: in-dev Re-Dispatch / Eskalation ----------------------------------
+
+
+def test_plan_tick_in_dev_redispatch_when_no_pr() -> None:
+    # in-dev, Run ohne PR, Versuche < MAX → Re-Dispatch in-place.
+    plan = plan_tick(
+        [_wi(1, Stage.IN_DEV, signals=StageSignals(dev_failed_no_pr=True, dev_attempts=1))],
+        capacity=1,
+    )
+    assert plan.dispatch == [DispatchOrder(1, Stage.IN_DEV)]
+    # KEIN ready→in-dev-Übergang (Item steht schon auf in-dev).
+    assert plan.transitions == []
+    assert plan.blocked == []
+
+
+def test_plan_tick_in_dev_escalates_after_max_retries() -> None:
+    plan = plan_tick(
+        [
+            _wi(
+                1,
+                Stage.IN_DEV,
+                signals=StageSignals(dev_failed_no_pr=True, dev_attempts=MAX_DEV_RETRIES),
+            )
+        ],
+        capacity=1,
+    )
+    assert plan.dispatch == []
+    assert plan.blocked == [
+        Blocked(
+            1,
+            "dev_exhausted",
+            (),
+            f"dev run produced no PR after {MAX_DEV_RETRIES} attempts",
+        )
+    ]
+    assert plan.transitions == [
+        StageTransition(1, Stage.IN_DEV, Stage.BLOCKED, "dev_retries_exhausted")
+    ]
+
+
+def test_plan_tick_in_dev_without_failure_signal_not_dispatched() -> None:
+    # in-dev ohne Failure-Signal → kein Dispatch (wartet auf PR/advance).
+    plan = plan_tick([_wi(1, Stage.IN_DEV)], capacity=5)
+    assert plan.dispatch == []
+    assert plan.transitions == []
+    assert plan.blocked == []
+
+
 def test_plan_tick_design_blocked_on_unmet_deps() -> None:
     # design #2 hängt an #1 (nicht done) → blocked, kein Design-Run.
     items = [_wi(1, Stage.IN_DEV), _wi(2, Stage.DESIGN, deps=[1])]
@@ -376,6 +426,82 @@ def test_derive_signals_review_done_uses_latest_review() -> None:
     # → noch gültig (sonst würde ein altes Review jeden Commit veralten lassen).
     between = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
     assert derive_signals(events, 42, head_committed_at=between).review_done is True
+
+
+# --- derive_dev_failure (A1) ----------------------------------------------
+
+
+def _t(hour: int):
+    return datetime(2026, 1, 1, hour, tzinfo=UTC)
+
+
+def test_derive_dev_failure_latest_fail_no_pr() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5, "focus": "bug"}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}, ts=_t(1)),
+    ]
+    assert derive_dev_failure(events, 5) == (True, 1)
+
+
+def test_derive_dev_failure_rate_limited_excluded() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "rate_limited"}, ts=_t(1)),
+    ]
+    # rate_limited gehört dem Resume-Pfad → kein Dev-Failure.
+    assert derive_dev_failure(events, 5) == (False, 0)
+
+
+def test_derive_dev_failure_pr_present_not_failure() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}, ts=_t(1)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "pr_created"}, ts=_t(1)),
+    ]
+    assert derive_dev_failure(events, 5) == (False, 0)
+
+
+def test_derive_dev_failure_ignores_design_run() -> None:
+    from forge_core.events import EventKind as EK
+
+    # design-Run mit gleichem issue_number darf NICHT als Dev-Failure zählen.
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5, "focus": "design:#5"}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}, ts=_t(1)),
+    ]
+    assert derive_dev_failure(events, 5) == (False, 0)
+
+
+def test_derive_dev_failure_in_flight_retry_suppressed() -> None:
+    from forge_core.events import EventKind as EK
+
+    # Ein neuer Dev-Run NACH dem letzten Finish läuft noch → nicht erneut flaggen.
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "error"}, ts=_t(1)),
+        _Evt(EK.RUN_STARTED, "r2", {"issue_number": 5}, ts=_t(2)),
+    ]
+    failed, attempts = derive_dev_failure(events, 5)
+    assert failed is False
+    assert attempts == 1
+
+
+def test_derive_dev_failure_counts_multiple_attempts() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}, ts=_t(1)),
+        _Evt(EK.RUN_STARTED, "r2", {"issue_number": 5}, ts=_t(2)),
+        _Evt(EK.RUN_FINISHED, "r2", {"decision": "error"}, ts=_t(3)),
+    ]
+    assert derive_dev_failure(events, 5) == (True, 2)
 
 
 def test_pr_number_for_issue_resolves_open_pr() -> None:

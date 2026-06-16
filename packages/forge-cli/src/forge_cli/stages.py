@@ -71,9 +71,23 @@ class StageSignals:
 
     review_done: bool = False
     """Für den offenen PR liegt bereits ein ``PRReviewed`` vor (Agent hat
-    geurteilt). Gate gegen teures Endlos-Re-Review in der ``qa``-Stage:
-    nach einem ``request_changes`` (kein Merge) wird NICHT erneut dispatcht,
-    bis neue Commits/ein neuer PR den Review-Stand zurücksetzen (Loop 1c)."""
+    geurteilt) UND seither kam kein neuer Commit. Gate gegen teures
+    Endlos-Re-Review in der ``qa``-Stage: nach einem ``request_changes`` (kein
+    Merge) wird NICHT erneut dispatcht, bis neue Commits den Review-Stand
+    zurücksetzen (Loop 1c — die Wiring-Schicht injiziert dazu den
+    Head-Commit-Zeitstempel in ``derive_signals``)."""
+
+    dev_failed_no_pr: bool = False
+    """Der jüngste *abgeschlossene* Dev-Run dieses Items endete ohne PR (kein
+    ``pr_created``, nicht ``rate_limited``), es gibt aktuell keinen offenen PR
+    und kein Dev-Run ist gerade in-flight. Auslöser für Re-Dispatch/Eskalation
+    in der ``in-dev``-Stage (A1)."""
+
+    dev_attempts: int = 0
+    """Anzahl der bisher fehlgeschlagenen Dev-Runs (ohne PR) dieses Items. Aus
+    dem Event-Strom abgeleitet (überlebt Heartbeat-Restarts). Erreicht sie
+    ``MAX_DEV_RETRIES``, eskaliert der Conductor das Item nach ``blocked``
+    statt erneut zu dispatchen."""
 
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
@@ -89,9 +103,11 @@ class StageSignals:
 # ein ``request_changes`` nicht jeden Tick ein teures Re-Review auslöst.
 #
 # ``in-dev`` steht bewusst NICHT hier: es wird beim ``ready→in-dev``-Übergang
-# *gekoppelt* dispatcht (genau einmal). Re-Dispatch/Eskalation bei
-# ausbleibendem PR (``no_improvement``) ist eine eigene Design-Entscheidung
-# (conductor-design.md §3, noch offen) — kein stiller Endlos-Retry.
+# *gekoppelt* dispatcht (genau einmal). Produziert dieser Run jedoch keinen PR
+# (``dev_failed_no_pr``), re-dispatcht ``plan_tick`` das Dev-Team bis
+# ``MAX_DEV_RETRIES`` und eskaliert danach nach ``blocked`` (A1) — ein
+# *beschränkter* Retry, kein stiller Endlos-Retry. Das ist ein eigener
+# plan_tick-Zweig (nicht In-Place), weil er signal-gegated ist.
 #
 # Wächst die Liste (``requirements``/``release``), braucht jede neue Stage
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen

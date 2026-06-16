@@ -21,6 +21,27 @@ from forge_core.events import EventKind
 from forge_cli.dependencies import find_cycle, unmet_dependencies
 from forge_cli.stages import IN_PLACE_WORK_STAGES, Stage, StageSignals, advance
 
+# Beschränkter Re-Dispatch eines in-dev-Items, dessen Run keinen PR produzierte,
+# bevor der Conductor nach ``blocked`` eskaliert (A1). Bewusst eine
+# Modul-Konstante statt eines Spec-Felds in v1 (Blast-Radius klein halten — die
+# harte Ressourcen-Grenze sind Cost-Caps + max_turns auf der Loop-1-Seite). Wird
+# das konfigurierbar, wandert es als optionales Feld in die Conductor-Config.
+MAX_DEV_RETRIES: int = 2
+
+# Decisions eines Dev-Runs, die als "kein PR, fehlgeschlagen" zählen. NICHT
+# enthalten: ``pr_created`` (Erfolg) und ``rate_limited`` (gehört dem
+# Resume-Pfad, ``derive_pending_resumes``).
+_DEV_NO_PR_FAILURES: frozenset[str] = frozenset(
+    {
+        "no_improvement",
+        "error",
+        "cost_cap_hit",
+        "guardrail_blocked",
+        "preflight_blocked",
+        "self_terminated",
+    }
+)
+
 
 @dataclass(frozen=True)
 class WorkItem:
@@ -131,6 +152,32 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             if w.stage == Stage.QA and w.signals.review_done:
                 continue
             target = w.stage
+        elif w.stage == Stage.IN_DEV and w.signals.dev_failed_no_pr:
+            # Dev-Run produzierte keinen PR. Beschränkter Re-Dispatch (A1):
+            # bis MAX_DEV_RETRIES erneut dispatchen, danach nach blocked
+            # eskalieren — kein stiller Endlos-Retry.
+            if w.signals.dev_attempts >= MAX_DEV_RETRIES:
+                blocked.append(
+                    Blocked(
+                        w.number,
+                        "dev_exhausted",
+                        (),
+                        f"dev run produced no PR after "
+                        f"{w.signals.dev_attempts} attempts",
+                    )
+                )
+                transitions.append(
+                    StageTransition(
+                        w.number,
+                        Stage.IN_DEV,
+                        Stage.BLOCKED,
+                        "dev_retries_exhausted",
+                    )
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            # Re-Dispatch in-place (kein Stage-Wechsel — Item ist schon in-dev).
+            target = Stage.IN_DEV
         elif w.stage == Stage.READY:
             # Warteschlange → Dev-Team; Übergang folgt beim Dispatch.
             target = Stage.IN_DEV
@@ -152,9 +199,13 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             candidates.append(DispatchOrder(w.number, target))
 
     # 4. DISPATCH (gemeinsame Kapazität über alle Teams) ---------------
+    by_num = {w.number: w for w in items}
     selected = candidates[: max(0, capacity)]
     for order in selected:
-        if order.stage == Stage.IN_DEV:
+        # Der ready→in-dev-Übergang gehört NUR zum Erst-Dispatch aus der
+        # Warteschlange — NICHT zum A1-Re-Dispatch eines Items, das bereits auf
+        # in-dev steht (sonst ein illegaler ready→in-dev-Übergang).
+        if order.stage == Stage.IN_DEV and by_num[order.number].stage == Stage.READY:
             transitions.append(
                 StageTransition(order.number, Stage.READY, Stage.IN_DEV, "dispatched")
             )
@@ -315,6 +366,81 @@ def pr_number_for_issue(events: list, issue_number: int) -> int | None:
     }
     open_prs = [n for n in pr_numbers if n not in merged]
     return max(open_prs) if open_prs else None
+
+
+def _is_dev_run_started(payload: dict) -> bool:
+    """True, wenn ein ``RunStarted``-Payload zu einem *Dev-Loop*-Run gehört
+    (nicht design/requirements/review).
+
+    Discriminator rein über vorhandene Felder: ein Dev-Run setzt kein
+    ``pr_number`` (anders als Review) und hat keinen Stage-Präfix im ``focus``
+    (design setzt ``design:#N``, requirements ``requirements:#N``).
+    """
+    if payload.get("pr_number") is not None:
+        return False
+    focus = payload.get("focus") or ""
+    return not any(
+        focus.startswith(prefix)
+        for prefix in ("design:", "requirements:", "review:")
+    )
+
+
+def derive_dev_failure(events: list, issue_number: int) -> tuple[bool, int]:
+    """Leitet ``(dev_failed_no_pr, dev_attempts)`` für ein ``in-dev``-Item ab.
+
+    Rein und replay-fähig (Mantra 3). Ein Dev-Run zählt als „No-PR-Failure",
+    wenn sein ``RunFinished`` eine Decision aus :data:`_DEV_NO_PR_FAILURES`
+    trägt und kein ``PRCreated`` für seine ``run_id`` existiert.
+
+      - ``dev_attempts``    : Anzahl solcher fehlgeschlagenen Dev-Runs.
+      - ``dev_failed_no_pr``: der jüngste *abgeschlossene* Dev-Run ist ein
+        No-PR-Failure UND es gibt aktuell keinen offenen PR (Sicherheits-Gate)
+        UND kein Dev-Run ist gerade in-flight (ein ``RunStarted`` neuer als das
+        jüngste ``RunFinished`` — verhindert Doppel-Dispatch, während ein Retry
+        schon läuft; Vorbild: ``derive_pending_resumes``' already_resumed-Gate).
+    """
+    dev_started: dict[str, object] = {}
+    for e in events:
+        if (
+            e.kind == EventKind.RUN_STARTED
+            and (e.payload or {}).get("issue_number") == issue_number
+            and _is_dev_run_started(e.payload or {})
+        ):
+            dev_started[e.run_id] = e.ts
+    if not dev_started:
+        return (False, 0)
+
+    run_ids = set(dev_started)
+    pr_run_ids = {
+        e.run_id
+        for e in events
+        if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+    }
+    finishes = [
+        e
+        for e in events
+        if e.kind == EventKind.RUN_FINISHED and e.run_id in run_ids
+    ]
+    finishes.sort(key=lambda e: e.ts)
+
+    attempts = sum(
+        1
+        for e in finishes
+        if (e.payload or {}).get("decision") in _DEV_NO_PR_FAILURES
+        and e.run_id not in pr_run_ids
+    )
+    if not finishes:
+        return (False, attempts)
+
+    latest = finishes[-1]
+    latest_is_failure = (
+        (latest.payload or {}).get("decision") in _DEV_NO_PR_FAILURES
+        and latest.run_id not in pr_run_ids
+    )
+    has_open_pr = pr_number_for_issue(events, issue_number) is not None
+    in_flight = any(ts > latest.ts for ts in dev_started.values())
+    failed_no_pr = latest_is_failure and not has_open_pr and not in_flight
+    return (failed_no_pr, attempts)
 
 
 @dataclass(frozen=True)

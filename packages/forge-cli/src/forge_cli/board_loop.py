@@ -22,7 +22,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -66,6 +66,7 @@ from forge_cli.conductor import (
     ResumeOrder,
     StageTransition,
     WorkItem,
+    derive_dev_failure,
     derive_pending_resumes,
     derive_signals,
     pr_number_for_issue,
@@ -997,6 +998,7 @@ def _run_conductor_watch(
             events = []
             for kind in (
                 EventKind.RUN_STARTED,
+                EventKind.RUN_FINISHED,
                 EventKind.PLAN_PROPOSED,
                 EventKind.PR_CREATED,
                 EventKind.PR_REVIEWED,
@@ -1044,16 +1046,22 @@ def _run_conductor_watch(
                         head_committed_at = fetch_pr_head_committed_at(
                             repo=ctx.repo_root, pr_number=qa_pr
                         )
+                signals = derive_signals(
+                    events, issue.number, head_committed_at=head_committed_at
+                )
+                # A1: in-dev-Item, dessen Dev-Run keinen PR produzierte →
+                # Re-Dispatch-/Eskalations-Signale aus dem Event-Strom ableiten.
+                if stage == Stage.IN_DEV:
+                    failed, attempts = derive_dev_failure(events, issue.number)
+                    signals = replace(
+                        signals, dev_failed_no_pr=failed, dev_attempts=attempts
+                    )
                 items.append(
                     WorkItem(
                         number=issue.number,
                         stage=stage,
                         depends_on=tuple(parse_depends_on(issue.body)),
-                        signals=derive_signals(
-                            events,
-                            issue.number,
-                            head_committed_at=head_committed_at,
-                        ),
+                        signals=signals,
                     )
                 )
             if not items:

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from forge_cli.conductor import (
+    MAX_DEV_RETRIES,
     Blocked,
     DispatchOrder,
     StageTransition,
     WorkItem,
+    derive_dev_failure,
     derive_signals,
     plan_tick,
     pr_number_for_issue,
@@ -56,6 +60,23 @@ def test_advance_event_driven_transitions() -> None:
         Stage.READY,
         "",
     )
+
+
+def test_advance_requirements_to_design() -> None:
+    assert advance(Stage.REQUIREMENTS, StageSignals(has_refined_spec=True)) == (
+        Stage.DESIGN,
+        "requirements_refined",
+    )
+    # Kein Signal → bleibt requirements.
+    assert advance(Stage.REQUIREMENTS, StageSignals()) == (Stage.REQUIREMENTS, "")
+
+
+def test_advance_release_to_done() -> None:
+    assert advance(Stage.RELEASE, StageSignals(release_done=True)) == (
+        Stage.DONE,
+        "released",
+    )
+    assert advance(Stage.RELEASE, StageSignals()) == (Stage.RELEASE, "")
 
 
 def test_allowed_transitions_guard() -> None:
@@ -194,6 +215,98 @@ def test_plan_tick_qa_merged_advances_to_release() -> None:
     ]
 
 
+# --- B1: requirements → design --------------------------------------------
+
+
+def test_plan_tick_requirements_in_place_dispatch() -> None:
+    # requirements ohne refined spec → in-place dispatch (Team = analyst/architect),
+    # kein Stage-Wechsel.
+    plan = plan_tick([_wi(1, Stage.REQUIREMENTS)], capacity=1)
+    assert plan.dispatch == [DispatchOrder(1, Stage.REQUIREMENTS)]
+    assert plan.transitions == []
+
+
+def test_plan_tick_requirements_advances_when_refined() -> None:
+    plan = plan_tick(
+        [_wi(1, Stage.REQUIREMENTS, signals=StageSignals(has_refined_spec=True))],
+        capacity=1,
+    )
+    # advance requirements→design, NICHT im selben Tick re-dispatcht.
+    assert plan.dispatch == []
+    assert plan.transitions == [
+        StageTransition(1, Stage.REQUIREMENTS, Stage.DESIGN, "requirements_refined")
+    ]
+
+
+# --- B2: release → done ----------------------------------------------------
+
+
+def test_plan_tick_release_in_place_dispatch() -> None:
+    # release ohne release_done → in-place dispatch (deterministischer Effekt).
+    plan = plan_tick([_wi(1, Stage.RELEASE)], capacity=1)
+    assert plan.dispatch == [DispatchOrder(1, Stage.RELEASE)]
+    assert plan.transitions == []
+
+
+def test_plan_tick_release_advances_to_done() -> None:
+    plan = plan_tick(
+        [_wi(1, Stage.RELEASE, signals=StageSignals(release_done=True))],
+        capacity=1,
+    )
+    assert plan.dispatch == []
+    assert plan.transitions == [
+        StageTransition(1, Stage.RELEASE, Stage.DONE, "released")
+    ]
+
+
+# --- A1: in-dev Re-Dispatch / Eskalation ----------------------------------
+
+
+def test_plan_tick_in_dev_redispatch_when_no_pr() -> None:
+    # in-dev, Run ohne PR, Versuche < MAX → Re-Dispatch in-place.
+    plan = plan_tick(
+        [_wi(1, Stage.IN_DEV, signals=StageSignals(dev_failed_no_pr=True, dev_attempts=1))],
+        capacity=1,
+    )
+    assert plan.dispatch == [DispatchOrder(1, Stage.IN_DEV)]
+    # KEIN ready→in-dev-Übergang (Item steht schon auf in-dev).
+    assert plan.transitions == []
+    assert plan.blocked == []
+
+
+def test_plan_tick_in_dev_escalates_after_max_retries() -> None:
+    plan = plan_tick(
+        [
+            _wi(
+                1,
+                Stage.IN_DEV,
+                signals=StageSignals(dev_failed_no_pr=True, dev_attempts=MAX_DEV_RETRIES),
+            )
+        ],
+        capacity=1,
+    )
+    assert plan.dispatch == []
+    assert plan.blocked == [
+        Blocked(
+            1,
+            "dev_exhausted",
+            (),
+            f"dev run produced no PR after {MAX_DEV_RETRIES} attempts",
+        )
+    ]
+    assert plan.transitions == [
+        StageTransition(1, Stage.IN_DEV, Stage.BLOCKED, "dev_retries_exhausted")
+    ]
+
+
+def test_plan_tick_in_dev_without_failure_signal_not_dispatched() -> None:
+    # in-dev ohne Failure-Signal → kein Dispatch (wartet auf PR/advance).
+    plan = plan_tick([_wi(1, Stage.IN_DEV)], capacity=5)
+    assert plan.dispatch == []
+    assert plan.transitions == []
+    assert plan.blocked == []
+
+
 def test_plan_tick_design_blocked_on_unmet_deps() -> None:
     # design #2 hängt an #1 (nicht done) → blocked, kein Design-Run.
     items = [_wi(1, Stage.IN_DEV), _wi(2, Stage.DESIGN, deps=[1])]
@@ -276,12 +389,13 @@ def test_run_conductor_tick_reports_blocked() -> None:
 
 
 class _Evt:
-    """Minimaler Event-Stand-in (kind/run_id/payload)."""
+    """Minimaler Event-Stand-in (kind/run_id/payload/ts)."""
 
-    def __init__(self, kind, run_id, payload):
+    def __init__(self, kind, run_id, payload, ts=None):
         self.kind = kind
         self.run_id = run_id
         self.payload = payload
+        self.ts = ts or datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def test_derive_signals_from_events() -> None:
@@ -312,6 +426,43 @@ def test_derive_signals_unknown_issue_is_empty() -> None:
     assert sig == StageSignals()
 
 
+def test_derive_signals_release_done_via_issue_number() -> None:
+    from forge_core.events import EventKind as EK
+
+    # ReleaseTagged hat keinen RunStarted → korreliert direkt über issue_number.
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 9}),
+        _Evt(EK.RELEASE_TAGGED, "session-x", {"issue_number": 9, "tag": "forge-issue-9"}),
+    ]
+    assert derive_signals(events, 9).release_done is True
+    # Anderes Issue schlägt nicht durch.
+    assert derive_signals(events, 8).release_done is False
+
+
+def test_derive_signals_has_refined_spec() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 9}),
+        _Evt(
+            EK.REQUIREMENTS_REFINED,
+            "r1",
+            {"issue_number": 9, "insufficient_context": False},
+        ),
+    ]
+    assert derive_signals(events, 9).has_refined_spec is True
+    # insufficient_context → kein Advance-Signal.
+    events2 = [
+        _Evt(EK.RUN_STARTED, "r2", {"issue_number": 9}),
+        _Evt(
+            EK.REQUIREMENTS_REFINED,
+            "r2",
+            {"issue_number": 9, "insufficient_context": True},
+        ),
+    ]
+    assert derive_signals(events2, 9).has_refined_spec is False
+
+
 def test_derive_signals_insufficient_context_is_no_plan() -> None:
     from forge_core.events import EventKind as EK
 
@@ -334,6 +485,121 @@ def test_derive_signals_review_done_from_pr_reviewed() -> None:
     assert sig.has_open_pr is True
     assert sig.review_done is True
     assert sig.has_merged_pr is False
+
+
+def test_derive_signals_review_stale_when_new_commit() -> None:
+    """A2: ein Commit NACH dem Review → review_done False (Re-Review fällig)."""
+    from forge_core.events import EventKind as EK
+
+    review_ts = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 42}),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}),
+        _Evt(EK.PR_REVIEWED, "rX", {"pr_number": 100}, ts=review_ts),
+    ]
+    # Commit später als Review → veraltet.
+    newer = datetime(2026, 6, 1, 13, 0, tzinfo=UTC)
+    assert derive_signals(events, 42, head_committed_at=newer).review_done is False
+    # Commit vor/gleich Review → noch gültig.
+    older = datetime(2026, 6, 1, 11, 0, tzinfo=UTC)
+    assert derive_signals(events, 42, head_committed_at=older).review_done is True
+    assert derive_signals(events, 42, head_committed_at=review_ts).review_done is True
+    # Ohne Board-Datum → Fallback aufs alte Verhalten (Review existiert).
+    assert derive_signals(events, 42, head_committed_at=None).review_done is True
+
+
+def test_derive_signals_review_done_uses_latest_review() -> None:
+    """A2: bei mehreren Reviews zählt das jüngste, nicht das erste."""
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 42}),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}),
+        _Evt(EK.PR_REVIEWED, "rX", {"pr_number": 100},
+             ts=datetime(2026, 6, 1, 10, 0, tzinfo=UTC)),
+        _Evt(EK.PR_REVIEWED, "rY", {"pr_number": 100},
+             ts=datetime(2026, 6, 1, 14, 0, tzinfo=UTC)),
+    ]
+    # Commit zwischen den beiden Reviews → das jüngste Review (14:00) ist neuer
+    # → noch gültig (sonst würde ein altes Review jeden Commit veralten lassen).
+    between = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    assert derive_signals(events, 42, head_committed_at=between).review_done is True
+
+
+# --- derive_dev_failure (A1) ----------------------------------------------
+
+
+def _t(hour: int):
+    return datetime(2026, 1, 1, hour, tzinfo=UTC)
+
+
+def test_derive_dev_failure_latest_fail_no_pr() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5, "focus": "bug"}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}, ts=_t(1)),
+    ]
+    assert derive_dev_failure(events, 5) == (True, 1)
+
+
+def test_derive_dev_failure_rate_limited_excluded() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "rate_limited"}, ts=_t(1)),
+    ]
+    # rate_limited gehört dem Resume-Pfad → kein Dev-Failure.
+    assert derive_dev_failure(events, 5) == (False, 0)
+
+
+def test_derive_dev_failure_pr_present_not_failure() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}, ts=_t(1)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "pr_created"}, ts=_t(1)),
+    ]
+    assert derive_dev_failure(events, 5) == (False, 0)
+
+
+def test_derive_dev_failure_ignores_design_run() -> None:
+    from forge_core.events import EventKind as EK
+
+    # design-Run mit gleichem issue_number darf NICHT als Dev-Failure zählen.
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5, "focus": "design:#5"}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}, ts=_t(1)),
+    ]
+    assert derive_dev_failure(events, 5) == (False, 0)
+
+
+def test_derive_dev_failure_in_flight_retry_suppressed() -> None:
+    from forge_core.events import EventKind as EK
+
+    # Ein neuer Dev-Run NACH dem letzten Finish läuft noch → nicht erneut flaggen.
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "error"}, ts=_t(1)),
+        _Evt(EK.RUN_STARTED, "r2", {"issue_number": 5}, ts=_t(2)),
+    ]
+    failed, attempts = derive_dev_failure(events, 5)
+    assert failed is False
+    assert attempts == 1
+
+
+def test_derive_dev_failure_counts_multiple_attempts() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 5}, ts=_t(0)),
+        _Evt(EK.RUN_FINISHED, "r1", {"decision": "no_improvement"}, ts=_t(1)),
+        _Evt(EK.RUN_STARTED, "r2", {"issue_number": 5}, ts=_t(2)),
+        _Evt(EK.RUN_FINISHED, "r2", {"decision": "error"}, ts=_t(3)),
+    ]
+    assert derive_dev_failure(events, 5) == (True, 2)
 
 
 def test_pr_number_for_issue_resolves_open_pr() -> None:

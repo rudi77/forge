@@ -60,6 +60,11 @@ ALLOWED_TRANSITIONS: dict[Stage, frozenset[Stage]] = {
 class StageSignals:
     """Beobachtungen über ein Work-Item, aus dem Event-Store abgeleitet."""
 
+    has_refined_spec: bool = False
+    """Ein ``RequirementsRefined`` (ohne ``insufficient_context``) liegt vor —
+    das requirements-Team hat testbare Akzeptanzkriterien verdichtet
+    (Advance-Signal requirements→design)."""
+
     has_plan: bool = False
     """Ein ``PlanProposed`` (ohne ``insufficient_context``) liegt vor."""
 
@@ -71,9 +76,27 @@ class StageSignals:
 
     review_done: bool = False
     """Für den offenen PR liegt bereits ein ``PRReviewed`` vor (Agent hat
-    geurteilt). Gate gegen teures Endlos-Re-Review in der ``qa``-Stage:
-    nach einem ``request_changes`` (kein Merge) wird NICHT erneut dispatcht,
-    bis neue Commits/ein neuer PR den Review-Stand zurücksetzen (Loop 1c)."""
+    geurteilt) UND seither kam kein neuer Commit. Gate gegen teures
+    Endlos-Re-Review in der ``qa``-Stage: nach einem ``request_changes`` (kein
+    Merge) wird NICHT erneut dispatcht, bis neue Commits den Review-Stand
+    zurücksetzen (Loop 1c — die Wiring-Schicht injiziert dazu den
+    Head-Commit-Zeitstempel in ``derive_signals``)."""
+
+    dev_failed_no_pr: bool = False
+    """Der jüngste *abgeschlossene* Dev-Run dieses Items endete ohne PR (kein
+    ``pr_created``, nicht ``rate_limited``), es gibt aktuell keinen offenen PR
+    und kein Dev-Run ist gerade in-flight. Auslöser für Re-Dispatch/Eskalation
+    in der ``in-dev``-Stage (A1)."""
+
+    dev_attempts: int = 0
+    """Anzahl der bisher fehlgeschlagenen Dev-Runs (ohne PR) dieses Items. Aus
+    dem Event-Strom abgeleitet (überlebt Heartbeat-Restarts). Erreicht sie
+    ``MAX_DEV_RETRIES``, eskaliert der Conductor das Item nach ``blocked``
+    statt erneut zu dispatchen."""
+
+    release_done: bool = False
+    """Ein ``ReleaseTagged`` liegt vor — forge hat Tag + Release erzeugt
+    (Advance-Signal release→done; opt-in ``capabilities.create_release``)."""
 
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
@@ -89,14 +112,18 @@ class StageSignals:
 # ein ``request_changes`` nicht jeden Tick ein teures Re-Review auslöst.
 #
 # ``in-dev`` steht bewusst NICHT hier: es wird beim ``ready→in-dev``-Übergang
-# *gekoppelt* dispatcht (genau einmal). Re-Dispatch/Eskalation bei
-# ausbleibendem PR (``no_improvement``) ist eine eigene Design-Entscheidung
-# (conductor-design.md §3, noch offen) — kein stiller Endlos-Retry.
+# *gekoppelt* dispatcht (genau einmal). Produziert dieser Run jedoch keinen PR
+# (``dev_failed_no_pr``), re-dispatcht ``plan_tick`` das Dev-Team bis
+# ``MAX_DEV_RETRIES`` und eskaliert danach nach ``blocked`` (A1) — ein
+# *beschränkter* Retry, kein stiller Endlos-Retry. Das ist ein eigener
+# plan_tick-Zweig (nicht In-Place), weil er signal-gegated ist.
 #
 # Wächst die Liste (``requirements``/``release``), braucht jede neue Stage
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
 # Dispatch-Zweig in der board-loop-Wiring-Schicht.
-IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset({Stage.DESIGN, Stage.QA})
+IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset(
+    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA, Stage.RELEASE}
+)
 
 
 def stage_of(labels: list[str]) -> Stage | None:
@@ -131,21 +158,26 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     Dispatch-Logik.
 
     Deckt nur die event-getriebenen Übergänge ab:
-      - design  → ready    sobald ein Plan vorliegt
-      - in-dev  → qa       sobald ein PR geöffnet wurde
-      - qa      → release  sobald der PR gemergt wurde
+      - requirements → design   sobald die Akzeptanzkriterien verdichtet sind
+      - design       → ready     sobald ein Plan vorliegt
+      - in-dev       → qa         sobald ein PR geöffnet wurde
+      - qa           → release    sobald der PR gemergt wurde
+      - release      → done        sobald Tag + Release erzeugt sind
 
     ``ready → in-dev`` passiert beim DISPATCH (Conductor, mit Kapazität +
-    Dependencies) und ``release → done`` / ``requirements → design`` brauchen
-    die devops- bzw. requirements-Rolle — beide hier bewusst NICHT automatisch.
-    Gibt ``(stage, "")`` zurück, wenn kein Übergang fällig ist.
+    Dependencies) — hier bewusst NICHT automatisch. Gibt ``(stage, "")``
+    zurück, wenn kein Übergang fällig ist.
     """
+    if stage == Stage.REQUIREMENTS and signals.has_refined_spec:
+        return Stage.DESIGN, "requirements_refined"
     if stage == Stage.DESIGN and signals.has_plan:
         return Stage.READY, "plan_proposed"
     if stage == Stage.IN_DEV and signals.has_open_pr:
         return Stage.QA, "pr_created"
     if stage == Stage.QA and signals.has_merged_pr:
         return Stage.RELEASE, "pr_merged"
+    if stage == Stage.RELEASE and signals.release_done:
+        return Stage.DONE, "released"
     return stage, ""
 
 

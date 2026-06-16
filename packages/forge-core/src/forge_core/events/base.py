@@ -50,6 +50,12 @@ class EventKind(StrEnum):
     # Resilienz: ein Run lief in ein Claude-Usage-/Session-Limit und kann
     # später per `claude --resume` fortgesetzt werden (Anker für Loop 2).
     RUN_RESUME_SCHEDULED = "RunResumeScheduled"
+    # Pipeline-Ende vorne: ein requirements-Run hat ein rohes Issue zu
+    # testbaren Akzeptanzkriterien verdichtet (Advance-Signal requirements→design).
+    REQUIREMENTS_REFINED = "RequirementsRefined"
+    # Pipeline-Ende hinten: forge hat in der release-Stage einen Tag +
+    # GitHub-Release erzeugt (Advance-Signal release→done; opt-in create_release).
+    RELEASE_TAGGED = "ReleaseTagged"
 
 
 class EventValidationError(ValueError):

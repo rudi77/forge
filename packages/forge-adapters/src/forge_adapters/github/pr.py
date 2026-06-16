@@ -28,6 +28,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -541,6 +542,53 @@ def fetch_pr_metadata(
     )
 
 
+def fetch_pr_head_committed_at(
+    *,
+    repo: Path,
+    pr_number: int,
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> datetime | None:
+    """Zeitstempel des Head-Commits eines offenen PRs via ``gh pr view --json commits``.
+
+    Fail-open: gibt ``None`` zurück, wenn gh fehlschlägt, die Ausgabe nicht
+    parsebar oder leer ist — ein transienter gh-Schluckauf darf den
+    Conductor-Tick nicht wedgen (der Caller fällt dann aufs alte
+    ``review_done``-Verhalten zurück, statt das Re-Review zu blockieren). ``gh
+    pr view --json commits`` liefert die Commits **oldest-first**; das letzte
+    Element ist der Head-Commit, dessen ``committedDate`` (ISO8601, UTC ``Z``)
+    als tz-aware ``datetime`` zurückgegeben wird.
+    """
+    try:
+        result = run_subprocess(
+            [gh_bin, "pr", "view", str(pr_number), "--json", "commits"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    commits = data.get("commits") or []
+    if not commits:
+        return None
+    raw = commits[-1].get("committedDate")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
 # Conclusions/States, die GitHubs Checks als Misserfolg melden.
 _CI_FAIL = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 # Erfolgreiche Endzustände (neutral/skipped gelten als "nicht blockierend").
@@ -678,3 +726,87 @@ def merge_pr(
         )
     merger = gh_current_login(repo=repo, gh_bin=gh_bin, run_subprocess=run_subprocess)
     return MergeResult(merged=True, merger=merger, method=method)
+
+
+def create_release(
+    *,
+    repo: Path,
+    tag: str,
+    title: str,
+    notes: str | None = None,
+    generate_notes: bool = True,
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> str:
+    """Erzeugt einen Tag + GitHub-Release via ``gh release create`` (B2).
+
+    Deterministischer forge-Effekt für die ``release``-Stage — opt-in über
+    ``capabilities.create_release``. ``gh release create`` legt Tag UND Release
+    in einem Aufruf an (kein manuelles ``git push``/``--force`` — ein Release
+    schreibt einen neuen Ref, fasst weder main noch force an).
+
+    **Idempotent:** existiert der Tag schon (Re-Dispatch desselben Items),
+    wird die bestehende Release-URL zurückgegeben statt zu scheitern — sonst
+    re-dispatcht die in-place release-Stage jeden Tick erfolglos.
+
+    Gibt die Release-URL zurück (``gh release create`` schreibt sie nach stdout).
+    """
+    existing = _release_url_if_exists(
+        repo=repo, tag=tag, gh_bin=gh_bin, run_subprocess=run_subprocess
+    )
+    if existing is not None:
+        return existing
+
+    cmd = [gh_bin, "release", "create", tag, "--title", title]
+    if generate_notes:
+        cmd.append("--generate-notes")
+    if notes:
+        cmd += ["--notes", notes]
+    result = run_subprocess(
+        cmd,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        # Race/Re-Dispatch: Tag zwischenzeitlich angelegt → als Erfolg werten.
+        if "already exists" in stderr.lower():
+            existing = _release_url_if_exists(
+                repo=repo, tag=tag, gh_bin=gh_bin, run_subprocess=run_subprocess
+            )
+            if existing is not None:
+                return existing
+        raise GitHubError(
+            f"gh release create {tag} failed (exit {result.returncode}): "
+            f"{stderr or '<no stderr>'}"
+        )
+    return result.stdout.strip()
+
+
+def _release_url_if_exists(
+    *,
+    repo: Path,
+    tag: str,
+    gh_bin: str,
+    run_subprocess: SubprocessRunner,
+) -> str | None:
+    """Release-URL eines bestehenden Tags via ``gh release view``, oder ``None``."""
+    result = run_subprocess(
+        [gh_bin, "release", "view", tag, "--json", "url"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    url = data.get("url")
+    return str(url) if url else ""

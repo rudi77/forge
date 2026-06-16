@@ -22,7 +22,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
@@ -30,7 +30,10 @@ from typing import Annotated, Any
 import typer
 from forge_adapters.github import (
     BoardError,
+    GitHubError,
     ReadyIssue,
+    create_release,
+    fetch_pr_head_committed_at,
     list_ready_items,
     list_stage_items,
     set_issue_stage_label,
@@ -40,6 +43,7 @@ from forge_core.events import (
     ConductorTickCompletedPayload,
     EventKind,
     IssueTriagedPayload,
+    ReleaseTaggedPayload,
     WorkItemBlockedPayload,
     WorkItemStageChangedPayload,
     build_event,
@@ -65,6 +69,7 @@ from forge_cli.conductor import (
     ResumeOrder,
     StageTransition,
     WorkItem,
+    derive_dev_failure,
     derive_pending_resumes,
     derive_signals,
     pr_number_for_issue,
@@ -522,6 +527,204 @@ def _dispatch_issues(
 
     return _PassResult(
         summaries=summaries, bailed=bailed, dispatched=dispatched, skipped=skipped
+    )
+
+
+def _release_tag_for_issue(issue_number: int) -> str:
+    """Deterministischer, eindeutiger Tag pro Work-Item (idempotenter
+    Re-Dispatch). v1: ein Release pro abgeschlossenem Issue."""
+    return f"forge-issue-{issue_number}"
+
+
+def _dispatch_release_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    store: EventStore,
+    session_id: str,
+) -> _PassResult | None:
+    """Effektiert die **Release-Stage** eines Work-Items (Pipeline-Ende hinten).
+
+    Anders als die anderen Stages ist das KEIN LLM-Run, sondern ein
+    deterministischer forge-Effekt (wie der Merge): Tag + GitHub-Release via
+    ``gh release create`` — opt-in über ``capabilities.create_release``.
+    Emittiert ``ReleaseTagged`` → ``derive_signals`` leitet ``release_done`` ab
+    → ``advance`` schreibt ``release→done`` fort.
+
+    Capability aus → kein Effekt, das Item parkt in release (manueller Operator,
+    analog zur ``merge_pr``-Ergonomie). push-to-main/force bleiben unberührt
+    (ein Release schreibt nur einen neuen Ref).
+    """
+    if not ctx.spec.capabilities.create_release:
+        console.print(
+            f"[dim]release #{issue.number}: capabilities.create_release=false "
+            f"→ übersprungen (manueller Release)[/dim]"
+        )
+        return None
+    tag = _release_tag_for_issue(issue.number)
+    try:
+        url = create_release(
+            repo=ctx.repo_root,
+            tag=tag,
+            title=f"{tag}: {issue.title}",
+        )
+    except GitHubError as exc:
+        err_console.print(
+            f"[red]error[/red] in release for issue #{issue.number}: {exc}"
+        )
+        return _PassResult(
+            summaries=[
+                _LoopSummaryRow(
+                    issue_number=issue.number,
+                    issue_title=issue.title,
+                    decision="error",
+                    pr_url=None,
+                    auto_merge="-",
+                    error=str(exc),
+                )
+            ],
+            bailed=False,
+            dispatched=0,
+            skipped=0,
+        )
+    store.append(
+        build_event(
+            kind=EventKind.RELEASE_TAGGED,
+            run_id=session_id,
+            project=ctx.spec.name,
+            project_fingerprint=ctx.project_fingerprint,
+            factory_version=ctx.factory_version,
+            spec_version=ctx.spec.spec_version,
+            payload=ReleaseTaggedPayload(
+                issue_number=issue.number,
+                tag=tag,
+                release_url=url or None,
+            ),
+        )
+    )
+    console.print(
+        f"  [green]released[/green] #{issue.number} → {tag}"
+        + (f" ({url})" if url else "")
+    )
+    return _PassResult(
+        summaries=[
+            _LoopSummaryRow(
+                issue_number=issue.number,
+                issue_title=issue.title,
+                decision="released",
+                pr_url=url or None,
+                auto_merge="-",
+                error=None,
+            )
+        ],
+        bailed=False,
+        dispatched=1,
+        skipped=0,
+    )
+
+
+_REQUIREMENTS_PREAMBLE = (
+    "This is a REQUIREMENTS-REFINEMENT task, not an implementation task. Do NOT "
+    "write or change any code. Read the issue below and produce sharpened, "
+    "*testable* acceptance criteria for it inside the plan block — each criterion "
+    "concrete enough that a later run can verify it. If the issue is too vague to "
+    "refine into testable criteria, mark it as insufficient context instead of "
+    "guessing.\n\n"
+)
+
+
+def _dispatch_requirements_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    params: _DispatchParams,
+    store: EventStore | None = None,
+) -> _PassResult:
+    """Dispatcht den **Requirements-Stage**-Run eines Work-Items (Pipeline-Ende
+    vorne, Team = architect/analyst).
+
+    Verdichtet ein rohes Issue zu testbaren Akzeptanzkriterien — kein Code, kein
+    PR (``create_pr=False``). Reuse der architect/design-Maschinerie: der
+    ``---FORGE-PLAN-...---``-Marker trägt hier die Kriterien; der Runner emittiert
+    daraus ``RequirementsRefined`` (statt ``PlanProposed``, gated über
+    ``prompt_template_id="requirements"``) → ``derive_signals`` leitet
+    ``has_refined_spec`` ab → ``advance`` schreibt ``requirements→design`` fort.
+
+    Roster: ``triggers.on_issue_label["forge:requirements"].agents``, sonst
+    ``["architect"]`` als Default.
+    """
+    roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
+    prompt = _REQUIREMENTS_PREAMBLE + wrap_issue_body(
+        title=issue.title, body=issue.body
+    )
+    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    console.print(
+        f"\n[bold magenta]>>> board-loop[/bold magenta] requirements run for issue "
+        f"#{issue.number} [italic]{issue.title}[/italic] "
+        f"([dim]team: {', '.join(roster)}[/dim])"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=prompt,
+            prompt_template_id="requirements",
+            trigger="issue_label",
+            focus=f"requirements:#{issue.number}",
+            base_ref=params.base_ref,
+            acceptance_criteria=acceptance,
+            max_iterations=params.max_iterations,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=issue.number,
+            pr_number=None,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=False,
+            agents=roster,
+            create_pr=False,
+            pr_base=params.pr_base,
+            extra_labels=[],
+            pr_draft=False,
+            auto_merge=False,
+            announce=False,
+            store=store,
+        )
+    except Exception as exc:
+        err_console.print(
+            f"[red]error[/red] in requirements run for issue #{issue.number}: {exc}"
+        )
+        return _PassResult(
+            summaries=[
+                _LoopSummaryRow(
+                    issue_number=issue.number,
+                    issue_title=issue.title,
+                    decision="error",
+                    pr_url=None,
+                    auto_merge="-",
+                    error=str(exc),
+                )
+            ],
+            bailed=True,
+            dispatched=0,
+            skipped=0,
+        )
+
+    bailed = outcome.result.decision in {
+        "cost_cap_hit",
+        "guardrail_blocked",
+        "error",
+    }
+    if bailed:
+        err_console.print(
+            f"[yellow]board-loop bailing[/yellow]: requirements run decision = "
+            f"{outcome.result.decision}"
+        )
+    return _PassResult(
+        summaries=[_summary_row_from_outcome(issue, outcome)],
+        bailed=bailed,
+        dispatched=1,
+        skipped=0,
     )
 
 
@@ -996,10 +1199,13 @@ def _run_conductor_watch(
             events = []
             for kind in (
                 EventKind.RUN_STARTED,
+                EventKind.RUN_FINISHED,
+                EventKind.REQUIREMENTS_REFINED,
                 EventKind.PLAN_PROPOSED,
                 EventKind.PR_CREATED,
                 EventKind.PR_REVIEWED,
                 EventKind.PR_MERGED,
+                EventKind.RELEASE_TAGGED,
                 EventKind.RUN_RESUME_SCHEDULED,
             ):
                 events.extend(store.events_by_kind(kind))
@@ -1032,12 +1238,33 @@ def _run_conductor_watch(
                 # Done bleibt drin (für Dependency-Auflösung), nur BLOCKED raus.
                 if stage is None or stage == Stage.BLOCKED:
                     continue
+                # Re-Review-Gate (A2): nur QA-Items mit offenem PR brauchen den
+                # Head-Commit-Zeitstempel, damit ein nachgebesserter
+                # request_changes-PR erneut reviewt wird. Eine gh-Call pro
+                # QA-Item (nicht pro Issue); fail-open → None bei jedem Fehler.
+                head_committed_at = None
+                if stage == Stage.QA:
+                    qa_pr = pr_number_for_issue(events, issue.number)
+                    if qa_pr is not None:
+                        head_committed_at = fetch_pr_head_committed_at(
+                            repo=ctx.repo_root, pr_number=qa_pr
+                        )
+                signals = derive_signals(
+                    events, issue.number, head_committed_at=head_committed_at
+                )
+                # A1: in-dev-Item, dessen Dev-Run keinen PR produzierte →
+                # Re-Dispatch-/Eskalations-Signale aus dem Event-Strom ableiten.
+                if stage == Stage.IN_DEV:
+                    failed, attempts = derive_dev_failure(events, issue.number)
+                    signals = replace(
+                        signals, dev_failed_no_pr=failed, dev_attempts=attempts
+                    )
                 items.append(
                     WorkItem(
                         number=issue.number,
                         stage=stage,
                         depends_on=tuple(parse_depends_on(issue.body)),
-                        signals=derive_signals(events, issue.number),
+                        signals=signals,
                     )
                 )
             if not items:
@@ -1078,8 +1305,18 @@ def _run_conductor_watch(
                     issue = by_number.get(order.number)
                     if issue is None:
                         return None
+                    # requirements → architect-Run (Akzeptanzkriterien, kein PR);
                     # design → architect-Run (Plan, kein PR); qa → Review-Merge-Agent
-                    # (PRReviewed/PRMerged, kein neuer PR); sonst → Dev-Loop (PR).
+                    # (PRReviewed/PRMerged, kein neuer PR); release → deterministischer
+                    # Tag/Release-Effekt (kein LLM-Run); sonst → Dev-Loop (PR).
+                    if order.stage == Stage.REQUIREMENTS:
+                        return _dispatch_requirements_run(
+                            ctx=ctx, issue=issue, params=params, store=store
+                        )
+                    if order.stage == Stage.RELEASE:
+                        return _dispatch_release_run(
+                            ctx=ctx, issue=issue, store=store, session_id=session_id
+                        )
                     if order.stage == Stage.DESIGN:
                         return _dispatch_design_run(
                             ctx=ctx, issue=issue, params=params, store=store

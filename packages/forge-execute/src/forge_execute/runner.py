@@ -781,12 +781,28 @@ class SequentialRunner:
         # logisch BEFORE der eigentlichen Code-Mutation, auch wenn beide aus
         # demselben claude-Aufruf stammen.
         if result.plan_md is not None:
-            self._emit_plan_proposed(
-                plan_md=result.plan_md,
-                gen_id=gen_id,
-                architect_turns=result.turns_used,
-                agents_invoked=result.agents_invoked,
-            )
+            # Ein requirements-Run (Pipeline-Ende vorne) verdichtet das Issue zu
+            # Akzeptanzkriterien statt einen Implementierungs-Plan zu liefern: er
+            # emittiert RequirementsRefined (Advance-Signal requirements→design),
+            # NICHT PlanProposed — sonst würde has_plan das Item später in der
+            # design-Stage verfrüht nach ready schreiben.
+            if (
+                self.config.prompt_template_id == "requirements"
+                and self.config.issue_number is not None
+            ):
+                self._emit_requirements_refined(
+                    spec_md=result.plan_md,
+                    gen_id=gen_id,
+                    analyst_turns=result.turns_used,
+                    agents_invoked=result.agents_invoked,
+                )
+            else:
+                self._emit_plan_proposed(
+                    plan_md=result.plan_md,
+                    gen_id=gen_id,
+                    architect_turns=result.turns_used,
+                    agents_invoked=result.agents_invoked,
+                )
 
         self._emit(
             EventKind.PROPOSAL_RECEIVED,
@@ -849,6 +865,41 @@ class SequentialRunner:
             ),
             generation_id=gen_id,
             artifacts={"plan": plan_hash},
+        )
+
+    def _emit_requirements_refined(
+        self,
+        *,
+        spec_md: str,
+        gen_id: str,
+        analyst_turns: int,
+        agents_invoked: list[str] | None = None,
+    ) -> None:
+        """Persistiert die verdichteten Akzeptanzkriterien und emittiert
+        ``RequirementsRefined`` (Pipeline-Ende vorne, requirements→design).
+
+        Reuse der Plan-Maschinerie: der requirements-Run produziert denselben
+        ``---FORGE-PLAN-...---``-Marker wie der architect, nur als
+        Akzeptanzkriterien interpretiert. ``parse_plan`` liefert dasselbe
+        ``insufficient_context``-Signal (zu vages Issue → kein Advance).
+        """
+        from forge_core.events.kinds.requirements import RequirementsRefinedPayload
+
+        from forge_execute._plan_parser import parse_plan
+
+        spec_hash = self.blobs.put_text(spec_md)
+        parsed = parse_plan(spec_md)
+        self._emit(
+            EventKind.REQUIREMENTS_REFINED,
+            RequirementsRefinedPayload(
+                issue_number=self.config.issue_number,  # type: ignore[arg-type]
+                criteria_count=parsed.subtask_count,
+                insufficient_context=parsed.insufficient_context,
+                analyst_turns=analyst_turns,
+                agents_used=agents_invoked or list(self.config.agents),
+            ),
+            generation_id=gen_id,
+            artifacts={"spec": spec_hash},
         )
 
     def _validate_changes(

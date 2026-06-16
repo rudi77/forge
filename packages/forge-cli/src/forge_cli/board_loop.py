@@ -527,6 +527,111 @@ def _dispatch_issues(
     )
 
 
+_REQUIREMENTS_PREAMBLE = (
+    "This is a REQUIREMENTS-REFINEMENT task, not an implementation task. Do NOT "
+    "write or change any code. Read the issue below and produce sharpened, "
+    "*testable* acceptance criteria for it inside the plan block — each criterion "
+    "concrete enough that a later run can verify it. If the issue is too vague to "
+    "refine into testable criteria, mark it as insufficient context instead of "
+    "guessing.\n\n"
+)
+
+
+def _dispatch_requirements_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    params: _DispatchParams,
+    store: EventStore | None = None,
+) -> _PassResult:
+    """Dispatcht den **Requirements-Stage**-Run eines Work-Items (Pipeline-Ende
+    vorne, Team = architect/analyst).
+
+    Verdichtet ein rohes Issue zu testbaren Akzeptanzkriterien — kein Code, kein
+    PR (``create_pr=False``). Reuse der architect/design-Maschinerie: der
+    ``---FORGE-PLAN-...---``-Marker trägt hier die Kriterien; der Runner emittiert
+    daraus ``RequirementsRefined`` (statt ``PlanProposed``, gated über
+    ``prompt_template_id="requirements"``) → ``derive_signals`` leitet
+    ``has_refined_spec`` ab → ``advance`` schreibt ``requirements→design`` fort.
+
+    Roster: ``triggers.on_issue_label["forge:requirements"].agents``, sonst
+    ``["architect"]`` als Default.
+    """
+    roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
+    prompt = _REQUIREMENTS_PREAMBLE + wrap_issue_body(
+        title=issue.title, body=issue.body
+    )
+    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    console.print(
+        f"\n[bold magenta]>>> board-loop[/bold magenta] requirements run for issue "
+        f"#{issue.number} [italic]{issue.title}[/italic] "
+        f"([dim]team: {', '.join(roster)}[/dim])"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=prompt,
+            prompt_template_id="requirements",
+            trigger="issue_label",
+            focus=f"requirements:#{issue.number}",
+            base_ref=params.base_ref,
+            acceptance_criteria=acceptance,
+            max_iterations=params.max_iterations,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=issue.number,
+            pr_number=None,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=False,
+            agents=roster,
+            create_pr=False,
+            pr_base=params.pr_base,
+            extra_labels=[],
+            pr_draft=False,
+            auto_merge=False,
+            announce=False,
+            store=store,
+        )
+    except Exception as exc:
+        err_console.print(
+            f"[red]error[/red] in requirements run for issue #{issue.number}: {exc}"
+        )
+        return _PassResult(
+            summaries=[
+                _LoopSummaryRow(
+                    issue_number=issue.number,
+                    issue_title=issue.title,
+                    decision="error",
+                    pr_url=None,
+                    auto_merge="-",
+                    error=str(exc),
+                )
+            ],
+            bailed=True,
+            dispatched=0,
+            skipped=0,
+        )
+
+    bailed = outcome.result.decision in {
+        "cost_cap_hit",
+        "guardrail_blocked",
+        "error",
+    }
+    if bailed:
+        err_console.print(
+            f"[yellow]board-loop bailing[/yellow]: requirements run decision = "
+            f"{outcome.result.decision}"
+        )
+    return _PassResult(
+        summaries=[_summary_row_from_outcome(issue, outcome)],
+        bailed=bailed,
+        dispatched=1,
+        skipped=0,
+    )
+
+
 def _dispatch_design_run(
     *,
     ctx: ForgeContext,
@@ -999,6 +1104,7 @@ def _run_conductor_watch(
             for kind in (
                 EventKind.RUN_STARTED,
                 EventKind.RUN_FINISHED,
+                EventKind.REQUIREMENTS_REFINED,
                 EventKind.PLAN_PROPOSED,
                 EventKind.PR_CREATED,
                 EventKind.PR_REVIEWED,
@@ -1102,8 +1208,13 @@ def _run_conductor_watch(
                     issue = by_number.get(order.number)
                     if issue is None:
                         return None
+                    # requirements → architect-Run (Akzeptanzkriterien, kein PR);
                     # design → architect-Run (Plan, kein PR); qa → Review-Merge-Agent
                     # (PRReviewed/PRMerged, kein neuer PR); sonst → Dev-Loop (PR).
+                    if order.stage == Stage.REQUIREMENTS:
+                        return _dispatch_requirements_run(
+                            ctx=ctx, issue=issue, params=params, store=store
+                        )
                     if order.stage == Stage.DESIGN:
                         return _dispatch_design_run(
                             ctx=ctx, issue=issue, params=params, store=store

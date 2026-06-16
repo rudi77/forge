@@ -298,6 +298,12 @@ def derive_signals(
     if not run_ids:
         return StageSignals()
 
+    has_refined_spec = any(
+        e.kind == EventKind.REQUIREMENTS_REFINED
+        and e.run_id in run_ids
+        and not (e.payload or {}).get("insufficient_context", False)
+        for e in events
+    )
     has_plan = any(
         e.kind == EventKind.PLAN_PROPOSED
         and e.run_id in run_ids
@@ -330,6 +336,7 @@ def derive_signals(
         head_committed_at is None or head_committed_at <= latest_review_ts
     )
     return StageSignals(
+        has_refined_spec=has_refined_spec,
         has_plan=has_plan,
         has_open_pr=has_open_pr,
         has_merged_pr=has_merged_pr,

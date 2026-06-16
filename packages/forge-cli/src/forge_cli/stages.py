@@ -60,6 +60,11 @@ ALLOWED_TRANSITIONS: dict[Stage, frozenset[Stage]] = {
 class StageSignals:
     """Beobachtungen über ein Work-Item, aus dem Event-Store abgeleitet."""
 
+    has_refined_spec: bool = False
+    """Ein ``RequirementsRefined`` (ohne ``insufficient_context``) liegt vor —
+    das requirements-Team hat testbare Akzeptanzkriterien verdichtet
+    (Advance-Signal requirements→design)."""
+
     has_plan: bool = False
     """Ein ``PlanProposed`` (ohne ``insufficient_context``) liegt vor."""
 
@@ -112,7 +117,9 @@ class StageSignals:
 # Wächst die Liste (``requirements``/``release``), braucht jede neue Stage
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
 # Dispatch-Zweig in der board-loop-Wiring-Schicht.
-IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset({Stage.DESIGN, Stage.QA})
+IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset(
+    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA}
+)
 
 
 def stage_of(labels: list[str]) -> Stage | None:
@@ -147,15 +154,18 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     Dispatch-Logik.
 
     Deckt nur die event-getriebenen Übergänge ab:
-      - design  → ready    sobald ein Plan vorliegt
-      - in-dev  → qa       sobald ein PR geöffnet wurde
-      - qa      → release  sobald der PR gemergt wurde
+      - requirements → design   sobald die Akzeptanzkriterien verdichtet sind
+      - design       → ready     sobald ein Plan vorliegt
+      - in-dev       → qa         sobald ein PR geöffnet wurde
+      - qa           → release    sobald der PR gemergt wurde
 
     ``ready → in-dev`` passiert beim DISPATCH (Conductor, mit Kapazität +
-    Dependencies) und ``release → done`` / ``requirements → design`` brauchen
-    die devops- bzw. requirements-Rolle — beide hier bewusst NICHT automatisch.
-    Gibt ``(stage, "")`` zurück, wenn kein Übergang fällig ist.
+    Dependencies) und ``release → done`` braucht die devops-Rolle — beide hier
+    bewusst NICHT automatisch. Gibt ``(stage, "")`` zurück, wenn kein Übergang
+    fällig ist.
     """
+    if stage == Stage.REQUIREMENTS and signals.has_refined_spec:
+        return Stage.DESIGN, "requirements_refined"
     if stage == Stage.DESIGN and signals.has_plan:
         return Stage.READY, "plan_proposed"
     if stage == Stage.IN_DEV and signals.has_open_pr:

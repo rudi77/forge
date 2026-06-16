@@ -62,6 +62,15 @@ def test_advance_event_driven_transitions() -> None:
     )
 
 
+def test_advance_requirements_to_design() -> None:
+    assert advance(Stage.REQUIREMENTS, StageSignals(has_refined_spec=True)) == (
+        Stage.DESIGN,
+        "requirements_refined",
+    )
+    # Kein Signal → bleibt requirements.
+    assert advance(Stage.REQUIREMENTS, StageSignals()) == (Stage.REQUIREMENTS, "")
+
+
 def test_allowed_transitions_guard() -> None:
     assert can_transition(Stage.DESIGN, Stage.READY)
     assert can_transition(Stage.READY, Stage.IN_DEV)
@@ -195,6 +204,29 @@ def test_plan_tick_qa_merged_advances_to_release() -> None:
     assert plan.dispatch == []
     assert plan.transitions == [
         StageTransition(1, Stage.QA, Stage.RELEASE, "pr_merged")
+    ]
+
+
+# --- B1: requirements → design --------------------------------------------
+
+
+def test_plan_tick_requirements_in_place_dispatch() -> None:
+    # requirements ohne refined spec → in-place dispatch (Team = analyst/architect),
+    # kein Stage-Wechsel.
+    plan = plan_tick([_wi(1, Stage.REQUIREMENTS)], capacity=1)
+    assert plan.dispatch == [DispatchOrder(1, Stage.REQUIREMENTS)]
+    assert plan.transitions == []
+
+
+def test_plan_tick_requirements_advances_when_refined() -> None:
+    plan = plan_tick(
+        [_wi(1, Stage.REQUIREMENTS, signals=StageSignals(has_refined_spec=True))],
+        capacity=1,
+    )
+    # advance requirements→design, NICHT im selben Tick re-dispatcht.
+    assert plan.dispatch == []
+    assert plan.transitions == [
+        StageTransition(1, Stage.REQUIREMENTS, Stage.DESIGN, "requirements_refined")
     ]
 
 
@@ -363,6 +395,30 @@ def test_derive_signals_from_events() -> None:
 def test_derive_signals_unknown_issue_is_empty() -> None:
     sig = derive_signals([], 999)
     assert sig == StageSignals()
+
+
+def test_derive_signals_has_refined_spec() -> None:
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 9}),
+        _Evt(
+            EK.REQUIREMENTS_REFINED,
+            "r1",
+            {"issue_number": 9, "insufficient_context": False},
+        ),
+    ]
+    assert derive_signals(events, 9).has_refined_spec is True
+    # insufficient_context → kein Advance-Signal.
+    events2 = [
+        _Evt(EK.RUN_STARTED, "r2", {"issue_number": 9}),
+        _Evt(
+            EK.REQUIREMENTS_REFINED,
+            "r2",
+            {"issue_number": 9, "insufficient_context": True},
+        ),
+    ]
+    assert derive_signals(events2, 9).has_refined_spec is False
 
 
 def test_derive_signals_insufficient_context_is_no_plan() -> None:

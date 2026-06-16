@@ -50,6 +50,9 @@ class EventKind(StrEnum):
     # Resilienz: ein Run lief in ein Claude-Usage-/Session-Limit und kann
     # später per `claude --resume` fortgesetzt werden (Anker für Loop 2).
     RUN_RESUME_SCHEDULED = "RunResumeScheduled"
+    # Pipeline-Ende vorne: ein requirements-Run hat ein rohes Issue zu
+    # testbaren Akzeptanzkriterien verdichtet (Advance-Signal requirements→design).
+    REQUIREMENTS_REFINED = "RequirementsRefined"
 
 
 class EventValidationError(ValueError):

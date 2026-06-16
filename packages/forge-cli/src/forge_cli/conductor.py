@@ -209,7 +209,12 @@ def run_conductor_tick(
     )
 
 
-def derive_signals(events: list, issue_number: int) -> StageSignals:
+def derive_signals(
+    events: list,
+    issue_number: int,
+    *,
+    head_committed_at: datetime | None = None,
+) -> StageSignals:
     """Leitet die Stage-Signale eines Work-Items aus dem Event-Strom ab.
 
     Rein und replay-fähig: korreliert ``RunStarted.issue_number`` → ``run_id``
@@ -221,6 +226,17 @@ def derive_signals(events: list, issue_number: int) -> StageSignals:
       - has_open_pr   : ein PRCreated in einem Run dieses Issues.
       - has_merged_pr : ein PRMerged, dessen pr_number zu einem PRCreated
                         dieses Issues gehört.
+      - review_done   : der offene PR wurde bereits gereviewt UND seither kam
+                        kein neuer Commit (siehe ``head_committed_at``).
+
+    ``head_committed_at`` ist der Head-Commit-Zeitstempel des offenen PRs, von
+    der Wiring-Schicht via Board-Query injiziert (Commit-ts steht NICHT im
+    Event-Strom — so bleibt diese Funktion rein). Ist er **neuer** als das
+    jüngste ``PRReviewed``, gilt der Review als veraltet → ``review_done=False``
+    → das QA-Team reviewt den nachgebesserten ``request_changes``-PR erneut.
+    ``None`` (kein Board-Datum / kein offener PR) → Fallback aufs alte
+    Verhalten (``review_done`` = ein Review existiert), damit ein gh-Schluckauf
+    keine Regression auslöst.
     """
     run_ids = {
         e.run_id
@@ -249,10 +265,18 @@ def derive_signals(events: list, issue_number: int) -> StageSignals:
         and (e.payload or {}).get("pr_number") in pr_numbers
         for e in events
     )
-    review_done = any(
-        e.kind == EventKind.PR_REVIEWED
-        and (e.payload or {}).get("pr_number") in pr_numbers
+    review_tss = [
+        e.ts
         for e in events
+        if e.kind == EventKind.PR_REVIEWED
+        and (e.payload or {}).get("pr_number") in pr_numbers
+    ]
+    latest_review_ts = max(review_tss) if review_tss else None
+    # Veraltet, sobald ein Commit NACH dem jüngsten Review landete. ``<=`` →
+    # ein Commit exakt zur Review-Zeit gilt als "nicht neuer" (bias zu weniger
+    # teuren Re-Reviews). Ohne Board-Datum: altes Verhalten (Review existiert).
+    review_done = latest_review_ts is not None and (
+        head_committed_at is None or head_committed_at <= latest_review_ts
     )
     return StageSignals(
         has_plan=has_plan,

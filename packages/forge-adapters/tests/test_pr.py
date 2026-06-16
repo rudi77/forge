@@ -10,6 +10,7 @@ import pytest
 from forge_adapters.github.pr import (
     GitHubError,
     _extract_pr_number,
+    fetch_pr_head_committed_at,
     fetch_pr_metadata,
     gh_current_login,
     merge_pr,
@@ -390,3 +391,48 @@ def test_post_pr_review_request_changes_raises_on_failure(tmp_path: Path) -> Non
         post_pr_review(
             repo=tmp_path, pr_number=5, approve=False, body="no", run_subprocess=runner
         )
+
+
+# --- fetch_pr_head_committed_at (A2) --------------------------------------
+
+
+def test_fetch_pr_head_committed_at_takes_last_commit(tmp_path: Path) -> None:
+    # gh pr view --json commits liefert oldest-first; das letzte = Head.
+    payload = (
+        '{"commits": ['
+        '{"committedDate": "2026-06-01T10:00:00Z"},'
+        '{"committedDate": "2026-06-01T13:30:00Z"}'
+        ']}'
+    )
+    runner = _stub_runner(_ok(stdout=payload))
+    ts = fetch_pr_head_committed_at(repo=tmp_path, pr_number=7, run_subprocess=runner)
+    assert ts is not None
+    assert ts.year == 2026 and ts.hour == 13 and ts.minute == 30
+    assert ts.tzinfo is not None  # tz-aware (UTC)
+    cmd = runner.calls[0]  # type: ignore[attr-defined]
+    assert cmd[:4] == ["gh", "pr", "view", "7"]
+    assert "commits" in cmd
+
+
+def test_fetch_pr_head_committed_at_fail_open(tmp_path: Path) -> None:
+    # gh-Fehler → None (fail-open, kein raise → Tick wedged nicht).
+    assert (
+        fetch_pr_head_committed_at(
+            repo=tmp_path, pr_number=7, run_subprocess=_stub_runner(_fail("boom"))
+        )
+        is None
+    )
+    # Müll-JSON → None.
+    assert (
+        fetch_pr_head_committed_at(
+            repo=tmp_path, pr_number=7, run_subprocess=_stub_runner(_ok(stdout="not json"))
+        )
+        is None
+    )
+    # Leere Commit-Liste → None.
+    assert (
+        fetch_pr_head_committed_at(
+            repo=tmp_path, pr_number=7, run_subprocess=_stub_runner(_ok(stdout='{"commits": []}'))
+        )
+        is None
+    )

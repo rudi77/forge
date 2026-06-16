@@ -31,6 +31,7 @@ import typer
 from forge_adapters.github import (
     BoardError,
     ReadyIssue,
+    fetch_pr_head_committed_at,
     list_ready_items,
     list_stage_items,
     set_issue_stage_label,
@@ -1032,12 +1033,27 @@ def _run_conductor_watch(
                 # Done bleibt drin (für Dependency-Auflösung), nur BLOCKED raus.
                 if stage is None or stage == Stage.BLOCKED:
                     continue
+                # Re-Review-Gate (A2): nur QA-Items mit offenem PR brauchen den
+                # Head-Commit-Zeitstempel, damit ein nachgebesserter
+                # request_changes-PR erneut reviewt wird. Eine gh-Call pro
+                # QA-Item (nicht pro Issue); fail-open → None bei jedem Fehler.
+                head_committed_at = None
+                if stage == Stage.QA:
+                    qa_pr = pr_number_for_issue(events, issue.number)
+                    if qa_pr is not None:
+                        head_committed_at = fetch_pr_head_committed_at(
+                            repo=ctx.repo_root, pr_number=qa_pr
+                        )
                 items.append(
                     WorkItem(
                         number=issue.number,
                         stage=stage,
                         depends_on=tuple(parse_depends_on(issue.body)),
-                        signals=derive_signals(events, issue.number),
+                        signals=derive_signals(
+                            events,
+                            issue.number,
+                            head_committed_at=head_committed_at,
+                        ),
                     )
                 )
             if not items:

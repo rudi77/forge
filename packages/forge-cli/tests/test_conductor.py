@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from forge_cli.conductor import (
     Blocked,
     DispatchOrder,
@@ -276,12 +278,13 @@ def test_run_conductor_tick_reports_blocked() -> None:
 
 
 class _Evt:
-    """Minimaler Event-Stand-in (kind/run_id/payload)."""
+    """Minimaler Event-Stand-in (kind/run_id/payload/ts)."""
 
-    def __init__(self, kind, run_id, payload):
+    def __init__(self, kind, run_id, payload, ts=None):
         self.kind = kind
         self.run_id = run_id
         self.payload = payload
+        self.ts = ts or datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def test_derive_signals_from_events() -> None:
@@ -334,6 +337,45 @@ def test_derive_signals_review_done_from_pr_reviewed() -> None:
     assert sig.has_open_pr is True
     assert sig.review_done is True
     assert sig.has_merged_pr is False
+
+
+def test_derive_signals_review_stale_when_new_commit() -> None:
+    """A2: ein Commit NACH dem Review → review_done False (Re-Review fällig)."""
+    from forge_core.events import EventKind as EK
+
+    review_ts = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 42}),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}),
+        _Evt(EK.PR_REVIEWED, "rX", {"pr_number": 100}, ts=review_ts),
+    ]
+    # Commit später als Review → veraltet.
+    newer = datetime(2026, 6, 1, 13, 0, tzinfo=UTC)
+    assert derive_signals(events, 42, head_committed_at=newer).review_done is False
+    # Commit vor/gleich Review → noch gültig.
+    older = datetime(2026, 6, 1, 11, 0, tzinfo=UTC)
+    assert derive_signals(events, 42, head_committed_at=older).review_done is True
+    assert derive_signals(events, 42, head_committed_at=review_ts).review_done is True
+    # Ohne Board-Datum → Fallback aufs alte Verhalten (Review existiert).
+    assert derive_signals(events, 42, head_committed_at=None).review_done is True
+
+
+def test_derive_signals_review_done_uses_latest_review() -> None:
+    """A2: bei mehreren Reviews zählt das jüngste, nicht das erste."""
+    from forge_core.events import EventKind as EK
+
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 42}),
+        _Evt(EK.PR_CREATED, "r1", {"pr_number": 100}),
+        _Evt(EK.PR_REVIEWED, "rX", {"pr_number": 100},
+             ts=datetime(2026, 6, 1, 10, 0, tzinfo=UTC)),
+        _Evt(EK.PR_REVIEWED, "rY", {"pr_number": 100},
+             ts=datetime(2026, 6, 1, 14, 0, tzinfo=UTC)),
+    ]
+    # Commit zwischen den beiden Reviews → das jüngste Review (14:00) ist neuer
+    # → noch gültig (sonst würde ein altes Review jeden Commit veralten lassen).
+    between = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    assert derive_signals(events, 42, head_committed_at=between).review_done is True
 
 
 def test_pr_number_for_issue_resolves_open_pr() -> None:

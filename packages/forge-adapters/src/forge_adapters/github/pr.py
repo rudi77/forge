@@ -28,6 +28,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -539,6 +540,53 @@ def fetch_pr_metadata(
         ci_status=summarize_ci(data.get("statusCheckRollup") or []),
         mergeable=str(data.get("mergeable") or "UNKNOWN").upper(),
     )
+
+
+def fetch_pr_head_committed_at(
+    *,
+    repo: Path,
+    pr_number: int,
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> datetime | None:
+    """Zeitstempel des Head-Commits eines offenen PRs via ``gh pr view --json commits``.
+
+    Fail-open: gibt ``None`` zurück, wenn gh fehlschlägt, die Ausgabe nicht
+    parsebar oder leer ist — ein transienter gh-Schluckauf darf den
+    Conductor-Tick nicht wedgen (der Caller fällt dann aufs alte
+    ``review_done``-Verhalten zurück, statt das Re-Review zu blockieren). ``gh
+    pr view --json commits`` liefert die Commits **oldest-first**; das letzte
+    Element ist der Head-Commit, dessen ``committedDate`` (ISO8601, UTC ``Z``)
+    als tz-aware ``datetime`` zurückgegeben wird.
+    """
+    try:
+        result = run_subprocess(
+            [gh_bin, "pr", "view", str(pr_number), "--json", "commits"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    commits = data.get("commits") or []
+    if not commits:
+        return None
+    raw = commits[-1].get("committedDate")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 # Conclusions/States, die GitHubs Checks als Misserfolg melden.

@@ -71,6 +71,14 @@ def test_advance_requirements_to_design() -> None:
     assert advance(Stage.REQUIREMENTS, StageSignals()) == (Stage.REQUIREMENTS, "")
 
 
+def test_advance_release_to_done() -> None:
+    assert advance(Stage.RELEASE, StageSignals(release_done=True)) == (
+        Stage.DONE,
+        "released",
+    )
+    assert advance(Stage.RELEASE, StageSignals()) == (Stage.RELEASE, "")
+
+
 def test_allowed_transitions_guard() -> None:
     assert can_transition(Stage.DESIGN, Stage.READY)
     assert can_transition(Stage.READY, Stage.IN_DEV)
@@ -227,6 +235,27 @@ def test_plan_tick_requirements_advances_when_refined() -> None:
     assert plan.dispatch == []
     assert plan.transitions == [
         StageTransition(1, Stage.REQUIREMENTS, Stage.DESIGN, "requirements_refined")
+    ]
+
+
+# --- B2: release → done ----------------------------------------------------
+
+
+def test_plan_tick_release_in_place_dispatch() -> None:
+    # release ohne release_done → in-place dispatch (deterministischer Effekt).
+    plan = plan_tick([_wi(1, Stage.RELEASE)], capacity=1)
+    assert plan.dispatch == [DispatchOrder(1, Stage.RELEASE)]
+    assert plan.transitions == []
+
+
+def test_plan_tick_release_advances_to_done() -> None:
+    plan = plan_tick(
+        [_wi(1, Stage.RELEASE, signals=StageSignals(release_done=True))],
+        capacity=1,
+    )
+    assert plan.dispatch == []
+    assert plan.transitions == [
+        StageTransition(1, Stage.RELEASE, Stage.DONE, "released")
     ]
 
 
@@ -395,6 +424,19 @@ def test_derive_signals_from_events() -> None:
 def test_derive_signals_unknown_issue_is_empty() -> None:
     sig = derive_signals([], 999)
     assert sig == StageSignals()
+
+
+def test_derive_signals_release_done_via_issue_number() -> None:
+    from forge_core.events import EventKind as EK
+
+    # ReleaseTagged hat keinen RunStarted → korreliert direkt über issue_number.
+    events = [
+        _Evt(EK.RUN_STARTED, "r1", {"issue_number": 9}),
+        _Evt(EK.RELEASE_TAGGED, "session-x", {"issue_number": 9, "tag": "forge-issue-9"}),
+    ]
+    assert derive_signals(events, 9).release_done is True
+    # Anderes Issue schlägt nicht durch.
+    assert derive_signals(events, 8).release_done is False
 
 
 def test_derive_signals_has_refined_spec() -> None:

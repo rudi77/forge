@@ -10,6 +10,7 @@ import pytest
 from forge_adapters.github.pr import (
     GitHubError,
     _extract_pr_number,
+    create_release,
     fetch_pr_head_committed_at,
     fetch_pr_metadata,
     gh_current_login,
@@ -436,3 +437,43 @@ def test_fetch_pr_head_committed_at_fail_open(tmp_path: Path) -> None:
         )
         is None
     )
+
+
+# --- create_release (B2) --------------------------------------------------
+
+
+def test_create_release_happy_path(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _fail("release not found", code=1),  # gh release view (does not exist yet)
+        _ok(stdout="https://github.com/o/r/releases/tag/forge-issue-7\n"),  # create
+    )
+    url = create_release(
+        repo=tmp_path, tag="forge-issue-7", title="t", run_subprocess=runner
+    )
+    assert url == "https://github.com/o/r/releases/tag/forge-issue-7"
+    create_cmd = runner.calls[1]  # type: ignore[attr-defined]
+    assert create_cmd[:4] == ["gh", "release", "create", "forge-issue-7"]
+    assert "--generate-notes" in create_cmd
+
+
+def test_create_release_idempotent_when_tag_exists(tmp_path: Path) -> None:
+    # Tag existiert bereits → bestehende URL zurück, kein zweiter create-Call.
+    runner = _stub_runner(
+        _ok(stdout='{"url": "https://github.com/o/r/releases/tag/forge-issue-7"}'),
+    )
+    url = create_release(
+        repo=tmp_path, tag="forge-issue-7", title="t", run_subprocess=runner
+    )
+    assert url == "https://github.com/o/r/releases/tag/forge-issue-7"
+    assert len(runner.calls) == 1  # type: ignore[attr-defined]  # nur view, kein create
+
+
+def test_create_release_raises_on_real_failure(tmp_path: Path) -> None:
+    runner = _stub_runner(
+        _fail("release not found", code=1),  # view → not exists
+        _fail("boom", code=1),               # create → genuine failure
+    )
+    with pytest.raises(GitHubError, match="gh release create"):
+        create_release(
+            repo=tmp_path, tag="forge-issue-7", title="t", run_subprocess=runner
+        )

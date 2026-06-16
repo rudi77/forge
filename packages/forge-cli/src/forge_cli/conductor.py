@@ -335,12 +335,20 @@ def derive_signals(
     review_done = latest_review_ts is not None and (
         head_committed_at is None or head_committed_at <= latest_review_ts
     )
+    # ReleaseTagged ist ein deterministischer forge-Effekt ohne RunStarted →
+    # direkt über issue_number korrelieren (nicht über run_id wie der Rest).
+    release_done = any(
+        e.kind == EventKind.RELEASE_TAGGED
+        and (e.payload or {}).get("issue_number") == issue_number
+        for e in events
+    )
     return StageSignals(
         has_refined_spec=has_refined_spec,
         has_plan=has_plan,
         has_open_pr=has_open_pr,
         has_merged_pr=has_merged_pr,
         review_done=review_done,
+        release_done=release_done,
     )
 
 

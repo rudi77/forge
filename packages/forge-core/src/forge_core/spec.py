@@ -136,6 +136,11 @@ class CapabilitiesConfig(BaseModel):
     """Opt-in: erlaubt forge, einen offenen PR nach Agent-Review selbst zu
     mergen (``gh pr merge``). Default ``false``. Zusätzlich CI-grün +
     Score-Schwelle abgesichert."""
+    create_release: bool = False
+    """Opt-in: erlaubt forge, in der ``release``-Stage nach dem Merge einen Tag
+    + GitHub-Release zu erzeugen (``gh release create``). Default ``false``.
+    Erlaubt KEIN push-to-main/force (die bleiben kategorisch deny) — ein
+    Release schreibt einen neuen Ref, fasst weder main-History noch force an."""
     push_to_main: Literal[False] = False
     push_force: Literal[False] = False
 

@@ -30,7 +30,9 @@ from typing import Annotated, Any
 import typer
 from forge_adapters.github import (
     BoardError,
+    GitHubError,
     ReadyIssue,
+    create_release,
     fetch_pr_head_committed_at,
     list_ready_items,
     list_stage_items,
@@ -41,6 +43,7 @@ from forge_core.events import (
     ConductorTickCompletedPayload,
     EventKind,
     IssueTriagedPayload,
+    ReleaseTaggedPayload,
     WorkItemBlockedPayload,
     WorkItemStageChangedPayload,
     build_event,
@@ -524,6 +527,99 @@ def _dispatch_issues(
 
     return _PassResult(
         summaries=summaries, bailed=bailed, dispatched=dispatched, skipped=skipped
+    )
+
+
+def _release_tag_for_issue(issue_number: int) -> str:
+    """Deterministischer, eindeutiger Tag pro Work-Item (idempotenter
+    Re-Dispatch). v1: ein Release pro abgeschlossenem Issue."""
+    return f"forge-issue-{issue_number}"
+
+
+def _dispatch_release_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    store: EventStore,
+    session_id: str,
+) -> _PassResult | None:
+    """Effektiert die **Release-Stage** eines Work-Items (Pipeline-Ende hinten).
+
+    Anders als die anderen Stages ist das KEIN LLM-Run, sondern ein
+    deterministischer forge-Effekt (wie der Merge): Tag + GitHub-Release via
+    ``gh release create`` — opt-in über ``capabilities.create_release``.
+    Emittiert ``ReleaseTagged`` → ``derive_signals`` leitet ``release_done`` ab
+    → ``advance`` schreibt ``release→done`` fort.
+
+    Capability aus → kein Effekt, das Item parkt in release (manueller Operator,
+    analog zur ``merge_pr``-Ergonomie). push-to-main/force bleiben unberührt
+    (ein Release schreibt nur einen neuen Ref).
+    """
+    if not ctx.spec.capabilities.create_release:
+        console.print(
+            f"[dim]release #{issue.number}: capabilities.create_release=false "
+            f"→ übersprungen (manueller Release)[/dim]"
+        )
+        return None
+    tag = _release_tag_for_issue(issue.number)
+    try:
+        url = create_release(
+            repo=ctx.repo_root,
+            tag=tag,
+            title=f"{tag}: {issue.title}",
+        )
+    except GitHubError as exc:
+        err_console.print(
+            f"[red]error[/red] in release for issue #{issue.number}: {exc}"
+        )
+        return _PassResult(
+            summaries=[
+                _LoopSummaryRow(
+                    issue_number=issue.number,
+                    issue_title=issue.title,
+                    decision="error",
+                    pr_url=None,
+                    auto_merge="-",
+                    error=str(exc),
+                )
+            ],
+            bailed=False,
+            dispatched=0,
+            skipped=0,
+        )
+    store.append(
+        build_event(
+            kind=EventKind.RELEASE_TAGGED,
+            run_id=session_id,
+            project=ctx.spec.name,
+            project_fingerprint=ctx.project_fingerprint,
+            factory_version=ctx.factory_version,
+            spec_version=ctx.spec.spec_version,
+            payload=ReleaseTaggedPayload(
+                issue_number=issue.number,
+                tag=tag,
+                release_url=url or None,
+            ),
+        )
+    )
+    console.print(
+        f"  [green]released[/green] #{issue.number} → {tag}"
+        + (f" ({url})" if url else "")
+    )
+    return _PassResult(
+        summaries=[
+            _LoopSummaryRow(
+                issue_number=issue.number,
+                issue_title=issue.title,
+                decision="released",
+                pr_url=url or None,
+                auto_merge="-",
+                error=None,
+            )
+        ],
+        bailed=False,
+        dispatched=1,
+        skipped=0,
     )
 
 
@@ -1109,6 +1205,7 @@ def _run_conductor_watch(
                 EventKind.PR_CREATED,
                 EventKind.PR_REVIEWED,
                 EventKind.PR_MERGED,
+                EventKind.RELEASE_TAGGED,
                 EventKind.RUN_RESUME_SCHEDULED,
             ):
                 events.extend(store.events_by_kind(kind))
@@ -1210,10 +1307,15 @@ def _run_conductor_watch(
                         return None
                     # requirements → architect-Run (Akzeptanzkriterien, kein PR);
                     # design → architect-Run (Plan, kein PR); qa → Review-Merge-Agent
-                    # (PRReviewed/PRMerged, kein neuer PR); sonst → Dev-Loop (PR).
+                    # (PRReviewed/PRMerged, kein neuer PR); release → deterministischer
+                    # Tag/Release-Effekt (kein LLM-Run); sonst → Dev-Loop (PR).
                     if order.stage == Stage.REQUIREMENTS:
                         return _dispatch_requirements_run(
                             ctx=ctx, issue=issue, params=params, store=store
+                        )
+                    if order.stage == Stage.RELEASE:
+                        return _dispatch_release_run(
+                            ctx=ctx, issue=issue, store=store, session_id=session_id
                         )
                     if order.stage == Stage.DESIGN:
                         return _dispatch_design_run(

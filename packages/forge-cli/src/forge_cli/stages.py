@@ -94,6 +94,10 @@ class StageSignals:
     ``MAX_DEV_RETRIES``, eskaliert der Conductor das Item nach ``blocked``
     statt erneut zu dispatchen."""
 
+    release_done: bool = False
+    """Ein ``ReleaseTagged`` liegt vor — forge hat Tag + Release erzeugt
+    (Advance-Signal release→done; opt-in ``capabilities.create_release``)."""
+
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
 # Advance-Auslöser produziert (``design`` → architect-Team → ``PlanProposed`` →
@@ -118,7 +122,7 @@ class StageSignals:
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
 # Dispatch-Zweig in der board-loop-Wiring-Schicht.
 IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset(
-    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA}
+    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA, Stage.RELEASE}
 )
 
 
@@ -158,11 +162,11 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
       - design       → ready     sobald ein Plan vorliegt
       - in-dev       → qa         sobald ein PR geöffnet wurde
       - qa           → release    sobald der PR gemergt wurde
+      - release      → done        sobald Tag + Release erzeugt sind
 
     ``ready → in-dev`` passiert beim DISPATCH (Conductor, mit Kapazität +
-    Dependencies) und ``release → done`` braucht die devops-Rolle — beide hier
-    bewusst NICHT automatisch. Gibt ``(stage, "")`` zurück, wenn kein Übergang
-    fällig ist.
+    Dependencies) — hier bewusst NICHT automatisch. Gibt ``(stage, "")``
+    zurück, wenn kein Übergang fällig ist.
     """
     if stage == Stage.REQUIREMENTS and signals.has_refined_spec:
         return Stage.DESIGN, "requirements_refined"
@@ -172,6 +176,8 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
         return Stage.QA, "pr_created"
     if stage == Stage.QA and signals.has_merged_pr:
         return Stage.RELEASE, "pr_merged"
+    if stage == Stage.RELEASE and signals.release_done:
+        return Stage.DONE, "released"
     return stage, ""
 
 

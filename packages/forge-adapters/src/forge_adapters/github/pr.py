@@ -726,3 +726,87 @@ def merge_pr(
         )
     merger = gh_current_login(repo=repo, gh_bin=gh_bin, run_subprocess=run_subprocess)
     return MergeResult(merged=True, merger=merger, method=method)
+
+
+def create_release(
+    *,
+    repo: Path,
+    tag: str,
+    title: str,
+    notes: str | None = None,
+    generate_notes: bool = True,
+    gh_bin: str = "gh",
+    run_subprocess: SubprocessRunner = subprocess.run,
+) -> str:
+    """Erzeugt einen Tag + GitHub-Release via ``gh release create`` (B2).
+
+    Deterministischer forge-Effekt für die ``release``-Stage — opt-in über
+    ``capabilities.create_release``. ``gh release create`` legt Tag UND Release
+    in einem Aufruf an (kein manuelles ``git push``/``--force`` — ein Release
+    schreibt einen neuen Ref, fasst weder main noch force an).
+
+    **Idempotent:** existiert der Tag schon (Re-Dispatch desselben Items),
+    wird die bestehende Release-URL zurückgegeben statt zu scheitern — sonst
+    re-dispatcht die in-place release-Stage jeden Tick erfolglos.
+
+    Gibt die Release-URL zurück (``gh release create`` schreibt sie nach stdout).
+    """
+    existing = _release_url_if_exists(
+        repo=repo, tag=tag, gh_bin=gh_bin, run_subprocess=run_subprocess
+    )
+    if existing is not None:
+        return existing
+
+    cmd = [gh_bin, "release", "create", tag, "--title", title]
+    if generate_notes:
+        cmd.append("--generate-notes")
+    if notes:
+        cmd += ["--notes", notes]
+    result = run_subprocess(
+        cmd,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        # Race/Re-Dispatch: Tag zwischenzeitlich angelegt → als Erfolg werten.
+        if "already exists" in stderr.lower():
+            existing = _release_url_if_exists(
+                repo=repo, tag=tag, gh_bin=gh_bin, run_subprocess=run_subprocess
+            )
+            if existing is not None:
+                return existing
+        raise GitHubError(
+            f"gh release create {tag} failed (exit {result.returncode}): "
+            f"{stderr or '<no stderr>'}"
+        )
+    return result.stdout.strip()
+
+
+def _release_url_if_exists(
+    *,
+    repo: Path,
+    tag: str,
+    gh_bin: str,
+    run_subprocess: SubprocessRunner,
+) -> str | None:
+    """Release-URL eines bestehenden Tags via ``gh release view``, oder ``None``."""
+    result = run_subprocess(
+        [gh_bin, "release", "view", tag, "--json", "url"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    url = data.get("url")
+    return str(url) if url else ""

@@ -35,6 +35,7 @@ from forge_core.events.kinds.proposal import (
     ProposalReceivedPayload,
     ProposalRequestedPayload,
 )
+from forge_core.events.kinds.release import ReleaseTaggedPayload
 from forge_core.events.kinds.requirements import RequirementsRefinedPayload
 from forge_core.events.kinds.resume import RunResumeScheduledPayload
 from forge_core.events.kinds.run import RunFinishedPayload, RunStartedPayload
@@ -66,6 +67,7 @@ __all__ = [
     "PreflightFailedPayload",
     "ProposalReceivedPayload",
     "ProposalRequestedPayload",
+    "ReleaseTaggedPayload",
     "RequirementsRefinedPayload",
     "RiskLevel",
     "RunFinishedPayload",

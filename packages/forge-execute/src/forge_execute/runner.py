@@ -16,6 +16,7 @@ Designentscheidungen für M1:
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -804,12 +805,21 @@ class SequentialRunner:
                     agents_invoked=result.agents_invoked,
                 )
 
+        # Kuratierte Lektionen (Gedächtnis): der Master meldet sie optional im
+        # ---FORGE-LESSONS-...---Block. Read-only-Auswertung in den Memory-Block
+        # späterer Runs; speist NIE den Operator-Seed zurück (Mantra 3).
+        if result.lessons_block:
+            self._emit_lessons_learned(
+                lessons_block=result.lessons_block,
+                gen_id=gen_id,
+            )
+
         self._emit(
             EventKind.PROPOSAL_RECEIVED,
             ProposalReceivedPayload(
                 stop_reason=_normalize_stop_reason(result.stop_reason),
                 turns_used=result.turns_used,
-                files_touched=[],
+                files_touched=_changed_files(result.diff),
             ),
             generation_id=gen_id,
             artifacts=artifacts,
@@ -866,6 +876,37 @@ class SequentialRunner:
             generation_id=gen_id,
             artifacts={"plan": plan_hash},
         )
+
+    def _emit_lessons_learned(
+        self,
+        *,
+        lessons_block: str,
+        gen_id: str,
+    ) -> None:
+        """Parst den Lessons-Block und emittiert ein ``LessonLearned`` je Lektion.
+
+        Best-effort und fail-open: ein unparsbarer/leerer Block ergibt einfach
+        keine Events. Das ist die einzige Schreibseite des Gedächtnisses; gelesen
+        wird es read-only über ``_project_memory.collect_recent_lessons``. Der
+        Operator-Seed ``.forge/memory.md`` bleibt unberührt (Mantra 3).
+        """
+        from forge_core.events.kinds.lesson import LessonLearnedPayload
+
+        from forge_execute._lesson_parser import parse_lessons
+
+        for parsed in parse_lessons(lessons_block):
+            self._emit(
+                EventKind.LESSON_LEARNED,
+                LessonLearnedPayload(
+                    lesson=parsed.lesson,
+                    category=parsed.category,
+                    issue_number=self.config.issue_number,
+                    files=parsed.files,
+                    source="agent",
+                ),
+                generation_id=gen_id,
+                success=True,
+            )
 
     def _emit_requirements_refined(
         self,
@@ -1316,6 +1357,32 @@ _ALLOWED_STOP_REASONS = {
 
 def _normalize_stop_reason(stop: str) -> str:
     return stop if stop in _ALLOWED_STOP_REASONS else "unknown"
+
+
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)$", re.MULTILINE)
+_MAX_FILES_TOUCHED = 50
+
+
+def _changed_files(diff: str | None) -> list[str]:
+    """Extracts the changed file paths from a unified git diff.
+
+    Best-effort: reads the ``diff --git a/<old> b/<new>`` headers and returns
+    the post-image paths (renames included). Feeds the per-proposal
+    ``files_touched`` record, which the cross-run file heatmap aggregates.
+    Bounded to keep the event payload small on huge diffs.
+    """
+    if not diff:
+        return []
+    seen: list[str] = []
+    out: set[str] = set()
+    for _old, new in _DIFF_GIT_RE.findall(diff):
+        path = new.strip()
+        if path and path not in out:
+            out.add(path)
+            seen.append(path)
+        if len(seen) >= _MAX_FILES_TOUCHED:
+            break
+    return seen
 
 
 def _quick_run(cmd: str, *, cwd: Path, timeout: int) -> int | None:

@@ -5,9 +5,10 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
-from forge_cli.analyze import _fmt_duration, _render_report
+from forge_cli.analyze import _fmt_duration, _render_report, _section_lessons
 from forge_core.events import (
     EventKind,
+    LessonLearnedPayload,
     PRCreatedPayload,
     PRMergedPayload,
     RunFinishedPayload,
@@ -88,6 +89,50 @@ def test_render_report_with_run_shows_kpis(tmp_path: Path) -> None:
     assert "| PRs merged | 1 |" in md
     # Lead-Time 7200s → 2.0h (siehe _fmt_duration).
     assert "2.0h" in md
+
+
+def _lesson(run_id: str, lesson: str, category: str = "general", issue: int | None = None):
+    return build_event(
+        kind=EventKind.LESSON_LEARNED,
+        run_id=run_id,
+        payload=LessonLearnedPayload(
+            lesson=lesson,
+            category=category,  # type: ignore[arg-type]
+            issue_number=issue,
+        ),
+        **_COMMON,
+    )
+
+
+def test_render_report_empty_store_has_lessons_placeholder(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        md = _render_report(store, project="pinta", last_runs=5)
+    finally:
+        store.close()
+    assert "## Lessons learned" in md
+    assert "_no lessons recorded yet._" in md
+
+
+def test_section_lessons_dedupes_and_counts(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        store.append_many(
+            [
+                _lesson("r1", "Use uv, not pip", "tooling"),
+                _lesson("r2", "Use uv, not pip", "tooling"),  # Wiederholung
+                _lesson("r3", "Tests need no __init__", "convention", issue=12),
+            ]
+        )
+        md = _section_lessons(store)
+    finally:
+        store.close()
+
+    # Dedupe nach Text: eine Zeile pro Lektion.
+    assert md.count("Use uv, not pip") == 1
+    # times_seen zählt die Wiederholung.
+    assert "| tooling | Use uv, not pip | — | 2 |" in md
+    assert "| convention | Tests need no __init__ | #12 | 1 |" in md
 
 
 def test_fmt_duration_buckets() -> None:

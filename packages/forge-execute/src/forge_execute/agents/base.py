@@ -113,6 +113,11 @@ class ProposalResult:
     hat (aus dem `---FORGE-AGENTS-...---`-Block). None, wenn der Master nichts
     meldete oder Single-Agent-Run — dann fällt der Runner auf das konfigurierte
     Roster zurück. Macht Orchestrierungs-Treue messbar (config != reality)."""
+    lessons_block: str | None = None
+    """Roher Inhalt des ``---FORGE-LESSONS-...---``-Blocks aus dem Master-
+    Output, falls der Agent kuratierte Lektionen zurückmeldete. None, wenn die
+    Marker fehlen (der Normalfall — Lektionen sind optional). Der Runner parst
+    ihn (``_lesson_parser.parse_lessons``) und emittiert ``LessonLearned``."""
     stream_log: str | None = None
     """Pfad zum stream-json-Log dieses propose-Aufrufs (ein Envelope
     ``{"ts", "event"}`` pro claude-Event). Lebt unter ``.forge/logs/<run_id>/``

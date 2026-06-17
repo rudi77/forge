@@ -30,7 +30,8 @@ def test_all_event_kinds_have_registered_payload_schemas() -> None:
     # + Agent-Review-Merge: PRReviewed = 23.
     # + Pipeline-Ende vorne: RequirementsRefined = 24.
     # + Pipeline-Ende hinten: ReleaseTagged = 25.
-    assert len(EventKind) == 25
+    # + Gedächtnis: LessonLearned = 26.
+    assert len(EventKind) == 26
     for kind in EventKind:
         assert kind in _PAYLOAD_REGISTRY, f"missing schema for {kind}"
 
@@ -195,6 +196,39 @@ def test_default_event_id_is_ulid_sortable() -> None:
     )
     # ULIDs erzeugt nacheinander sind chronologisch sortierbar als string
     assert e1.event_id < e2.event_id
+
+
+def test_lesson_learned_payload_validates_and_bounds() -> None:
+    from forge_core.events.kinds.lesson import LessonLearnedPayload
+
+    # Leere Lektion ist ungültig (es gibt nichts zu merken).
+    with pytest.raises(ValueError):
+        LessonLearnedPayload(lesson="   ")
+
+    # Lange Lektion wird hart gekürzt, Files werden gekappt + gestrippt.
+    p = LessonLearnedPayload(
+        lesson="x" * 500,
+        category="pitfall",
+        files=[" a.py ", "", "b.py"] + [f"f{i}.py" for i in range(20)],
+    )
+    assert len(p.lesson) == 280
+    assert p.files[:2] == ["a.py", "b.py"]
+    assert len(p.files) == 10
+    assert p.source == "agent"  # Default
+
+
+def test_lesson_learned_roundtrips_through_build_event() -> None:
+    from forge_core.events.kinds.lesson import LessonLearnedPayload
+
+    evt = build_event(
+        kind=EventKind.LESSON_LEARNED,
+        run_id="r1",
+        payload=LessonLearnedPayload(lesson="use uv", category="tooling"),
+        **COMMON,
+    )
+    assert evt.kind == EventKind.LESSON_LEARNED
+    assert evt.payload_schema_version == "1.0"
+    assert evt.payload["lesson"] == "use uv"
 
 
 def test_cost_usd_preserves_precision() -> None:

@@ -365,6 +365,63 @@ def test_runner_plan_proposed_records_invoked_agents_over_config(
     store.close()
 
 
+def test_runner_emits_lessons_and_records_touched_files(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """Der Master-Lessons-Block wird als LessonLearned-Events persistiert, und
+    ProposalReceived.files_touched wird aus dem Diff befüllt (vorher Stub)."""
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+
+    def fix_with_lessons(wt: Path, prompt: str) -> ProposalResult:
+        (wt / "src" / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n", encoding="utf-8"
+        )
+        import subprocess as sp
+
+        diff = sp.run(
+            ["git", "diff"], cwd=str(wt), capture_output=True, text=True
+        ).stdout
+        return ProposalResult(
+            diff=diff,
+            stop_reason="end_turn",
+            agents_invoked=["developer"],
+            lessons_block=(
+                "- [convention] calc lives in src/calc.py\n"
+                "- [pitfall] the suite needs pytest, not unittest"
+            ),
+        )
+
+    agent = MockCodingAgent(callable_=fix_with_lessons)
+    config = RunConfig(
+        spec=spec,
+        project="red-repo",
+        project_fingerprint="sha256:test",
+        factory_version="git:test",
+        repo_root=red_repo,
+        prompt_template_id="t1",
+        initial_prompt="Fix the failing test.",
+        agents=["developer"],
+        max_iterations=1,
+    )
+    runner = SequentialRunner(config=config, agent=agent, store=store, blobs=blobs)
+    runner.run()
+
+    lessons = store.events_by_kind(EventKind.LESSON_LEARNED)
+    texts = {e.payload["lesson"] for e in lessons}
+    assert "calc lives in src/calc.py" in texts
+    assert "the suite needs pytest, not unittest" in texts
+    cats = {e.payload["category"] for e in lessons}
+    assert cats == {"convention", "pitfall"}
+
+    proposals = store.events_by_kind(EventKind.PROPOSAL_RECEIVED)
+    touched = proposals[0].payload["files_touched"]
+    assert "src/calc.py" in touched
+
+    store.close()
+
+
 def test_runner_emits_project_memory_artifact_when_seed_present(
     red_repo: Path, tmp_path: Path
 ) -> None:

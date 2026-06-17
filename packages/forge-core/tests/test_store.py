@@ -210,6 +210,39 @@ def test_factory_throughput_view(store: EventStore) -> None:
     assert rows[0]["no_improvement"] == 0
 
 
+def test_lessons_learned_view_dedupes_with_recent_category(store: EventStore) -> None:
+    from forge_core.events.kinds.lesson import LessonLearnedPayload
+
+    def lesson(run_id: str, text: str, category: str, issue: int | None = None):
+        return build_event(
+            kind=EventKind.LESSON_LEARNED,
+            run_id=run_id,
+            payload=LessonLearnedPayload(
+                lesson=text,
+                category=category,  # type: ignore[arg-type]
+                issue_number=issue,
+            ),
+            **COMMON,
+        )
+
+    # Dieselbe Lektion zweimal — die zweite (jüngere) trägt eine andere
+    # Kategorie. arg_max(category, ts) muss die jüngere wählen.
+    store.append(lesson("r1", "Prefer arg_max over ANY_VALUE", "general"))
+    store.append(lesson("r2", "Prefer arg_max over ANY_VALUE", "pattern", issue=5))
+    store.append(lesson("r3", "Tests need no __init__", "convention"))
+
+    rows = store.query(
+        "SELECT * FROM lessons_learned ORDER BY times_seen DESC, lesson"
+    )
+    by_lesson = {r["lesson"]: r for r in rows}
+    assert len(rows) == 2  # dedupe nach Text
+    arg = by_lesson["Prefer arg_max over ANY_VALUE"]
+    assert arg["times_seen"] == 2
+    assert arg["category"] == "pattern"  # jüngstes Vorkommen gewinnt
+    assert arg["issue_number"] == 5
+    assert by_lesson["Tests need no __init__"]["times_seen"] == 1
+
+
 def test_referenced_artifact_hashes(store: EventStore) -> None:
     _seed_minimal_run(store)
     refs = store.referenced_artifact_hashes()

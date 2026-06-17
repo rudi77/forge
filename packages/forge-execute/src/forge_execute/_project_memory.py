@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
 from forge_core.blobs import BlobStore
@@ -23,6 +24,14 @@ _MAX_RECENT_PLANS = 3
 _MAX_RECENT_OUTCOMES = 5
 _MAX_FOCUS_CHARS = 100
 _SEED_FILENAME = "memory.md"
+
+# Gedächtnis-Erweiterungen (A/B/C). Bewusst kleine Caps — der Memory-Block
+# konkurriert mit dem Task-Kontext um Tokens; _truncate ist die harte Grenze.
+_MAX_LESSONS = 8
+_MAX_FAILURE_MODES = 5
+_MAX_HOTSPOTS = 8
+_HOTSPOT_SCAN = 200  # wie viele jüngste ProposalReceived-Events durchgezählt werden
+_MIN_HOTSPOT_HITS = 2  # erst ab 2 Runs gilt eine Datei als „häufig angefasst"
 
 
 def load_memory_seed(forge_dir: Path) -> str | None:
@@ -139,6 +148,142 @@ def collect_recent_run_outcomes(
     return out
 
 
+def collect_recent_lessons(
+    store: EventStore,
+    *,
+    project: str,
+    exclude_run_id: str | None = None,
+    limit: int = _MAX_LESSONS,
+) -> list[str]:
+    """Kuratierte Lektionen aus ``LessonLearned``-Events (jüngste zuerst).
+
+    Das ist die ein einzige Quelle, die NICHT aus anderen Events ableitbar ist
+    (Selbstauskunft des Agenten). Dedupliziert über den Lektions-Text, damit
+    derselbe Hinweis aus mehreren Runs den Block nicht flutet.
+    """
+    rows = store.query(
+        """
+        SELECT json_extract_string(payload, '$.lesson') AS lesson,
+               json_extract_string(payload, '$.category') AS category
+        FROM events
+        WHERE kind = 'LessonLearned'
+          AND project = ?
+          AND (? IS NULL OR run_id != ?)
+        ORDER BY ts DESC, event_id DESC
+        LIMIT ?
+        """,
+        [project, exclude_run_id, exclude_run_id, limit * 4],
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        lesson = str(row.get("lesson") or "").strip()
+        if not lesson:
+            continue
+        key = lesson.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        category = str(row.get("category") or "general").strip()
+        if category and category != "general":
+            out.append(f"- [{category}] {lesson}")
+        else:
+            out.append(f"- {lesson}")
+        if len(out) >= limit:
+            break
+    return out
+
+
+def collect_recent_failures(
+    store: EventStore,
+    *,
+    project: str,
+    exclude_run_id: str | None = None,
+    limit: int = _MAX_FAILURE_MODES,
+) -> list[str]:
+    """Wiederkehrende Fehlschläge, rein aus dem Event-Strom abgeleitet.
+
+    Gruppiert explizit gescheiterte Events (``success = FALSE``) nach Kind +
+    ``error_class`` und zählt sie. Der nächste Run sieht so, in welche
+    Sackgassen frühere Runs gelaufen sind (Timeouts, Agent-Fehler,
+    Guardrail-Verletzungen) — Failure-Memory ohne neues Event (Mantra 3).
+    """
+    rows = store.query(
+        """
+        SELECT kind AS kind,
+               COALESCE(error_class, '(unspecified)') AS error_class,
+               COUNT(*) AS n
+        FROM events
+        WHERE project = ?
+          AND success = FALSE
+          AND (? IS NULL OR run_id != ?)
+        GROUP BY kind, error_class
+        ORDER BY n DESC, kind
+        LIMIT ?
+        """,
+        [project, exclude_run_id, exclude_run_id, limit],
+    )
+    out: list[str] = []
+    for row in rows:
+        n = int(row.get("n") or 0)
+        if n <= 0:
+            continue
+        error_class = str(row.get("error_class") or "(unspecified)")
+        kind = str(row.get("kind") or "?")
+        unit = "time" if n == 1 else "times"
+        out.append(f"- `{error_class}` during {kind} ({n} {unit})")
+    return out
+
+
+def collect_file_hotspots(
+    store: EventStore,
+    *,
+    project: str,
+    exclude_run_id: str | None = None,
+    limit: int = _MAX_HOTSPOTS,
+) -> list[str]:
+    """Häufig angefasste Dateien, aggregiert aus ``ProposalReceived``.
+
+    Zählt die ``files_touched`` der jüngsten Proposals und liefert die Dateien,
+    die über mindestens ``_MIN_HOTSPOT_HITS`` Proposals hinweg auftauchen. Gibt
+    dem nächsten Run (und via Context-Handoff den Subagents) einen Hinweis,
+    welche Pfade für dieses Projekt zentral sind — spart kaltes Re-Scannen.
+    """
+    rows = store.query(
+        """
+        SELECT payload
+        FROM events
+        WHERE kind = 'ProposalReceived'
+          AND project = ?
+          AND (? IS NULL OR run_id != ?)
+        ORDER BY ts DESC, event_id DESC
+        LIMIT ?
+        """,
+        [project, exclude_run_id, exclude_run_id, _HOTSPOT_SCAN],
+    )
+    counts: Counter[str] = Counter()
+    for row in rows:
+        payload_raw = row.get("payload")
+        if isinstance(payload_raw, str):
+            try:
+                payload = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                continue
+        elif isinstance(payload_raw, dict):
+            payload = payload_raw
+        else:
+            continue
+        for f in payload.get("files_touched") or []:
+            if isinstance(f, str) and f.strip():
+                counts[f.strip()] += 1
+    out: list[str] = []
+    for path, n in counts.most_common(limit):
+        if n < _MIN_HOTSPOT_HITS:
+            break  # most_common ist absteigend — ab hier nur noch seltenere
+        out.append(f"- `{path}` ({n} proposals)")
+    return out
+
+
 def build_project_memory(
     *,
     forge_dir: Path,
@@ -155,6 +300,20 @@ def build_project_memory(
         parts.append("## Operator seed\n")
         parts.append(seed)
 
+    lessons = collect_recent_lessons(
+        store,
+        project=project,
+        exclude_run_id=exclude_run_id,
+    )
+    if lessons:
+        parts.append("## Lessons learned\n")
+        parts.append(
+            "Distilled by earlier runs on this repo — conventions, pitfalls, "
+            "and reusable patterns. Apply them; do not relearn them.\n"
+        )
+        parts.extend(lessons)
+        parts.append("")
+
     outcomes = collect_recent_run_outcomes(
         store,
         project=project,
@@ -168,6 +327,35 @@ def build_project_memory(
             "`pr_created` is already implemented; do not re-plan it.\n"
         )
         parts.extend(outcomes)
+        parts.append("")
+
+    failures = collect_recent_failures(
+        store,
+        project=project,
+        exclude_run_id=exclude_run_id,
+    )
+    if failures:
+        parts.append("## Recurring failures & dead-ends\n")
+        parts.append(
+            "Failure modes seen across prior runs. Anticipate these — a "
+            "repeating timeout or agent error often means a step needs a "
+            "different approach, not a retry.\n"
+        )
+        parts.extend(failures)
+        parts.append("")
+
+    hotspots = collect_file_hotspots(
+        store,
+        project=project,
+        exclude_run_id=exclude_run_id,
+    )
+    if hotspots:
+        parts.append("## Frequently touched files\n")
+        parts.append(
+            "Files changed across multiple prior proposals — likely central "
+            "to this project. Start here instead of re-scanning the repo.\n"
+        )
+        parts.extend(hotspots)
         parts.append("")
 
     recent = collect_recent_plan_summaries(

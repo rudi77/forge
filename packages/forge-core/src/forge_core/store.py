@@ -230,6 +230,39 @@ GROUP BY project, CAST(started_at AS DATE);
 """
 
 
+# Gedächtnis-Sicht: kuratierte Lektionen (LessonLearned-Events), dedupliziert
+# nach Lektions-Text. Kategorie/Issue stammen aus dem JÜNGSTEN Vorkommen
+# (arg_max über ts) — gleiche „neuestes gewinnt"-Semantik wie
+# `_project_memory.collect_recent_lessons`. `times_seen` zeigt, wie oft ein
+# Hinweis über Runs hinweg wiederkam (ein wiederholt gemeldeter Stolperstein
+# verdient mehr Aufmerksamkeit). Read-only über den Event-Strom (Mantra 3).
+_VIEW_LESSONS = """
+CREATE OR REPLACE VIEW lessons_learned AS
+WITH parsed AS (
+    SELECT
+        project,
+        json_extract_string(payload, '$.lesson')   AS lesson,
+        json_extract_string(payload, '$.category')  AS category,
+        TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER)
+            AS issue_number,
+        ts
+    FROM events
+    WHERE kind = 'LessonLearned'
+)
+SELECT
+    project,
+    lesson,
+    arg_max(category, ts)     AS category,
+    arg_max(issue_number, ts) AS issue_number,
+    COUNT(*)                  AS times_seen,
+    MAX(ts)                   AS last_seen
+FROM parsed
+WHERE lesson IS NOT NULL AND lesson != ''
+GROUP BY project, lesson
+ORDER BY last_seen DESC;
+"""
+
+
 _VIEWS = [
     _VIEW_RUNS_WITH_OUTCOMES,
     _VIEW_COST_PER_FOCUS,
@@ -237,6 +270,7 @@ _VIEWS = [
     _VIEW_FAILURE_MODES,
     _VIEW_FACTORY_KPIS,
     _VIEW_FACTORY_THROUGHPUT,
+    _VIEW_LESSONS,
 ]
 
 

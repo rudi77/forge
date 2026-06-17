@@ -9,6 +9,7 @@ Reports gemäß Spec Teil 8 / 10:
 4. **Cost pro Focus** — wo Geld fließt, was es bringt
 5. **PR-Merge-Rate pro Focus** — Mensch-Maschine-Match-Indikator
 6. **Top Failure-Modes** — recurring Stolperfallen
+7. **Lessons learned** — kuratiertes Gedächtnis (LessonLearned-Events)
 
 Die Factory-KPIs sind die „Software-Factory"-Sicht (Mantra 1): read-only
 Aggregation über den Event-Strom, Voraussetzung für Koordinations- und
@@ -72,6 +73,7 @@ def _render_report(store, *, project: str, last_runs: int) -> str:
     sections.append(_section_cost_per_focus(store))
     sections.append(_section_pr_merge_rate(store))
     sections.append(_section_failure_modes(store))
+    sections.append(_section_lessons(store))
     return "\n".join(sections)
 
 
@@ -262,6 +264,41 @@ def _section_failure_modes(store) -> str:
         )
         out.append(
             f"| {r['kind']} | {r['error_class'] or '—'} | {r['occurrences']} | {last} |"
+        )
+    out.append("")
+    return "\n".join(out)
+
+
+def _section_lessons(store, *, limit: int = 25) -> str:
+    rows = store.query(
+        """
+        SELECT lesson, category, issue_number, times_seen, last_seen
+        FROM lessons_learned
+        ORDER BY times_seen DESC, last_seen DESC
+        LIMIT ?
+        """,
+        [limit],
+    )
+    if not rows:
+        return "## Lessons learned\n\n_no lessons recorded yet._\n"
+
+    out = [
+        "## Lessons learned",
+        "",
+        "| category | lesson | issue | seen | last |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        category = r["category"] or "general"
+        lesson = (r["lesson"] or "").replace("|", "\\|")
+        issue = f"#{r['issue_number']}" if r["issue_number"] is not None else "—"
+        last = (
+            r["last_seen"].isoformat(timespec="seconds")
+            if r["last_seen"] is not None
+            else "—"
+        )
+        out.append(
+            f"| {category} | {lesson} | {issue} | {r['times_seen']} | {last} |"
         )
     out.append("")
     return "\n".join(out)

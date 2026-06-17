@@ -217,11 +217,23 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             f"{AGENTS_BEGIN_MARKER}\n"
             "<comma-separated list of the subagent roles you ACTUALLY "
             "invoked this run, e.g. `architect, developer, tester`>\n"
-            f"{AGENTS_END_MARKER}\n"
+            f"{AGENTS_END_MARKER}\n\n"
+            f"{LESSONS_BEGIN_MARKER}\n"
+            "<0-5 durable lessons a FUTURE run on this repo should know, one "
+            "per line. Each line: an optional `[pattern|pitfall|convention|"
+            "tooling]` tag, then one sentence. Optionally end with "
+            "`(files: a.py, b.py)`. Capture only non-obvious, lasting facts "
+            "(a project convention, a pitfall that cost you time, a reusable "
+            "pattern) — NOT task-specific status or anything already obvious "
+            "from the code. Omit the lines entirely if you learned nothing "
+            "worth persisting.>\n"
+            f"{LESSONS_END_MARKER}\n"
             "```\n\n"
             f"   The `{PLAN_BEGIN_MARKER}` / `{PLAN_END_MARKER}` and "
             f"`{AGENTS_BEGIN_MARKER}` / `{AGENTS_END_MARKER}` markers are "
-            "MANDATORY and must appear on their own lines."
+            "MANDATORY and must appear on their own lines. The "
+            f"`{LESSONS_BEGIN_MARKER}` / `{LESSONS_END_MARKER}` block is "
+            "optional — include it only when you have a real lesson."
         )
     else:
         steps.append(
@@ -232,7 +244,13 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "```\n"
             f"{AGENTS_BEGIN_MARKER}\n"
             "<comma-separated roles you invoked, e.g. `developer, tester`>\n"
-            f"{AGENTS_END_MARKER}\n"
+            f"{AGENTS_END_MARKER}\n\n"
+            f"{LESSONS_BEGIN_MARKER}\n"
+            "<optional: 0-5 durable lessons a future run should know, one per "
+            "line, each an optional `[pattern|pitfall|convention|tooling]` tag "
+            "then one sentence. Only non-obvious, lasting facts — omit if "
+            "none.>\n"
+            f"{LESSONS_END_MARKER}\n"
             "```"
         )
 
@@ -340,6 +358,13 @@ PLAN_END_MARKER = "---FORGE-PLAN-END---"
 AGENTS_BEGIN_MARKER = "---FORGE-AGENTS-BEGIN---"
 AGENTS_END_MARKER = "---FORGE-AGENTS-END---"
 
+# Markers used to extract curated, distilled lessons the master wants future
+# runs to remember (conventions, pitfalls, patterns). Optional and fail-open:
+# absent markers simply mean "no lessons this run" — forge never fabricates
+# them. Each line in the block is one lesson; see `extract_lessons_block`.
+LESSONS_BEGIN_MARKER = "---FORGE-LESSONS-BEGIN---"
+LESSONS_END_MARKER = "---FORGE-LESSONS-END---"
+
 
 def extract_plan_from_master_output(text: str) -> str | None:
     """Extracts the architect's plan from the master claude's final output.
@@ -371,6 +396,22 @@ def extract_agents_from_master_output(text: str) -> list[str] | None:
     tokens = {t.strip().lower() for t in re.split(r"[,\s]+", blob) if t.strip()}
     ordered = [a for a in KNOWN_AGENTS if a in tokens]
     return ordered or None
+
+
+def extract_lessons_block(text: str) -> str | None:
+    """Returns the raw inner text of the ``---FORGE-LESSONS-...---`` block.
+
+    None when the markers are absent — the common case (lessons are optional,
+    forge never fabricates them). Structured parsing into individual lessons
+    happens in ``forge_execute._lesson_parser.parse_lessons``; this stays a
+    pure marker-slice, mirroring ``extract_plan_from_master_output``.
+    """
+    begin = text.find(LESSONS_BEGIN_MARKER)
+    end = text.find(LESSONS_END_MARKER)
+    if begin == -1 or end == -1 or end <= begin:
+        return None
+    block = text[begin + len(LESSONS_BEGIN_MARKER) : end].strip()
+    return block or None
 
 
 # Rückwärtskompatibler Default-Prompt (volles Roster). Neuer Code soll

@@ -6,12 +6,17 @@ from pathlib import Path
 
 from forge_core.blobs import BlobStore
 from forge_core.events import EventKind, build_event
+from forge_core.events.kinds.lesson import LessonLearnedPayload
 from forge_core.events.kinds.plan import PlanProposedPayload
 from forge_core.events.kinds.pr import PRMergedPayload
+from forge_core.events.kinds.proposal import ProposalReceivedPayload
 from forge_core.events.kinds.run import RunFinishedPayload, RunStartedPayload
 from forge_core.store import EventStore
 from forge_execute._project_memory import (
     build_project_memory,
+    collect_file_hotspots,
+    collect_recent_failures,
+    collect_recent_lessons,
     collect_recent_plan_summaries,
     collect_recent_run_outcomes,
     load_memory_seed,
@@ -319,5 +324,139 @@ def test_build_project_memory_is_deterministic(tmp_path: Path) -> None:
         )
         assert first == second
         assert "Recent successful plans" in first
+    finally:
+        store.close()
+
+
+# --- Gedächtnis-Erweiterungen: Lessons (C), Failures (A), Hotspots (B) ----
+
+
+def _append_lesson(
+    store: EventStore,
+    *,
+    run_id: str,
+    lesson: str,
+    category: str = "general",
+    files: list[str] | None = None,
+) -> None:
+    store.append(
+        build_event(
+            kind=EventKind.LESSON_LEARNED,
+            run_id=run_id,
+            payload=LessonLearnedPayload(
+                lesson=lesson,
+                category=category,  # type: ignore[arg-type]
+                files=files or [],
+            ),
+            **_COMMON,
+        )
+    )
+
+
+def _append_proposal(
+    store: EventStore,
+    *,
+    run_id: str,
+    files: list[str],
+    success: bool | None = True,
+    error_class: str | None = None,
+) -> None:
+    store.append(
+        build_event(
+            kind=EventKind.PROPOSAL_RECEIVED,
+            run_id=run_id,
+            payload=ProposalReceivedPayload(
+                stop_reason="error" if error_class else "end_turn",
+                files_touched=files,
+            ),
+            success=success,
+            error_class=error_class,
+            **_COMMON,
+        )
+    )
+
+
+def test_collect_recent_lessons_dedupes_and_tags(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        # Reihenfolge: ältester zuerst angehängt. Dedup behält die JÜNGSTE
+        # Variante (neuestes gewinnt), daher die getaggte uv-Zeile zuletzt.
+        _append_lesson(store, run_id="r1", lesson="use uv, not pip")  # dup (case)
+        _append_lesson(store, run_id="r2", lesson="Use uv, not pip", category="tooling")
+        _append_lesson(store, run_id="r3", lesson="Tests need no __init__")
+        out = collect_recent_lessons(store, project="testproj")
+        assert any("[tooling] Use uv, not pip" in line for line in out)
+        # Dedup: nur eine uv-Zeile.
+        assert sum("uv, not pip" in line.lower() for line in out) == 1
+        # general-Kategorie ohne Tag-Präfix.
+        assert any(line == "- Tests need no __init__" for line in out)
+    finally:
+        store.close()
+
+
+def test_collect_recent_failures_counts_modes(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        _append_proposal(store, run_id="r1", files=[], success=False, error_class="CodingAgentTimeout")
+        _append_proposal(store, run_id="r2", files=[], success=False, error_class="CodingAgentTimeout")
+        _append_proposal(store, run_id="r3", files=[], success=False, error_class="CodingAgentError")
+        _append_proposal(store, run_id="r4", files=["a.py"], success=True)  # kein Fehler
+        out = collect_recent_failures(store, project="testproj")
+        joined = "\n".join(out)
+        assert "CodingAgentTimeout" in joined
+        assert "(2 times)" in joined
+        assert "CodingAgentError" in joined
+        # Erfolgreiche Proposals tauchen nicht auf.
+        assert "end_turn" not in joined
+    finally:
+        store.close()
+
+
+def test_collect_file_hotspots_requires_repeat(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        _append_proposal(store, run_id="r1", files=["src/core.py", "once.py"])
+        _append_proposal(store, run_id="r2", files=["src/core.py"])
+        _append_proposal(store, run_id="r3", files=["src/core.py"])
+        out = collect_file_hotspots(store, project="testproj")
+        joined = "\n".join(out)
+        # src/core.py 3x → Hotspot; once.py nur 1x → unter der Schwelle.
+        assert "`src/core.py` (3 proposals)" in joined
+        assert "once.py" not in joined
+    finally:
+        store.close()
+
+
+def test_collect_lessons_excludes_current_run(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.duckdb")
+    try:
+        _append_lesson(store, run_id="current", lesson="only from current run")
+        out = collect_recent_lessons(store, project="testproj", exclude_run_id="current")
+        assert out == []
+    finally:
+        store.close()
+
+
+def test_build_project_memory_includes_lessons_failures_hotspots(tmp_path: Path) -> None:
+    forge_dir = tmp_path / ".forge"
+    forge_dir.mkdir()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+    try:
+        _append_lesson(store, run_id="r1", lesson="Prefer GitIgnoreSpec.from_lines", category="convention")
+        _append_proposal(store, run_id="r1", files=["src/core.py"], success=False, error_class="CodingAgentTimeout")
+        _append_proposal(store, run_id="r2", files=["src/core.py"], success=False, error_class="CodingAgentTimeout")
+        md = build_project_memory(
+            forge_dir=forge_dir,
+            store=store,
+            blobs=blobs,
+            project="testproj",
+        )
+        assert "## Lessons learned" in md
+        assert "GitIgnoreSpec.from_lines" in md
+        assert "## Recurring failures & dead-ends" in md
+        assert "CodingAgentTimeout" in md
+        assert "## Frequently touched files" in md
+        assert "src/core.py" in md
     finally:
         store.close()

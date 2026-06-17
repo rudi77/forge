@@ -56,6 +56,10 @@ class EventKind(StrEnum):
     # Pipeline-Ende hinten: forge hat in der release-Stage einen Tag +
     # GitHub-Release erzeugt (Advance-Signal release→done; opt-in create_release).
     RELEASE_TAGGED = "ReleaseTagged"
+    # Gedächtnis: eine kuratierte, destillierte Lektion aus einem Run, die
+    # künftige Runs orientiert (Konventionen, Stolperfallen, Patterns). Nicht
+    # aus anderen Events ableitbar — Selbstauskunft des Master-Agenten.
+    LESSON_LEARNED = "LessonLearned"
 
 
 class EventValidationError(ValueError):

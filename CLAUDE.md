@@ -253,7 +253,7 @@ dann reviewed `forge review-pr` nur und merged nie.
 - Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
 - Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
 
-Vor jeder Schema-Änderung: `len(EventKind) == 23` und `len(_PAYLOAD_REGISTRY) == 23` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22; + Agent-Review-Merge: `PRReviewed` = 23).
+Vor jeder Schema-Änderung: `len(EventKind) == 26` und `len(_PAYLOAD_REGISTRY) == 26` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22; + Agent-Review-Merge: `PRReviewed` = 23; + Pipeline-Enden: `RequirementsRefined`/`ReleaseTagged` = 25; + Gedächtnis: `LessonLearned` = 26).
 
 `PRMerged` steht auf Schema **1.1** (additiv: `merged_by_forge` + `merge_method` für forge-initiierte Merges). Alte 1.0-Events lesen weiter (Defaults).
 
@@ -291,7 +291,11 @@ Drei gemessene Kostentreiber orchestrierter Runs (Analyse eines $19/57-min-Runs:
 
 ### Project memory: Erledigt-Status kommt aus dem Event-Strom
 
-`_project_memory.py` baut den Memory-Block aus drei Quellen: Operator-Seed (`.forge/memory.md`), **Recent run outcomes** (`RunStarted` + `RunFinished` + `PRMerged`, korreliert über `run_id`) und jüngsten Plan-Summaries. Die Outcomes existieren, weil der Seed zwangsläufig veraltet: `.forge/**` ist für den Agenten Forbidden Zone, forge selbst schreibt `memory.md` NIE (Operator-Datei) — ein „WP4 noch offen" im Seed bleibt also stehen, obwohl der PR längst gemerged ist. Der Addendum-Text legt fest: bei Widerspruch gewinnen die Run-Outcomes, nicht die Seed-Prosa. Wenn du hier erweiterst: Memory ist read-only-Auswertung des Event-Stroms (Mantra 3), keine neue Event-Logik.
+`_project_memory.py` baut den Memory-Block aus mehreren Quellen, alle **read-only aus dem Event-Strom** (bzw. dem Operator-Seed): Operator-Seed (`.forge/memory.md`), **Lessons learned** (`LessonLearned`-Events, s.u.), **Recent run outcomes** (`RunStarted` + `RunFinished` + `PRMerged`, korreliert über `run_id`), **Recurring failures & dead-ends** (gruppiert aus Events mit `success=false` nach `kind`+`error_class`), **Frequently touched files** (aggregiert aus `ProposalReceived.files_touched`, ab `_MIN_HOTSPOT_HITS` Proposals) und jüngsten Plan-Summaries. Die Outcomes/Failures/Hotspots existieren, weil der Seed zwangsläufig veraltet: `.forge/**` ist für den Agenten Forbidden Zone, forge selbst schreibt `memory.md` NIE (Operator-Datei) — ein „WP4 noch offen" im Seed bleibt also stehen, obwohl der PR längst gemerged ist. Der Addendum-Text legt fest: bei Widerspruch gewinnen die Run-Outcomes, nicht die Seed-Prosa. Wenn du hier erweiterst: Memory ist read-only-Auswertung des Event-Stroms (Mantra 3), keine neue Event-Logik.
+
+### Lessons learned: das einzige Gedächtnis-Schreibevent
+
+`LessonLearned` (forge-core, Schema 1.0) ist die **eine** Ausnahme zur reinen Derivation: eine kuratierte, destillierte Lektion (Konvention, Stolperfalle, Pattern), die der Master-Agent am Run-Ende im optionalen `---FORGE-LESSONS-BEGIN/END---`-Block zurückmeldet — **nicht** aus anderen Events ableitbar, deshalb ein eigenes Event. Pfad: Orchestrator-Prompt fordert den Block an → `extract_lessons_block` (templates) slict ihn → `_lesson_parser.parse_lessons` (best-effort, fail-open: kein Block = keine Lektion, forge erfindet nie welche) → Runner `_emit_lessons_learned` (eine Emission pro Lektion, `source="agent"`). Gelesen wird read-only via `collect_recent_lessons` (dedupe nach Text, neuestes gewinnt). **Wichtig (Mantra 3 + Forbidden Zone):** die Lektionen leben im replay-fähigen Event-Strom, NICHT in `.forge/memory.md`. forge schreibt den Operator-Seed weiterhin nie — so kann der Agent sein eigenes Gedächtnis nicht über die Forbidden Zone manipulieren. „Memory updatet sich automatisch" = neue `LessonLearned`-Events pro Run, die der Block beim nächsten Run reflektiert. Nebenbei repariert: `ProposalReceived.files_touched` war ein leerer Stub und wird jetzt aus dem Diff befüllt (`runner._changed_files`) — Datengrundlage der File-Heatmap.
 
 ### Was die Orchestrierung (noch) NICHT misst
 

@@ -42,6 +42,7 @@ from forge_execute.agents.templates import (
     DEFAULT_AGENTS,
     build_orchestrator_prompt,
     extract_agents_from_master_output,
+    extract_lessons_block,
     extract_plan_from_master_output,
     list_templates,
     normalize_agents,
@@ -358,11 +359,13 @@ class ClaudeCodeCLIAgent:
         # jedem orchestrierten Run zurück.
         plan_md: str | None = None
         agents_invoked: list[str] | None = None
+        lessons_block: str | None = None
         if self.multi_agent:
             result_text = str(raw.get("result") or "")
             if "architect" in self.agents:
                 plan_md = extract_plan_from_master_output(result_text)
             agents_invoked = extract_agents_from_master_output(result_text)
+            lessons_block = extract_lessons_block(result_text)
 
         return ProposalResult(
             diff=diff,
@@ -378,6 +381,7 @@ class ClaudeCodeCLIAgent:
             error=None if proc.returncode == 0 else f"exit {proc.returncode}, subtype={raw.get('subtype')}",
             plan_md=plan_md,
             agents_invoked=agents_invoked,
+            lessons_block=lessons_block,
             stream_log=str(log_path),
             session_id=session_id,
         )

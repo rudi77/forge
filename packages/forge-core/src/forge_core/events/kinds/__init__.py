@@ -17,6 +17,7 @@ from forge_core.events.kinds.generation import (
     GenerationStartedPayload,
 )
 from forge_core.events.kinds.guardrail import GuardrailViolationPayload
+from forge_core.events.kinds.lesson import LessonCategory, LessonLearnedPayload
 from forge_core.events.kinds.mutation import MutationAppliedPayload
 from forge_core.events.kinds.plan import (
     PlanProposedPayload,
@@ -57,6 +58,8 @@ __all__ = [
     "GenerationStartedPayload",
     "GuardrailViolationPayload",
     "IssueTriagedPayload",
+    "LessonCategory",
+    "LessonLearnedPayload",
     "MutationAppliedPayload",
     "PRCreatedPayload",
     "PRMergedPayload",

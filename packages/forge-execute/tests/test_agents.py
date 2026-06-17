@@ -578,6 +578,54 @@ def test_extract_agents_from_master_output_absent_returns_none() -> None:
     assert extract_agents_from_master_output(empty) is None
 
 
+def test_extract_lessons_block_roundtrip() -> None:
+    from forge_execute.agents.templates import (
+        LESSONS_BEGIN_MARKER,
+        LESSONS_END_MARKER,
+        extract_lessons_block,
+    )
+
+    text = (
+        "## Run summary\nstuff\n\n"
+        f"{LESSONS_BEGIN_MARKER}\n"
+        "- [pitfall] DuckDB locks per process\n"
+        "- tests live without __init__.py\n"
+        f"{LESSONS_END_MARKER}\ntrailing"
+    )
+    block = extract_lessons_block(text)
+    assert block is not None
+    assert "DuckDB locks per process" in block
+    assert "tests live without __init__.py" in block
+    # Marker selbst sind nicht im Block.
+    assert LESSONS_BEGIN_MARKER not in block
+
+
+def test_extract_lessons_block_absent_returns_none() -> None:
+    from forge_execute.agents.templates import (
+        LESSONS_BEGIN_MARKER,
+        LESSONS_END_MARKER,
+        extract_lessons_block,
+    )
+
+    assert extract_lessons_block("no markers here") is None
+    # Leerer Block → None (fail-open: keine Lektionen).
+    empty = f"{LESSONS_BEGIN_MARKER}\n\n{LESSONS_END_MARKER}"
+    assert extract_lessons_block(empty) is None
+
+
+def test_orchestrator_prompt_includes_lessons_markers() -> None:
+    from forge_execute.agents.templates import (
+        LESSONS_BEGIN_MARKER,
+        build_orchestrator_prompt,
+    )
+
+    # Beide Output-Zweige (mit/ohne architect) erwähnen den Lessons-Block.
+    with_arch = build_orchestrator_prompt(["architect", "developer", "tester"])
+    without_arch = build_orchestrator_prompt(["developer", "tester"])
+    assert LESSONS_BEGIN_MARKER in with_arch
+    assert LESSONS_BEGIN_MARKER in without_arch
+
+
 def test_claude_agent_roster_derives_multi_agent() -> None:
     """`agents`-Roster ist die Quelle der Wahrheit für multi_agent."""
     lone = ClaudeCodeCLIAgent(agents=["developer"])

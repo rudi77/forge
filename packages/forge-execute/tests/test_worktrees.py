@@ -388,3 +388,60 @@ def test_revert_with_explicit_to_commit(repo: Path) -> None:
         )
     finally:
         wm.cleanup(wt)
+
+
+def test_revert_preserves_venv(repo: Path) -> None:
+    """revert() löscht das Eval-erzeugte `.venv` NICHT.
+
+    Das venv ist ein regenerierbares Tooling-Artefakt; auf Windows lockt der
+    laufende Python-Prozess die geladenen nativen Libs, sodass `git clean -fdx`
+    daran scheiterte und den ganzen Run crashte. Untracked *Quellen* müssen
+    weiterhin entfernt werden.
+    """
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="rvenv")
+    try:
+        (wt.path / "src" / "new_file.py").write_text("x = 1\n", encoding="utf-8")
+        venv_lib = wt.path / ".venv" / "Lib"
+        venv_lib.mkdir(parents=True)
+        (venv_lib / "marker.txt").write_text("native lib", encoding="utf-8")
+
+        wm.revert(wt)
+
+        assert not (wt.path / "src" / "new_file.py").exists(), (
+            "untracked Quelle muss vom revert entfernt werden"
+        )
+        assert (venv_lib / "marker.txt").exists(), (
+            ".venv darf vom revert NICHT entfernt werden"
+        )
+    finally:
+        wm.cleanup(wt)
+
+
+def test_revert_tolerates_locked_files(repo: Path, monkeypatch) -> None:
+    """Un-löschbare (gesperrte) Dateien beim clean crashen den Run nicht.
+
+    `git reset --hard` hat den Quellstand bereits hergestellt; reine
+    "failed to remove"-Warnungen von `git clean` werden toleriert.
+    """
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="rlock")
+    try:
+        real_run = WorktreeManager._run
+
+        def fake_run(cmd, *, cwd, stdin=None, check=False):
+            if cmd[:2] == ["git", "clean"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    stdout="",
+                    stderr="warning: failed to remove .venv/x.pyd: Invalid argument",
+                )
+            return real_run(cmd, cwd=cwd, stdin=stdin, check=check)
+
+        monkeypatch.setattr(WorktreeManager, "_run", staticmethod(fake_run))
+        # Darf NICHT raisen.
+        wm.revert(wt)
+    finally:
+        monkeypatch.undo()
+        wm.cleanup(wt)

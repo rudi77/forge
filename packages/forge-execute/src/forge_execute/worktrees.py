@@ -17,11 +17,14 @@ API laut todos.txt Schritt 3a:
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class GitError(RuntimeError):
@@ -373,9 +376,32 @@ class WorktreeManager:
         )
         if reset.returncode != 0:
             raise GitError(f"git reset --hard failed: {reset.stderr.strip()}")
-        clean = self._run(["git", "clean", "-fdx"], cwd=worktree.path)
+        # `-e .venv`: das vom Eval erzeugte venv ist ein regenerierbares
+        # Tooling-Artefakt, keine Agent-Quelländerung — und auf Windows lockt
+        # der laufende Python-Prozess die geladenen nativen Libs (.pyd/.dll),
+        # sodass `git clean` sie nicht entfernen kann und non-zero zurückgibt.
+        # Es vom Clean auszuschließen vermeidet den Crash UND spart der nächsten
+        # Generation den venv-Re-Sync.
+        clean = self._run(["git", "clean", "-fdx", "-e", ".venv"], cwd=worktree.path)
         if clean.returncode != 0:
-            raise GitError(f"git clean failed: {clean.stderr.strip()}")
+            # Defense-in-depth: bleiben trotzdem un-löschbare Dateien übrig (von
+            # einem anderen Prozess gesperrt), darf das den Run NICHT crashen —
+            # der wertvolle Teil (Quellstand via `git reset --hard`) ist bereits
+            # erledigt. Reine "failed to remove"-Warnungen tolerieren, echte
+            # Fehler weiter hochreichen.
+            stderr = clean.stderr.strip()
+            residual = [ln for ln in stderr.splitlines() if ln.strip()]
+            only_lock_warnings = bool(residual) and all(
+                "failed to remove" in ln.lower() for ln in residual
+            )
+            if not only_lock_warnings:
+                raise GitError(f"git clean failed: {stderr}")
+            logger.warning(
+                "git clean konnte gesperrte Dateien im Worktree %s nicht "
+                "entfernen (Quellstand via reset --hard wiederhergestellt): %s",
+                worktree.path,
+                stderr,
+            )
 
     def commit(
         self,

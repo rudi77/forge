@@ -115,6 +115,41 @@ cd forge
 uv sync --all-packages --extra dev
 ```
 
+### forge global installieren (in jedem Repo aufrufbar)
+
+Damit `forge` als Befehl in **jedem** Repository verfügbar ist — nicht nur via
+`uv run` im forge-Workspace — gibt es einen Installer. Er baut die vier
+Workspace-Wheels und installiert sie via `uv tool install` auf die PATH.
+
+```powershell
+# Windows (PowerShell)
+pwsh scripts/install.ps1
+```
+
+```bash
+# Linux / macOS
+scripts/install.sh
+```
+
+Danach (ggf. neue Shell öffnen) aus einem beliebigen Repo:
+
+```bash
+cd /pfad/zu/irgendeinem/repo
+forge --help
+forge doctor --spec .forge/project.yaml
+```
+
+Erneutes Ausführen des Installers aktualisiert die Installation (idempotent).
+Deinstallieren: `pwsh scripts/install.ps1 -Uninstall` bzw.
+`scripts/install.sh --uninstall` (intern `uv tool uninstall forge-cli`).
+
+> **Hinweis zur PyPI-Namenskollision:** Die Distributionsnamen `forge-cli`,
+> `forge-core` und `forge-adapters` sind auf PyPI von fremden Paketen belegt.
+> Der Installer installiert die lokalen Wheels deshalb **per Dateipfad** (in uv
+> gepinnte Referenzen, die jede Index-Version überschreiben) — ein Install per
+> Name würde die falschen Pakete ziehen. Voraussetzung bleibt `uv` + Python auf
+> der Maschine; die Laufzeit ist uv-verwaltet, kein separates venv-Setup nötig.
+
 ### Smoke-Test
 
 ```bash
@@ -172,6 +207,7 @@ forge/
 │   ├── forge-adapters/      # GitHub (PR + Webhooks + Action-Templates)
 │   └── forge-cli/           # forge run / analyze / doctor / replay
 ├── packaging/               # PyInstaller-Entry + reproduzierbarer Binary-Build
+├── scripts/                 # install.ps1 / install.sh — forge global auf die PATH
 ├── .github/workflows/       # CI: Test + Lint + forge.exe-Build
 ├── examples/
 │   └── pinta/               # Reference-Spec

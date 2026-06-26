@@ -28,8 +28,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/forge_execute"]
-
-# Subagent-Markdowns als Package-Daten ausliefern, damit
-# importlib.resources sie findet auch nach pip install.
-[tool.hatch.build.targets.wheel.force-include]
-"src/forge_execute/agents/templates" = "forge_execute/agents/templates"
+# Subagent-Markdowns als Package-Daten ausliefern, damit importlib.resources
+# sie auch nach `pip install`/`uv tool install` findet. `artifacts` zieht die
+# `.md` ins Wheel, ohne (wie ein `force-include` des ganzen Verzeichnisses) mit
+# dem normalen Package-Globbing von `templates/__init__.py` zu kollidieren —
+# das templates/-Verzeichnis ist seit dem `__init__.py` ein echtes Package.
+artifacts = ["src/forge_execute/agents/templates/*.md"]

@@ -14,9 +14,8 @@ also echten Code liefern, nicht den Test verbiegen.
 from __future__ import annotations
 
 import yaml
-from typer.testing import CliRunner
-
 from forge_cli.main import app
+from typer.testing import CliRunner
 
 runner = CliRunner()
 
@@ -55,7 +54,7 @@ def test_forge_init_does_not_clobber_existing_config(tmp_path, monkeypatch):
     sentinel = "# operator edit — darf nicht verloren gehen\n"
     cfg.write_text(cfg.read_text(encoding="utf-8") + sentinel, encoding="utf-8")
 
-    second = runner.invoke(app, ["init"])
+    runner.invoke(app, ["init"])
     # Kein Clobber: entweder sauberer Abbruch (!=0) oder no-op, aber die
     # Operator-Änderung muss erhalten bleiben.
     assert sentinel in cfg.read_text(encoding="utf-8"), (

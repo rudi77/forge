@@ -10,8 +10,20 @@ from pathlib import Path
 
 # Subagent-Rollen, die forge als Arbeitspferde kennt. Reihenfolge ist die
 # kanonische Pipeline-Ordnung (architect plant, developer baut, tester prüft,
-# reviewer liest am Ende kritisch gegen).
-KNOWN_AGENTS: tuple[str, ...] = ("architect", "developer", "tester", "reviewer")
+# simplify räumt auf, reviewer liest am Ende kritisch gegen).
+#
+# `simplify` ist ein Sonderfall: KEIN Task-Subagent (kein `.md`-Template), sondern
+# die built-in `/simplify`-Skill der Claude Code CLI, die der Master direkt über das
+# `Skill`-Tool aufruft. Steht trotzdem in KNOWN_AGENTS, damit der Operator sie wie
+# jede andere Rolle ins Roster (`--agents`, `agents:[...]`) nimmt und der Master sie
+# als „mitgewirkt" zurückmelden kann (`extract_agents_from_master_output`).
+KNOWN_AGENTS: tuple[str, ...] = (
+    "architect",
+    "developer",
+    "tester",
+    "simplify",
+    "reviewer",
+)
 
 # Default-Roster, wenn der Operator nichts anderes konfiguriert. Der reviewer
 # ist bewusst NICHT im Default — er ist opt-in pro Roster (kostet einen
@@ -94,6 +106,7 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
     roster = normalize_agents(agents)
     has_architect = "architect" in roster
     has_tester = "tester" in roster
+    has_simplify = "simplify" in roster
     has_reviewer = "reviewer" in roster
 
     # --- Rollenbeschreibungen (nur aktivierte) ----------------------
@@ -115,6 +128,14 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "verify a subtask's acceptance criteria. Invoke before AND after "
             "a developer run when the task requires new tests."
         )
+    if has_simplify:
+        descriptions.append(
+            "- **/simplify** (built-in skill, invoked via the **Skill** tool — "
+            "NOT a Task subagent): a finishing cleanup pass over the cumulative "
+            "diff (reuse of existing helpers, simplification, efficiency, right "
+            "level of abstraction). It applies the cleanups itself. See the "
+            "workflow for when to run it."
+        )
     if has_reviewer:
         descriptions.append(
             "- **reviewer** (read-only): critically reviews the cumulative "
@@ -122,6 +143,7 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "quality. Reports BLOCKING and non-blocking findings. Invoke LAST, "
             "once the implementation is complete"
             + (" and the tester reports green" if has_tester else "")
+            + (" and /simplify has run" if has_simplify else "")
             + "."
         )
 
@@ -178,6 +200,22 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
         steps.append(
             f"{n}. After all subtasks, call the **tester** one more time to "
             "run the full verification suite."
+        )
+        n += 1
+
+    if has_simplify:
+        steps.append(
+            f"{n}. Invoke the built-in **/simplify** skill via the Skill tool "
+            "on the cumulative diff to apply reuse / simplification / "
+            "efficiency / right-altitude cleanups. The skill edits the worktree "
+            "itself — do not hand-edit."
+            + (
+                " Then call the **tester** again to confirm the suite is still "
+                "green; if a cleanup broke a test, hand the failure to the "
+                "**developer** to fix (two rounds max), then re-verify."
+                if has_tester
+                else ""
+            )
         )
         n += 1
 
@@ -266,7 +304,15 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
     ]
 
     # --- Verbote (konditional) --------------------------------------
-    nevers = ["- Edit files yourself. Delegate to the developer subagent."]
+    nevers = [
+        "- Edit files yourself. Delegate to the developer subagent."
+        + (
+            " (Invoking the **/simplify** skill is the one sanctioned exception "
+            "— that is a tool call that edits, not manual hand-editing.)"
+            if has_simplify
+            else ""
+        )
+    ]
     if has_architect:
         nevers.append(
             "- Skip the architect step, even for tasks that look simple. The "
@@ -298,7 +344,10 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "forge needs them to persist the plan as a first-class artefact."
         )
 
-    roster_str = ", ".join(roster)
+    # `simplify` ist kein Task-Subagent — aus der Team-Zeile raushalten, damit
+    # „Use them via the Task tool" stimmt. Der Skill-Schritt steht separat in den
+    # descriptions + im Workflow.
+    roster_str = ", ".join(r for r in roster if r != "simplify")
     return (
         "You are the lead engineer in a forge software factory. Your active "
         f"subagent team for this task is: {roster_str}. Use them via the Task "

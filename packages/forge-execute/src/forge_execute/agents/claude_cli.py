@@ -196,7 +196,9 @@ class ClaudeCodeCLIAgent:
         # .claude/agents/ entdeckt.
         if self.multi_agent:
             _install_subagents(worktree, agents=self.agents)
-            allowed_tools = _augment_tools_for_multi_agent(allowed_tools)
+            allowed_tools = _augment_tools_for_multi_agent(
+                allowed_tools, self.agents
+            )
 
         # stream-json statt json: claude emittiert pro Event eine JSON-Zeile
         # (system/init, assistant inkl. tool_use-Blöcke, user/tool_results,
@@ -585,17 +587,27 @@ def _frontmatter_has_model(path: Path) -> bool:
     return bool(re.search(r"^model\s*:", text[3:end], re.MULTILINE))
 
 
-def _augment_tools_for_multi_agent(allowed_tools: str | None) -> str:
-    """Sicherstellen, dass `Task` in der Allowlist ist — der Master-Claude
-    spawnt Subagents über das Task-Tool.
+def _augment_tools_for_multi_agent(
+    allowed_tools: str | None, agents: list[str] | None = None
+) -> str:
+    """Allowlist um die Tools ergänzen, die die Orchestrierung braucht.
 
-    Wenn `allowed_tools` leer ist, fügen wir Task als einzigen Eintrag.
+    - `Task` immer — der Master-Claude spawnt Subagents über das Task-Tool.
+    - `Skill(simplify)` nur, wenn `simplify` im Roster steht — der Master ruft
+      dann die built-in `/simplify`-Skill auf. Bewusst gescopt (nur diese eine
+      Skill), nicht das offene `Skill`: die Allowlist bleibt die enge
+      Verteidigungslinie.
+
+    Wenn `allowed_tools` leer ist, bauen wir die Liste von Grund auf.
     """
-    if not allowed_tools:
-        return "Task"
-    if "Task" in allowed_tools:
-        return allowed_tools
-    return f"{allowed_tools},Task"
+    parts = [p for p in (allowed_tools.split(",") if allowed_tools else []) if p]
+    additions = ["Task"]
+    if agents and "simplify" in agents:
+        additions.append("Skill(simplify)")
+    for tool in additions:
+        if tool not in parts:
+            parts.append(tool)
+    return ",".join(parts)
 
 
 def _new_stream_log_path(worktree: Path, *, label: str) -> Path:

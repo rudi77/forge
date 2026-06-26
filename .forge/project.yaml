@@ -1,0 +1,107 @@
+# forge — project.yaml für das forge-Repo selbst (Dogfooding).
+#
+# Diese Spec lässt forge an der eigenen CLI arbeiten. Sie ist BEWUSST eng:
+# der Agent darf nur in forge-cli (src + tests) editieren — die anderen
+# Packages (core/execute/adapters), die Specs, CI und Docs sind tabu.
+#
+# Mantra 1 (nur Messbares): die Akzeptanz eines Features ist ein pytest-Gate.
+# Greenfield-Features werden via rot→grün gehalten: ein vorab geschriebener,
+# fehlschlagender Akzeptanztest (Forbidden, damit der Agent ihn nicht
+# abschwächt) wird vom Agenten grün gemacht (gate_revival).
+
+spec_version: "1.0"
+name: forge
+language_stack: [python]
+frameworks: [typer, pydantic, duckdb]
+
+# === SURFACES — was darf wie geändert werden ===
+surfaces:
+  cli:
+    paths:
+      - "packages/forge-cli/src/forge_cli/"
+    type: code
+    guardrails:
+      - "uv run ruff check packages/forge-cli/src/forge_cli/"
+  cli_tests:
+    paths:
+      - "packages/forge-cli/tests/"
+    type: code
+    guardrails:
+      - "uv run ruff check packages/forge-cli/tests/"
+
+# === FORBIDDEN — Pfade, die forge NIE editiert ===
+# Feiner als Surfaces; gewinnt bei Overlap. test_init.py liegt IN einer Surface,
+# ist hier aber gesperrt: das Gate führt ihn aus, der Agent darf ihn nicht ändern.
+forbidden:
+  - "packages/forge-cli/tests/test_init.py"
+  # Andere Packages — außerhalb des Auftrags
+  - "packages/forge-core/**"
+  - "packages/forge-execute/**"
+  - "packages/forge-adapters/**"
+  # forge-eigene Konfig / CI (Spec Teil 7.4)
+  - ".forge/**"
+  - ".github/**"
+  - ".codegraph/**"
+  - "scripts/**"
+  # Doku / Konventionen — Mensch entscheidet
+  - "CLAUDE.md"
+  - "CLAUDE_BEHAVIORAL.md"
+  - "README.md"
+  - "docs/**"
+
+# === CAPABILITIES ===
+capabilities:
+  read: ["**/*"]
+  edit: ["{surfaces}"]
+  run:
+    - "uv run pytest*"
+    - "uv run ruff*"
+    - "pytest*"
+    - "ruff*"
+    - "python*"
+  commit: true
+  open_pr: true
+  merge_pr: false           # hardcoded v1
+  push_to_main: false       # hardcoded v1
+  push_force: false
+  network_egress:
+    - "api.anthropic.com"
+    - "api.github.com"
+
+# === EVAL-SUITEN ===
+# Nur forge-cli; läuft in der per-Run-uv-venv des Worktrees.
+eval_suites:
+  quick:
+    cmd: |
+      uv run pytest packages/forge-cli --no-header -q --tb=short
+    budget_s: 900
+    parses: pytest_json
+
+# === GATES — harte Pass/Fail ===
+gates:
+  - {kind: pytest_pass_rate, threshold: 1.0, source: quick}
+
+# === SCORES — leer (KEEP nur via rot→grün, s.o.) ===
+scores: []
+diagnostics: []
+
+# === COST-CAPS — Pflicht ab Tag eins ===
+cost_caps:
+  per_generation_usd: 2.00
+  per_run_usd: 5.00
+  per_project_per_day_usd: 10.00
+  per_project_per_month_usd: 50.00
+
+# === TRIGGERS ===
+triggers:
+  on_issue_label:
+    auto-feature:
+      strategy: sequential
+      model: sonnet
+      max_iterations: 5
+      agents: [architect, developer, tester]
+
+# === RELEASE ===
+release:
+  conventional_commits: true
+  on_main_green: "off"

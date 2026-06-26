@@ -214,6 +214,22 @@ def test_trigger_explicit_agents_override_default() -> None:
     ]
 
 
+def test_trigger_accepts_simplify_in_roster() -> None:
+    # `simplify` ist ein gültiger Roster-Eintrag (opt-in /simplify-Skill-Schritt).
+    d = _minimal_spec_dict()
+    d["triggers"] = {
+        "on_issue_label": {
+            "auto-feature": {
+                "strategy": "sequential",
+                "model": "opus",
+                "agents": ["architect", "developer", "tester", "simplify", "reviewer"],
+            },
+        },
+    }
+    spec = ProjectSpec.model_validate(d)
+    assert "simplify" in spec.triggers.on_issue_label["auto-feature"].agents
+
+
 def test_invalid_agent_name_rejected() -> None:
     d = _minimal_spec_dict()
     d["triggers"] = {

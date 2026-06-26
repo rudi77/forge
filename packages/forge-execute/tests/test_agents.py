@@ -423,6 +423,23 @@ def test_augment_tools_adds_task_when_missing() -> None:
     assert _augment_tools_for_multi_agent("Read,Task,Edit") == "Read,Task,Edit"
 
 
+def test_augment_tools_adds_skill_only_when_simplify_in_roster() -> None:
+    from forge_execute.agents.claude_cli import _augment_tools_for_multi_agent
+
+    # simplify im Roster → die built-in /simplify-Skill wird gescopt freigegeben.
+    assert (
+        _augment_tools_for_multi_agent("Read,Edit", ["developer", "simplify"])
+        == "Read,Edit,Task,Skill(simplify)"
+    )
+    # Ohne simplify → kein Skill-Eintrag (Allowlist bleibt eng).
+    out = _augment_tools_for_multi_agent("Read,Edit", ["developer", "tester"])
+    assert "Skill" not in out
+    # Nur diese eine Skill, nie das offene `Skill`.
+    assert "Skill(simplify)" in _augment_tools_for_multi_agent(
+        None, ["developer", "simplify"]
+    )
+
+
 # --- Roster resolution & orchestrator prompt ------------------------------
 
 
@@ -522,11 +539,42 @@ def test_build_orchestrator_prompt_without_reviewer_omits_review() -> None:
     assert "BLOCKING" not in prompt
 
 
+def test_build_orchestrator_prompt_with_simplify_weaves_skill_step() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(
+        ["architect", "developer", "tester", "simplify", "reviewer"]
+    )
+    # Der /simplify-Step nennt die Skill explizit und steht VOR dem Reviewer.
+    assert "/simplify" in prompt
+    assert "Skill tool" in prompt
+    # BLOCKING kommt nur im Reviewer-Step vor → /simplify steht davor.
+    assert prompt.index("/simplify") < prompt.index("BLOCKING")
+    # simplify steht NICHT in der Task-Subagent-Team-Zeile (kein Task-Subagent).
+    team_line = prompt.split("\n", 1)[0]
+    assert "simplify" not in team_line
+
+
+def test_build_orchestrator_prompt_without_simplify_omits_skill() -> None:
+    from forge_execute.agents.templates import build_orchestrator_prompt
+
+    prompt = build_orchestrator_prompt(["architect", "developer", "tester"])
+    assert "/simplify" not in prompt
+    assert "Skill tool" not in prompt
+
+
 def test_unknown_agents_flags_dropped_roles() -> None:
-    from forge_execute.agents.templates import unknown_agents
+    from forge_execute.agents.templates import normalize_agents, unknown_agents
 
     assert unknown_agents(None) == []
     assert unknown_agents(["architect", "developer", "tester", "reviewer"]) == []
+    # simplify ist eine bekannte Rolle (Pseudo-Eintrag für die /simplify-Skill).
+    assert unknown_agents(["simplify"]) == []
+    assert normalize_agents(["reviewer", "simplify", "developer"]) == [
+        "developer",
+        "simplify",
+        "reviewer",
+    ]
     # Tippfehler und spec-reservierte-aber-nicht-implementierte Rollen werden
     # sichtbar (Input-Reihenfolge), bekannte fallen raus.
     assert unknown_agents(["architect", "operations", "typo"]) == [

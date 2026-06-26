@@ -236,10 +236,14 @@ class TriggerStrategy(StrEnum):
 
 # Subagent-Namen, die Spec v0.3 Teil 6.5 als Pflicht/Optional definiert.
 # Implementiert (Template + Orchestrierung): architect, developer, tester,
-# reviewer. `operations` ist reserviert (v1.5, Telemetrie→Issue-Vorschläge),
+# reviewer. `simplify` ist kein Task-Subagent, sondern die built-in
+# `/simplify`-Skill, die der Master als opt-in Cleanup-Schritt aufruft (kein
+# Template). `operations` ist reserviert (v1.5, Telemetrie→Issue-Vorschläge),
 # hat noch kein Template — ein Roster mit `operations` wird von
 # `normalize_agents` still verworfen, die CLI warnt via `unknown_agents`.
-SubagentName = Literal["architect", "developer", "tester", "reviewer", "operations"]
+SubagentName = Literal[
+    "architect", "developer", "tester", "simplify", "reviewer", "operations"
+]
 
 
 class IssueLabelTriggerConfig(BaseModel):

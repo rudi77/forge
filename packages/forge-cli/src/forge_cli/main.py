@@ -5,6 +5,7 @@ Subcommands:
 - `forge run`     — startet einen Sequential-Run gegen die aktuelle Spec
 - `forge analyze` — Markdown-Reports aus dem Event-Store
 - `forge doctor`  — Spec-Konsistenz, Tool-Verfügbarkeit, API-Keys
+- `forge init`    — legt .forge/project.yaml mit sicheren Defaults an
 - `forge replay`  — rekonstruiert einen Run als Markdown-Timeline
 - `forge watch`   — Live-Tracking eines laufenden Runs (Worktree + Events)
 """
@@ -16,6 +17,7 @@ import typer
 from forge_cli import analyze as analyze_mod
 from forge_cli import board_loop as board_loop_mod
 from forge_cli import doctor as doctor_mod
+from forge_cli import init as init_mod
 from forge_cli import plan as plan_mod
 from forge_cli import replay as replay_mod
 from forge_cli import review_pr as review_pr_mod
@@ -74,6 +76,11 @@ app.command(
         "(approve + grüner CI + capabilities.merge_pr)."
     ),
 )(review_pr_mod.review_pr_command)
+
+app.command(
+    name="init",
+    help="Legt .forge/project.yaml mit sicheren Defaults an.",
+)(init_mod.init_command)
 
 
 def main() -> None:

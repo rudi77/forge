@@ -220,11 +220,15 @@ __marimo__/
 # forge runtime artefacts
 .forge/blobs/
 .forge/worktrees/
+.forge/logs/
 .forge/events.duckdb
 .forge/events.duckdb.wal
 .forge/runs/
 *.duckdb
 *.duckdb.wal
+
+# CodeGraph local index (per-developer, regeneratable)
+.codegraph/
 
 # Claude Code local state (per-developer)
 .claude/scheduled_tasks.lock

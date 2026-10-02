@@ -118,9 +118,10 @@ def render_body(
     fp: str,
     source: str,
     origin_issue: int | None = None,
+    extra_lines: tuple[str, ...] = (),
 ) -> str:
     lines = [item.body.strip()] if item.body.strip() else []
-    meta: list[str] = []
+    meta: list[str] = list(extra_lines)
     if origin_issue is not None:
         meta.append(f"Found while working on #{origin_issue}.")
     if depends_on:
@@ -207,6 +208,7 @@ def create_items(
     origin_issue: int | None = None,
     scope: str = "",
     provider: str | None = None,
+    extra_lines: tuple[str, ...] = (),
 ) -> IntakeResult:
     """Legt ``items`` beim Tracker an — mit allen Leitplanken (A3).
 
@@ -239,7 +241,7 @@ def create_items(
         deps = [numbers[d] for d in item.depends_on if d in numbers]
         stage = start_stage(item.kind, source=source, cfg=cfg, parent_approved=parent_approved)
         body = render_body(item, depends_on=deps, fp=fp, source=source,
-                           origin_issue=origin_issue)
+                           origin_issue=origin_issue, extra_lines=extra_lines)
         try:
             created = tracker.create_item(
                 NewWorkItem(

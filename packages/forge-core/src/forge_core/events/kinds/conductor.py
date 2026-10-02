@@ -46,8 +46,15 @@ class ConductorTickCompletedPayload(BaseModel):
     """Wie viele vom Usage-/Session-Limit unterbrochene Runs in diesem Tick
     fällig waren und per ``forge run --resume`` wieder angestoßen wurden."""
 
+    parallel_running: int = Field(default=0, ge=0)
+    """1.2: wie viele Runs dieser Tick nebenläufig dispatchte (Auslastung, G)."""
+
+    capacity: int | None = None
+    """1.2: wirksame Kapazität dieses Ticks (Budget/Ressourcen-begrenzt)."""
+
 
 # 1.1 (additiv): scheduled_resume_count ergänzt — alte 1.0-Events lesen weiter.
+# 1.2 (additiv): parallel_running + capacity (Arbeitsgraph G).
 register_payload(
-    EventKind.CONDUCTOR_TICK_COMPLETED, ConductorTickCompletedPayload, "1.1"
+    EventKind.CONDUCTOR_TICK_COMPLETED, ConductorTickCompletedPayload, "1.2"
 )

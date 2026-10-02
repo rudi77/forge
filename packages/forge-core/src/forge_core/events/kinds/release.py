@@ -26,5 +26,19 @@ class ReleaseTaggedPayload(BaseModel):
     """Optionaler CAS-Ref auf den Changelog-Text (v1: meist ``None`` —
     ``gh release create --generate-notes`` erzeugt die Notes server-seitig)."""
 
+    version: str | None = None
+    """1.1: SemVer des Releases (Release-Train, L3), z.B. ``1.4.0``."""
 
-register_payload(EventKind.RELEASE_TAGGED, ReleaseTaggedPayload, "1.0")
+    issue_numbers: list[int] = Field(default_factory=list)
+    """1.1: alle Work-Items, die dieses Release ausliefert (Train). Ein Item
+    gilt als released, wenn es ``issue_number`` ist ODER hier steht."""
+
+    integrated_into: str | None = None
+    """1.1: das Item wurde nicht selbst released, sondern in einen
+    Integrations-Branch (``forge/epic-<N>``) gemergt (G). Es ist damit fertig;
+    ausgeliefert wird es mit dem Epic."""
+
+
+# 1.1 (additiv): version, issue_numbers, integrated_into (Release-Train L3,
+# Integrations-Branch G). Alte 1.0-Events lesen weiter.
+register_payload(EventKind.RELEASE_TAGGED, ReleaseTaggedPayload, "1.1")

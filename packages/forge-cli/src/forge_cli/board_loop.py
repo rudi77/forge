@@ -65,7 +65,12 @@ from forge_cli.conductor import (
     run_conductor_tick,
     spec_pr_for_issue,
 )
-from forge_cli.dependencies import parse_depends_on
+from forge_cli.dependencies import (
+    parse_depends_on,
+    parse_integration_branch,
+    parse_integration_mode,
+    parse_touches,
+)
 from forge_cli.heartbeat import HeartbeatStats, TickResult, run_heartbeat
 from forge_cli.review_pr import execute_pr_review
 from forge_cli.run import _DEFAULT_RESUME_PROMPT, RunOutcome, execute_run
@@ -83,6 +88,14 @@ from forge_cli.workgen import (
     refined_spec_text,
     tick_sources,
     with_refined_spec,
+)
+from forge_cli.workgraph import (
+    ensure_integration_branch,
+    epic_run_id,
+    integration_branch_name,
+    open_integration_pr,
+    sync_branch,
+    tick_capacity,
 )
 
 
@@ -507,6 +520,17 @@ def _dispatch_issues(
             f"\n[bold cyan]>>> board-loop[/bold cyan] dispatching issue "
             f"#{issue.number} [italic]{issue.title}[/italic]"
         )
+        # G: Kind eines Integrations-Epics → Basis + PR-Ziel ist forge/epic-<N>.
+        base_ref, pr_base = params.base_ref, params.pr_base
+        integration = parse_integration_branch(issue.body)
+        if integration:
+            try:
+                base_ref = WorktreeManager(ctx.repo_root).fetch_remote_branch(integration)
+                pr_base = integration
+            except GitError as exc:
+                err_console.print(
+                    f"[yellow]integration branch {integration} unavailable[/yellow]: {exc}"
+                )
         try:
             outcome = execute_run(
                 ctx=ctx,
@@ -514,7 +538,7 @@ def _dispatch_issues(
                 prompt_template_id=params.template_id,
                 trigger="issue_label",
                 focus=focus,
-                base_ref=params.base_ref,
+                base_ref=base_ref,
                 acceptance_criteria=acceptance,
                 max_iterations=params.max_iterations,
                 max_turns=params.max_turns,
@@ -527,7 +551,7 @@ def _dispatch_issues(
                 multi_agent=params.multi_agent,
                 agents=roster,
                 create_pr=True,
-                pr_base=params.pr_base,
+                pr_base=pr_base,
                 extra_labels=[*(params.pr_label or []), f"issue-{issue.number}"],
                 pr_draft=False,
                 auto_merge=params.auto_merge,
@@ -593,6 +617,28 @@ def _dispatch_release_run(
     analog zur ``merge_pr``-Ergonomie). push-to-main/force bleiben unberührt
     (ein Release schreibt nur einen neuen Ref).
     """
+    integration = parse_integration_branch(issue.body)
+    if integration:
+        # G: in den Integrations-Branch gemergt → fertig; ausgeliefert wird mit
+        # dem Epic (kein eigener Tag, keine Capability nötig).
+        store.append(
+            build_event(
+                kind=EventKind.RELEASE_TAGGED,
+                run_id=session_id,
+                project=ctx.spec.name,
+                project_fingerprint=ctx.project_fingerprint,
+                factory_version=ctx.factory_version,
+                spec_version=ctx.spec.spec_version,
+                payload=ReleaseTaggedPayload(
+                    issue_number=issue.number, tag=integration, integrated_into=integration
+                ),
+            )
+        )
+        console.print(f"  [green]integrated[/green] #{issue.number} → {integration}")
+        return _PassResult(
+            summaries=[_LoopSummaryRow(issue.number, issue.title, "integrated", None, "-")],
+            bailed=False, dispatched=1, skipped=0,
+        )
     if not ctx.spec.capabilities.create_release:
         console.print(
             f"[dim]release #{issue.number}: capabilities.create_release=false "
@@ -877,6 +923,14 @@ _REWORK_PREAMBLE = (
     "before finishing.\n\n"
 )
 
+_CONFLICT_PREAMBLE = (
+    "This is a MERGE-CONFLICT task on an EXISTING pull request (PR #{pr}). The "
+    "base branch moved after a sibling pull request was merged; forge merged it "
+    "into this branch and committed the conflict markers. Resolve every conflict "
+    "in the files listed below so that BOTH sides' intent is preserved, remove all "
+    "markers, and make the tests pass. Do not drop the sibling's changes.\n\n"
+)
+
 _CI_FIX_PREAMBLE = (
     "This is a CI-FIX task on an EXISTING pull request (PR #{pr}). The working "
     "tree already contains the PR's changes, but CI is red. Find the root cause "
@@ -918,8 +972,14 @@ def _dispatch_branch_run(
     kind: str,
     context: str,
     store: EventStore | None = None,
+    base_ref_override: str | None = None,
 ) -> _PassResult:
-    """Run auf einem BESTEHENDEN PR-Branch (Nacharbeit L1 / CI-Fix L2).
+    """Run auf einem BESTEHENDEN PR-Branch (Nacharbeit L1 / CI-Fix L2 /
+    Merge-Konflikt G).
+
+    ``base_ref_override``: Startpunkt statt des PR-Heads (G: der lokale
+    Konflikt-Commit aus ``sync_branch``, ein Nachfahre des Heads → der Push
+    bleibt fast-forward).
 
     Der Runner bleibt unverändert: er bekommt als ``base_ref`` den frisch
     geholten PR-Head (``refs/remotes/origin/<head>``) und arbeitet wie immer auf
@@ -929,7 +989,7 @@ def _dispatch_branch_run(
     (``git_push_argv``). Kein neuer PR: der bestehende wird aktualisiert, sein
     neuer Head-Commit macht das alte Review veraltet → ``in-dev → qa``.
     """
-    label = "rework" if kind == "rework" else "ci-fix"
+    label = {"rework": "rework", "ci_fix": "ci-fix", "conflict": "conflict"}[kind]
     row = lambda decision, err=None, url=None: _LoopSummaryRow(  # noqa: E731
         issue_number=issue.number,
         issue_title=issue.title,
@@ -951,13 +1011,17 @@ def _dispatch_branch_run(
         return _PassResult(summaries=[row("skipped", msg)], bailed=False,
                            dispatched=0, skipped=1)
     try:
-        base_ref = WorktreeManager(ctx.repo_root).fetch_remote_branch(head)
+        base_ref = base_ref_override or WorktreeManager(ctx.repo_root).fetch_remote_branch(
+            head
+        )
     except GitError as exc:
         return _PassResult(summaries=[row("error", str(exc))], bailed=False,
                            dispatched=0, skipped=0)
 
-    preamble = _REWORK_PREAMBLE if kind == "rework" else _CI_FIX_PREAMBLE
-    context_label = "review findings" if kind == "rework" else "ci failure"
+    preamble = {"rework": _REWORK_PREAMBLE, "ci_fix": _CI_FIX_PREAMBLE,
+                "conflict": _CONFLICT_PREAMBLE}[kind]
+    context_label = {"rework": "review findings", "ci_fix": "ci failure",
+                     "conflict": "merge conflict"}[kind]
     prompt = preamble.format(pr=pr_number) + wrap_issue_body(
         title=issue.title, body=issue.body
     )
@@ -970,9 +1034,9 @@ def _dispatch_branch_run(
     if context.strip():
         acceptance += f"\n\n{context_label.title()}:\n{context}"
     roster = (
-        _roster_for_issue(ctx.spec, issue.labels)
-        if kind == "rework"
-        else _ci_fix_roster(ctx.spec)
+        _ci_fix_roster(ctx.spec)
+        if kind == "ci_fix"
+        else _roster_for_issue(ctx.spec, issue.labels)
     )
     console.print(
         f"\n[bold yellow]>>> board-loop[/bold yellow] {label} run for issue "
@@ -983,7 +1047,7 @@ def _dispatch_branch_run(
             ctx=ctx,
             rendered_prompt=prompt,
             prompt_template_id=label,
-            trigger="rework" if kind == "rework" else "ci_failure",
+            trigger="ci_failure" if kind == "ci_fix" else "rework",
             focus=f"{label}:#{issue.number}",
             base_ref=base_ref,
             acceptance_criteria=acceptance,
@@ -1030,7 +1094,7 @@ def _dispatch_branch_run(
 
 
 def _pr_observation(ctx: ForgeContext, pr_number: int):
-    """(Head-Commit-Zeitstempel, CI-Status, PR-State) vom Code-Host.
+    """(Head-Commit-Zeitstempel, CI-Status, PR-State, Mergeable) vom Code-Host.
 
     Fail-open: jeder Code-Host-Fehler → ``None`` (Signal unbekannt → altes
     Verhalten), damit ein Schluckauf den Tick nicht wedged."""
@@ -1038,10 +1102,10 @@ def _pr_observation(ctx: ForgeContext, pr_number: int):
     head = host.head_committed_at(pr_number)
     try:
         meta = host.fetch_metadata(pr_number)
-        ci, state = meta.ci_status, meta.state
+        ci, state, mergeable = meta.ci_status, meta.state, meta.mergeable
     except CodeHostError:
-        ci, state = None, None
-    return head, ci, state
+        ci, state, mergeable = None, None, None
+    return head, ci, state, mergeable
 
 
 def _record_observed_merge(
@@ -1076,6 +1140,34 @@ def _record_observed_merge(
     )
     store.append(evt)
     return evt
+
+
+def _dispatch_sync(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    pr_number: int,
+    params: _DispatchParams,
+    store: EventStore | None = None,
+) -> _PassResult:
+    """G: konfliktbehafteten PR nach einem Geschwister-Merge nachziehen.
+
+    Erst deterministisch (``git merge`` der Basis, sauber → Fast-Forward-Push,
+    kein LLM). Nur bei echten Konflikten ein Agent-Run (``conflict``) ab dem
+    lokalen Konflikt-Commit."""
+    res = sync_branch(ctx, pr_number)
+    row = _LoopSummaryRow(issue.number, issue.title, f"sync:{res.status}", f"#{pr_number}",
+                          "-", res.detail or None)
+    if res.status == "synced":
+        console.print(f"  [green]synced[/green] PR #{pr_number} with its base")
+        return _PassResult(summaries=[row], bailed=False, dispatched=0, skipped=0)
+    if res.status != "conflict" or res.conflict_ref is None:
+        return _PassResult(summaries=[row], bailed=False, dispatched=0, skipped=1)
+    context = "Conflicting files:\n" + "\n".join(f"- {f}" for f in res.files)
+    return _dispatch_branch_run(
+        ctx=ctx, issue=issue, pr_number=pr_number, params=params, kind="conflict",
+        context=context, store=store, base_ref_override=res.conflict_ref,
+    )
 
 
 def _ci_fix_roster(spec) -> list[str] | None:
@@ -1155,11 +1247,20 @@ def _dispatch_epic_run(
         )
     blocks = list(outcome.result.workitems_blocks or [])
     created: list[int] = []
+    extra: tuple[str, ...] = ()
+    # G/E13: alle Kinder landen in forge/epic-<N>, ausgeliefert wird als Ganzes.
+    if (
+        blocks
+        and parse_integration_mode(issue.body) == "branch"
+        and ensure_integration_branch(ctx, issue.number, params.pr_base)
+    ):
+        extra = (f"Integration-Branch: {integration_branch_name(issue.number)}",)
     if blocks:
         with _store_scope(ctx, store) as s:
             created = intake_blocks(
                 ctx, store=s, run_id=outcome.result.run_id, blocks=blocks,
                 source="epic_decomposition", parent=issue.number, parent_approved=True,
+                extra_lines=extra,
             ).created
     return _PassResult(
         summaries=[_LoopSummaryRow(
@@ -1312,6 +1413,8 @@ def _heartbeat_session(
                     skipped=result.skipped,
                     bailed=result.bailed,
                     scheduled_resume_count=result.scheduled_resume_count,
+                    parallel_running=result.parallel_running,
+                    capacity=result.capacity,
                 ),
             )
         )
@@ -1611,11 +1714,12 @@ def _run_conductor_watch(
                 # QA-Item (nicht pro Issue); fail-open → None bei jedem Fehler.
                 head_committed_at = None
                 ci_status = None
-                if stage in (Stage.QA, Stage.IN_DEV):
+                mergeable = None
+                if stage in (Stage.QA, Stage.IN_DEV, Stage.TRACKING):
                     qa_pr = pr_number_for_issue(events, issue.number)
                     if qa_pr is not None:
-                        head_committed_at, ci_status, pr_state = _pr_observation(
-                            ctx, qa_pr
+                        head_committed_at, ci_status, pr_state, mergeable = (
+                            _pr_observation(ctx, qa_pr)
                         )
                         if pr_state == "MERGED":
                             merged_evt = _record_observed_merge(
@@ -1628,7 +1732,7 @@ def _run_conductor_watch(
                     # PRMerged nachtragen → spec_pending fällt → design.
                     spec_pr = spec_pr_for_issue(events, issue.number)
                     if spec_pr is not None:
-                        _, _, spec_state = _pr_observation(ctx, spec_pr)
+                        _, _, spec_state, _ = _pr_observation(ctx, spec_pr)
                         if spec_state == "MERGED":
                             merged_evt = _record_observed_merge(
                                 ctx, store, events, spec_pr, session_id
@@ -1640,15 +1744,30 @@ def _run_conductor_watch(
                     issue.number,
                     head_committed_at=head_committed_at,
                     ci_status=ci_status,
+                    mergeable=mergeable,
                 )
                 if stage == Stage.TRACKING:
                     children = epic_children(events, issue.number)
                     stages_by_number = {i.number: stage_of(i.labels) for i in issues}
-                    signals = replace(
-                        signals,
-                        children_done=bool(children)
-                        and all(stages_by_number.get(c) == Stage.DONE for c in children),
+                    all_done = bool(children) and all(
+                        stages_by_number.get(c) == Stage.DONE for c in children
                     )
+                    if parse_integration_mode(issue.body) == "branch":
+                        # G: alle Kinder im Integrations-Branch → Sammel-PR
+                        # öffnen (einmal); tracking → qa folgt über has_open_pr.
+                        if all_done and not signals.has_open_pr:
+                            run_id = epic_run_id(events, issue.number)
+                            if run_id and open_integration_pr(
+                                ctx, epic=issue, run_id=run_id, store=store,
+                                base=params.pr_base,
+                            ):
+                                events.extend(
+                                    e for e in store.events_by_kind(EventKind.PR_CREATED)
+                                    if e.run_id == run_id
+                                )
+                                signals = derive_signals(events, issue.number)
+                    else:
+                        signals = replace(signals, children_done=all_done)
                 # A1: in-dev-Item, dessen Dev-Run keinen PR produzierte →
                 # Re-Dispatch-/Eskalations-Signale aus dem Event-Strom ableiten.
                 if stage == Stage.IN_DEV:
@@ -1661,6 +1780,7 @@ def _run_conductor_watch(
                         number=issue.number,
                         stage=stage,
                         depends_on=tuple(parse_depends_on(issue.body)),
+                        touches=tuple(parse_touches(issue.body)),
                         signals=signals,
                     )
                 )
@@ -1720,6 +1840,13 @@ def _run_conductor_watch(
                         return _dispatch_design_run(
                             ctx=ctx, issue=issue, params=params, store=store
                         )
+                    if order.kind == "sync":
+                        pr_num = pr_number_for_issue(events, order.number)
+                        if pr_num is None:
+                            return None
+                        return _dispatch_sync(
+                            ctx=ctx, issue=issue, pr_number=pr_num, params=params, store=store
+                        )
                     if order.kind in ("rework", "ci_fix"):
                         pr_num = pr_number_for_issue(events, order.number)
                         if pr_num is None:
@@ -1770,9 +1897,10 @@ def _run_conductor_watch(
             def dispatch(order: DispatchOrder) -> None:
                 pending.append(order)
 
+            capacity = tick_capacity(ctx, store, max_parallel)
             result = run_conductor_tick(
                 items=items,
-                capacity=max_parallel,
+                capacity=capacity,
                 set_stage=set_stage,
                 dispatch=dispatch,
                 on_blocked=_emit_blocked,
@@ -1800,6 +1928,8 @@ def _run_conductor_watch(
                 blocked=result.blocked,
                 bailed=bool(counters["bailed"]),
                 scheduled_resume_count=resume_count,
+                parallel_running=len(pending) if max_parallel > 1 else min(len(pending), 1),
+                capacity=capacity,
             )
 
         return tick_fn

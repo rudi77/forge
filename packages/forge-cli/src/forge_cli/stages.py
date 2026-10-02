@@ -66,7 +66,7 @@ ALLOWED_TRANSITIONS: dict[Stage, frozenset[Stage]] = {
     Stage.DONE: frozenset(),
     Stage.BLOCKED: frozenset(),
     Stage.EPIC: frozenset({Stage.TRACKING, Stage.BLOCKED}),
-    Stage.TRACKING: frozenset({Stage.DONE, Stage.BLOCKED}),
+    Stage.TRACKING: frozenset({Stage.DONE, Stage.QA, Stage.BLOCKED}),
     Stage.PROPOSED: frozenset(),
 }
 
@@ -159,6 +159,16 @@ class StageSignals:
     epic_failed_runs: int = 0
     """A2: Zerlegungs-Runs, die keine Items erzeugten (Eskalation statt
     Endlos-Retry)."""
+
+    conflicting: bool = False
+    """G: der Code-Host meldet den offenen PR als ``CONFLICTING`` (Basis hat
+    sich nach einem Geschwister-Merge bewegt). Injiziert wie ``ci_status``."""
+
+    conflict_fix_started: bool = False
+    """G: für den aktuellen Head läuft/lief bereits ein Konflikt-Run."""
+
+    conflict_fix_failed: bool = False
+    """G: ein Konflikt-Run für den aktuellen Head endete ohne Ergebnis."""
 
     @property
     def ci_failed(self) -> bool:
@@ -259,6 +269,9 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
         return Stage.DESIGN, "requirements_refined"
     if stage == Stage.EPIC and signals.has_decomposition:
         return Stage.TRACKING, "epic_decomposed"
+    if stage == Stage.TRACKING and signals.has_open_pr:
+        # G: Integrations-Branch-Epic — der Sammel-PR geht durch die normale QA.
+        return Stage.QA, "integration_pr"
     if stage == Stage.TRACKING and signals.children_done:
         return Stage.DONE, "children_done"
     if stage == Stage.DESIGN and signals.has_plan:
@@ -268,6 +281,7 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
         and signals.has_open_pr
         and not signals.changes_requested
         and not signals.ci_failed
+        and not signals.conflicting
     ):
         return Stage.QA, "pr_created"
     if stage == Stage.QA and signals.has_merged_pr:
@@ -276,6 +290,8 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
         if signals.rework_rounds > MAX_REWORK_ROUNDS:
             return Stage.BLOCKED, "rework_exhausted"
         return Stage.IN_DEV, "review_changes_requested"
+    if stage == Stage.QA and signals.conflicting:
+        return Stage.IN_DEV, "merge_conflict"
     if stage == Stage.QA and signals.ci_failed:
         if signals.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS:
             return Stage.BLOCKED, "ci_fix_exhausted"

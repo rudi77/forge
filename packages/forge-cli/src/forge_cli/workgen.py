@@ -204,6 +204,7 @@ def create_proposed(
     parent_approved: bool = False,
     origin_issue: int | None = None,
     scope: str = "",
+    extra_lines: tuple[str, ...] = (),
 ) -> IntakeResult:
     """Legt ``items`` mit allen Leitplanken an und emittiert ``WorkItemCreated``."""
     if not items:
@@ -241,6 +242,7 @@ def create_proposed(
         origin_issue=origin_issue,
         scope=scope,
         provider=getattr(tracker, "provider", None),
+        extra_lines=extra_lines,
     )
     if result.created:
         console.print(
@@ -262,6 +264,7 @@ def intake_blocks(
     origin_issue: int | None = None,
     parent: int | None = None,
     parent_approved: bool = False,
+    extra_lines: tuple[str, ...] = (),
 ) -> IntakeResult:
     """Parst ``FORGE-WORKITEMS``-Blöcke eines Runs/Reviews und legt die Items an."""
     items: list[ProposedItem] = []
@@ -270,6 +273,7 @@ def intake_blocks(
     return create_proposed(
         ctx, store=store, run_id=run_id, items=items, source=source,
         origin_issue=origin_issue, parent=parent, parent_approved=parent_approved,
+        extra_lines=extra_lines,
     )
 
 

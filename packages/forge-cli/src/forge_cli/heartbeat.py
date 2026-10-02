@@ -38,6 +38,12 @@ class TickResult:
     bailed: bool = False
     """True, wenn der Board-Pass abbrach (Cost-Cap/Guardrail/Fehler)."""
 
+    parallel_running: int = 0
+    """Runs, die dieser Tick nebenläufig dispatchte (G, Auslastung)."""
+
+    capacity: int | None = None
+    """Wirksame Kapazität dieses Ticks (Budget-/Ressourcen-begrenzt, G)."""
+
 
 @dataclass
 class HeartbeatStats:

@@ -305,6 +305,24 @@ ORDER BY created DESC;
 """
 
 
+# Auslastungs-Sicht (Roadmap G): wie viel Parallelität die Fabrik pro Tag
+# tatsächlich nutzt und wie weit Budget/Ressourcen die Kapazität drosselten.
+_VIEW_FACTORY_PARALLELISM = """
+CREATE OR REPLACE VIEW factory_parallelism AS
+SELECT
+    project,
+    CAST(ts AS DATE)                                                      AS day,
+    COUNT(*)                                                              AS ticks,
+    AVG(TRY_CAST(json_extract(payload, '$.parallel_running') AS INTEGER)) AS mean_parallel,
+    MAX(TRY_CAST(json_extract(payload, '$.parallel_running') AS INTEGER)) AS max_parallel,
+    MIN(TRY_CAST(json_extract(payload, '$.capacity') AS INTEGER))         AS min_capacity
+FROM events
+WHERE kind = 'ConductorTickCompleted'
+GROUP BY project, CAST(ts AS DATE)
+ORDER BY day DESC;
+"""
+
+
 _VIEWS = [
     _VIEW_RUNS_WITH_OUTCOMES,
     _VIEW_COST_PER_FOCUS,
@@ -314,6 +332,7 @@ _VIEWS = [
     _VIEW_FACTORY_THROUGHPUT,
     _VIEW_LESSONS,
     _VIEW_FACTORY_INTAKE,
+    _VIEW_FACTORY_PARALLELISM,
 ]
 
 

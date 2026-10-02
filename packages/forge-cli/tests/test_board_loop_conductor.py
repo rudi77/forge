@@ -232,12 +232,15 @@ def test_conductor_empty_board_emits_tick_only(
 def test_conductor_parallel_dispatches_two_ready_items(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    # max_parallel=2: zwei ready-Items werden in EINEM Tick nebenläufig dispatcht.
+    # max_parallel=2: zwei ready-Items mit disjunkten Touches werden in EINEM
+    # Tick nebenläufig dispatcht (G; ohne Touches liefe jedes allein, E14).
     import threading
 
     ctx = _make_ctx(tmp_path)
-    _board(ctx, [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
-    )
+    _board(ctx, [
+        _issue(5, ["forge:ready"], body="Touches: src/a/**"),
+        _issue(6, ["forge:ready"], body="Touches: src/b/**"),
+    ])
 
     lock = threading.Lock()
     dispatched: list[int] = []

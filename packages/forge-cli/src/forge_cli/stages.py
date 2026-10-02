@@ -38,7 +38,14 @@ class Stage(StrEnum):
 
 # Marker-Labels, die forge zusätzlich zu den Stages setzt (keine Stage):
 # ``forge:generated`` kennzeichnet von forge selbst erzeugte Work-Items (A3).
-MARKER_LABELS: tuple[str, ...] = ("forge:generated",)
+# ``forge:auto``/``forge:spec``/``forge:release-pr`` markieren PRs (gh bricht
+# ``pr create --label`` ab, wenn ein Label fehlt → ``doctor --board --fix``).
+MARKER_LABELS: tuple[str, ...] = (
+    "forge:generated",
+    "forge:auto",
+    "forge:spec",
+    "forge:release-pr",
+)
 
 
 # Kanonische Pipeline-Reihenfolge (ohne die Sonderzustände blocked/done-terminal).
@@ -148,6 +155,10 @@ class StageSignals:
     spec_pending: bool = False
     """A1: für das Item ist ein Spec-PR (Label ``forge:spec``) offen und noch
     nicht gemergt → ``requirements`` wartet auf den Merge (menschliches Gate)."""
+
+    spec_rejected: bool = False
+    """A1: der Spec-PR wurde ungemergt geschlossen → eskalieren (ein Mensch
+    entscheidet, ob neu verdichtet werden soll), statt still zu warten."""
 
     has_decomposition: bool = False
     """A2: ein Epic wurde in Kind-Items zerlegt (``WorkItemCreated`` mit

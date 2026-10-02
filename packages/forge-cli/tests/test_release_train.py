@@ -192,7 +192,8 @@ def test_train_prepares_reviews_and_tags(repo: Path) -> None:
     assert RELEASE_PR_LABEL in pr.labels
     assert pr.title == "chore(release): v0.1.0"
     assert pr.branch.startswith("forge/release-0.1.0-")
-    assert "### Features" in pr.body and "Release-Items: #3, #4" in pr.body
+    assert "### Features" in pr.body
+    assert pr.body.startswith("Release-Items: #3, #4")  # überlebt Azure-Kürzung
     assert ctx.code_host.pushed[0].endswith(f":{pr.branch}")
 
     reviewed: list[int] = []
@@ -236,8 +237,11 @@ def test_train_respects_min_items_capability_and_closed_prs(repo: Path) -> None:
 
 
 def test_train_schedule_gates_preparation(repo: Path) -> None:
-    ctx = _ctx(repo, schedule="0 9 * * 1")  # montags 09:00
-    assert _tick(ctx, [3]).action == "idle"  # 2026-06-01 12:00 ist kein Treffer
+    # _tick läuft am Montag, 2026-06-01 12:00 UTC.
+    ctx = _ctx(repo, schedule="0 9 * * 5")  # freitags 09:00 — nicht in den letzten 24 h
+    assert _tick(ctx, [3]).action == "idle"
+    ctx = _ctx(repo, schedule="0 9 * * 1")  # montags 09:00 — heute früh, wird nachgeholt
+    assert _tick(ctx, [3]).action == "prepared"
 
 
 def test_conductor_runs_train_instead_of_per_item_release(

@@ -177,6 +177,14 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             # L3: Train sammelt release-Items selbst ein.
             if w.stage == Stage.RELEASE and w.signals.release_batched:
                 continue
+            # A1: Spec-PR ungemergt geschlossen → sichtbar eskalieren.
+            if w.stage == Stage.REQUIREMENTS and w.signals.spec_rejected:
+                blocked.append(Blocked(w.number, "error", (), "spec PR closed without merge"))
+                transitions.append(
+                    StageTransition(w.number, Stage.REQUIREMENTS, Stage.BLOCKED, "spec_rejected")
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
             # A1: Spec ist verdichtet, wartet nur noch auf den Spec-PR-Merge
             # → kein erneuter requirements-Run.
             if w.stage == Stage.REQUIREMENTS and w.signals.has_refined_spec:
@@ -342,7 +350,10 @@ def _is_code_run(order: DispatchOrder, item: WorkItem) -> bool:
     """Neuer Code-Run auf ``main``-Basis (ready → in-dev). Rework/CI-Fix/Sync
     arbeiten auf dem eigenen PR-Branch, design/requirements/epic/qa/release
     ändern keinen Code — sie konkurrieren nicht um Dateien."""
-    return order.kind == "run" and order.stage == Stage.IN_DEV and item.stage == Stage.READY
+    return order.kind == "run" and order.stage == Stage.IN_DEV and item.stage in (
+        Stage.READY,
+        Stage.IN_DEV,  # A1-Retry: neuer Dev-Run auf main-Basis
+    )
 
 
 def _select_with_file_conflicts(
@@ -361,6 +372,9 @@ def _select_with_file_conflicts(
       kollidieren die PRs beim Merge.
     * Ein Code-Run OHNE ``touches`` läuft allein: nur, wenn in diesem Tick noch
       kein anderer Code-Run gewählt ist, und danach kommt keiner mehr dazu.
+      Gegenüber bereits offenen PRs ohne ``touches`` greift bewusst keine Kante
+      (sonst wäre jede Fabrik ohne Touches-Angaben strikt seriell) — dort fängt
+      das Nachziehen nach dem Merge (``sync``) Konflikte ab.
     Deterministisch nach Nummer; implizite Kanten werden pro Tick neu
     berechnet, nicht gespeichert."""
     in_flight = [

@@ -316,12 +316,12 @@ def test_tick_sources_schedule_creates_epic_when_due(tmp_path: Path) -> None:
         ]),
     )
     store = ctx.open_store()
-    assert workgen.tick_sources(ctx, store=store, session_id="s",
-                                now=datetime(2026, 6, 1, 1, 0, tzinfo=UTC)) == 0
-    assert workgen.tick_sources(ctx, store=store, session_id="s",
-                                now=datetime(2026, 6, 1, 2, 0, tzinfo=UTC)) == 1
-    assert workgen.tick_sources(ctx, store=store, session_id="s",
-                                now=datetime(2026, 6, 1, 2, 30, tzinfo=UTC)) == 0
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    # Ohne Historie zählt das letzte Tagesfenster → ein täglicher Cron feuert
+    # beim ersten Tick (Nachholen statt exakter Minuten-Treffer).
+    assert workgen.tick_sources(ctx, store=store, session_id="s", now=now) == 1
+    # Danach ist der jüngste Lauf der Anker → nicht nochmal im selben Fenster.
+    assert workgen.tick_sources(ctx, store=store, session_id="s", now=now) == 0
     store.close()
     (item,) = (f.issue for f in ctx.tracker.items.values())
     assert "forge:epic" in item.labels

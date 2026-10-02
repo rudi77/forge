@@ -25,7 +25,7 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -259,7 +259,11 @@ def train_tick(
     if len(waiting_items) < cfg.min_items:
         return TrainResult("idle", f"{len(waiting_items)} < min_items")
     if cfg.schedule:
-        last = max((e.ts for e in _release_prs(events)), default=None)
+        # Erstes Mal ohne Historie: das letzte Tagesfenster zählt (sonst feuert
+        # cron_due nur, wenn ein Tick exakt die Minute trifft).
+        last = max((e.ts for e in _release_prs(events)), default=None) or (
+            now - timedelta(days=1)
+        )
         if not cron_due(cfg.schedule, last=last, now=now):
             return TrainResult("idle", "schedule not due")
     if not caps.check_action("open_pr").allowed:
@@ -319,10 +323,12 @@ def _prepare_release_pr(ctx, *, store, session_id, items, base, now, host) -> Tr
         pr = host.open_change(
             branch=target_branch,
             title=f"chore(release): {cfg.tag_prefix}{version}",
+            # Release-Items ZUERST: Azure kürzt Beschreibungen auf 4000 Zeichen,
+            # die Zeile darf bei langen Changelogs nicht verloren gehen.
             body=(
+                "Release-Items: " + ", ".join(f"#{n}" for n in sorted(items)) + "\n\n"
                 f"Release {cfg.tag_prefix}{version}, vorbereitet von forge (Release-Train).\n\n"
                 + section
-                + "\nRelease-Items: " + ", ".join(f"#{n}" for n in sorted(items)) + "\n"
             ),
             base=base,
             labels=labels,
@@ -375,7 +381,7 @@ def _advance_release_pr(ctx, *, store, session_id, events, pr_evt, merged, revie
         return TrainResult("error", f"cannot read version from {branch!r}")
     tag = f"{cfg.tag_prefix}{version}"
     items = parse_release_items(meta.body)
-    notes = meta.body.split("\nRelease-Items:")[0]
+    notes = _ITEMS_LINE.sub("", meta.body).strip() + "\n"
     try:
         url = host.create_release(tag=tag, title=tag, notes=notes, target=base)
     except CodeHostError as exc:

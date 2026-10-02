@@ -16,7 +16,7 @@ legt nichts an (Mantra 3).
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from forge_adapters.base import CodeHostError, TrackerError
@@ -45,8 +45,42 @@ from forge_cli.schedule import cron_due
 # --- A1: Specs ------------------------------------------------------------------
 
 
-def refined_spec_text(store: Any, blobs: Any, issue_number: int) -> str:
-    """Jüngste verdichtete Spec (``RequirementsRefined.artifacts['spec']``)."""
+def merged_spec_file(repo_root, spec_dir: str, issue_number: int, ref: str = "HEAD") -> str:
+    """Inhalt der gemergten Spec-Datei ``<spec_dir>/<n>-*.md`` auf ``ref``, oder ``""``.
+
+    Gewinnt über den CAS-Blob: im Spec-PR darf (und soll) ein Mensch die
+    Kriterien nachschärfen — der gemergte Stand ist die Wahrheit."""
+    import subprocess
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=str(repo_root), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+
+    listing = git("ls-tree", "-r", "--name-only", ref, "--", spec_dir.rstrip("/") + "/")
+    if listing.returncode != 0:
+        return ""
+    prefix = f"{spec_dir.rstrip('/')}/{issue_number}-"
+    paths = [p for p in listing.stdout.splitlines() if p.startswith(prefix) and p.endswith(".md")]
+    if not paths:
+        return ""
+    show = git("show", f"{ref}:{sorted(paths)[0]}")
+    return show.stdout.strip() if show.returncode == 0 else ""
+
+
+def refined_spec_text(
+    store: Any,
+    blobs: Any,
+    issue_number: int,
+    *,
+    repo_root=None,
+    spec_dir: str = "docs/specs",
+) -> str:
+    """Verdichtete Spec eines Items: gemergte Spec-Datei (falls vorhanden),
+    sonst die jüngste ``RequirementsRefined.artifacts['spec']``."""
+    if repo_root is not None:
+        merged = merged_spec_file(repo_root, spec_dir, issue_number)
+        if merged:
+            return merged
     run_ids = {
         e.run_id
         for e in store.events_by_kind(EventKind.RUN_STARTED)
@@ -270,10 +304,13 @@ def intake_blocks(
     items: list[ProposedItem] = []
     for block in blocks:
         items.extend(parse_workitems(block))
+    # Epic-Kinder sind pro Epic eindeutig (zwei Epics dürfen gleich betitelte
+    # Kinder haben); Funde dedupen bewusst über Runs/Items hinweg.
+    scope = f"parent:{parent}" if parent is not None else ""
     return create_proposed(
         ctx, store=store, run_id=run_id, items=items, source=source,
         origin_issue=origin_issue, parent=parent, parent_approved=parent_approved,
-        extra_lines=extra_lines,
+        scope=scope, extra_lines=extra_lines,
     )
 
 
@@ -312,12 +349,14 @@ def tick_sources(ctx: ForgeContext, *, store: Any, session_id: str, now: datetim
     prior = store.events_by_kind(EventKind.WORK_ITEM_CREATED)
     for trig in ctx.spec.triggers.schedule:
         title = f"[schedule] {trig.focus}"
+        # Ohne Historie zählt das letzte Tagesfenster (sonst feuert cron_due
+        # nur, wenn ein Tick exakt die Cron-Minute trifft).
         last = max(
             (e.ts for e in prior
              if (e.payload or {}).get("source") == "schedule"
              and (e.payload or {}).get("title") == title),
             default=None,
-        )
+        ) or now - timedelta(days=1)
         if not cron_due(trig.cron, last=last, now=now):
             continue
         item = ProposedItem(

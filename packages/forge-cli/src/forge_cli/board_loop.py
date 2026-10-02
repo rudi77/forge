@@ -448,7 +448,10 @@ def _store_scope(ctx: ForgeContext, store: EventStore | None):
 def _spec_for(ctx: ForgeContext, store: EventStore | None, issue_number: int) -> str:
     """A1: verdichtete Akzeptanzkriterien des Items (leer, wenn keine)."""
     with _store_scope(ctx, store) as s:
-        return refined_spec_text(s, ctx.open_blobs(), issue_number)
+        return refined_spec_text(
+            s, ctx.open_blobs(), issue_number,
+            repo_root=ctx.repo_root, spec_dir=ctx.spec.intake.spec_dir,
+        )
 
 
 def _intake_run_findings(
@@ -1077,14 +1080,13 @@ def _dispatch_branch_run(
 
     result = outcome.result
     _intake_run_findings(ctx, store, issue, outcome)
-    if result.decision == "pr_created" and result.branch:
-        try:
-            code_host.push_branch(branch=result.branch, target=head)
-        except CodeHostError as exc:
-            err_console.print(f"[red]push failed[/red] for PR #{pr_number}: {exc}")
-            return _PassResult(summaries=[row("push_failed", str(exc))], bailed=False,
-                               dispatched=1, skipped=0)
-        console.print(f"  [green]pushed[/green] {label} → {head} (PR #{pr_number})")
+    if (
+        result.decision == "pr_created"
+        and result.branch
+        and not _push_branch_result(ctx, issue, pr_number, result.branch, store, head=head)
+    ):
+        return _PassResult(summaries=[row("push_failed")], bailed=False,
+                           dispatched=1, skipped=0)
     bailed = result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}
     return _PassResult(
         summaries=[row(f"{label}:{result.decision}", url=f"#{pr_number}")],
@@ -1141,6 +1143,68 @@ def _record_observed_merge(
     )
     store.append(evt)
     return evt
+
+
+def _original_run_started(events: list, run_id: str) -> dict:
+    """Payload des ERSTEN ``RunStarted`` eines Runs (Resume-Kontext)."""
+    starts = sorted(
+        (e for e in events if e.kind == EventKind.RUN_STARTED and e.run_id == run_id),
+        key=lambda e: e.ts,
+    )
+    return dict(starts[0].payload or {}) if starts else {}
+
+
+def _push_branch_result(
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    pr_number: int,
+    branch: str,
+    store: EventStore | None,
+    *,
+    head: str | None = None,
+) -> bool:
+    """Pusht ein Branch-Run-Ergebnis fast-forward auf den PR-Head.
+
+    Scheitert der Push (Head bewegte sich, Rechte), würde das Item sonst still
+    in ``in-dev`` hängen (der Run gilt als erfolgreich, der Head bleibt alt) →
+    sichtbar nach ``blocked`` eskalieren (``WorkItemBlocked`` kind ``error``)."""
+    host = ctx.get_code_host()
+    try:
+        if head is None:
+            head = host.fetch_metadata(pr_number).head_branch
+        host.push_branch(branch=branch, target=head)
+    except CodeHostError as exc:
+        err_console.print(f"[red]push failed[/red] for PR #{pr_number}: {exc}")
+        _escalate(ctx, store, issue, f"push to PR #{pr_number} failed: {exc}")
+        return False
+    console.print(f"  [green]pushed[/green] {branch} → {head} (PR #{pr_number})")
+    return True
+
+
+def _escalate(ctx: ForgeContext, store: EventStore | None, issue: ReadyIssue, reason: str) -> None:
+    """Item sichtbar nach ``forge:blocked`` (Label + ``WorkItemBlocked``)."""
+    stage = stage_of(issue.labels)
+    try:
+        ctx.get_tracker().set_stage(
+            number=issue.number, add=Stage.BLOCKED.value,
+            remove=stage.value if stage is not None else None,
+        )
+    except TrackerError as exc:
+        err_console.print(f"[yellow]escalation label failed[/yellow] #{issue.number}: {exc}")
+    with _store_scope(ctx, store) as s:
+        s.append(
+            build_event(
+                kind=EventKind.WORK_ITEM_BLOCKED,
+                run_id=str(ULID()),
+                project=ctx.spec.name,
+                project_fingerprint=ctx.project_fingerprint,
+                factory_version=ctx.factory_version,
+                spec_version=ctx.spec.spec_version,
+                payload=WorkItemBlockedPayload(
+                    issue_number=issue.number, kind="error", reason=reason[:500]
+                ),
+            )
+        )
 
 
 def _dispatch_sync(
@@ -1302,8 +1366,15 @@ def _dispatch_resume(
     params: _DispatchParams,
     issue: ReadyIssue | None,
     store: EventStore | None = None,
+    events: list | None = None,
 ) -> _PassResult:
     """Setzt einen vom Usage-/Session-Limit unterbrochenen Run fort (Loop 2).
+
+    Der Resume behält Trigger, Focus, PR-Nummer und damit die **Run-Art** des
+    Originals (aus dessen ``RunStarted``): ein Rework/CI-Fix/Konflikt-Run pusht
+    sein Ergebnis wieder fast-forward auf den bestehenden PR-Branch (kein neuer
+    PR), Epic/Design/Requirements-Runs öffnen nie einen PR, ein Kind eines
+    Integrations-Epics zielt auf ``forge/epic-<N>``.
 
     Reicht den Resume-Anker (run_id + session_id) an ``execute_run`` durch; der
     Runner dockt an den eingefrorenen Worktree an (``claude --resume``) und führt
@@ -1314,6 +1385,17 @@ def _dispatch_resume(
     """
     roster = _roster_for_issue(ctx.spec, issue.labels) if issue is not None else None
     title = issue.title if issue is not None else f"resume {order.run_id[:10]}"
+    orig = _original_run_started(events or [], order.run_id)
+    focus = str(orig.get("focus") or f"resume:{order.run_id}")
+    kind = focus.split(":", 1)[0] if ":" in focus else "dev"
+    branch_kinds = {"rework", "ci-fix", "conflict"}
+    template = {"requirements": "requirements", "design": "design", "epic": "epic"}.get(
+        kind, "resume"
+    )
+    create_pr = kind not in branch_kinds | {"epic", "design", "requirements"}
+    pr_base = params.pr_base
+    if issue is not None and (integration := parse_integration_branch(issue.body)):
+        pr_base = integration
     console.print(
         f"\n[bold blue]>>> board-loop[/bold blue] resume run "
         f"[dim]{order.run_id[:10]}[/dim] (issue "
@@ -1323,9 +1405,9 @@ def _dispatch_resume(
         outcome = execute_run(
             ctx=ctx,
             rendered_prompt=_DEFAULT_RESUME_PROMPT,
-            prompt_template_id="resume",
-            trigger="schedule",
-            focus=f"resume:{order.run_id}",
+            prompt_template_id=template,
+            trigger=str(orig.get("trigger") or "schedule"),
+            focus=focus,
             base_ref=params.base_ref,
             acceptance_criteria=None,
             max_iterations=params.max_iterations,
@@ -1333,13 +1415,13 @@ def _dispatch_resume(
             eval_suite=params.eval_suite,
             model=params.model,
             issue_number=order.issue_number,
-            pr_number=None,
+            pr_number=orig.get("pr_number"),
             dry_run=False,
             claude_bin=params.claude_bin,
             multi_agent=params.multi_agent,
             agents=roster,
-            create_pr=True,
-            pr_base=params.pr_base,
+            create_pr=create_pr,
+            pr_base=pr_base,
             extra_labels=params.pr_label or [],
             pr_draft=False,
             auto_merge=params.auto_merge,
@@ -1365,6 +1447,24 @@ def _dispatch_resume(
             dispatched=0,
             skipped=0,
         )
+
+    result = outcome.result
+    if kind in branch_kinds and result.decision == "pr_created" and result.branch:
+        pr_number = orig.get("pr_number")
+        if pr_number is not None and issue is not None:
+            _push_branch_result(ctx, issue, int(pr_number), result.branch, store)
+    elif kind == "epic" and issue is not None and result.workitems_blocks:
+        with _store_scope(ctx, store) as s:
+            intake_blocks(
+                ctx, store=s, run_id=result.run_id, blocks=list(result.workitems_blocks),
+                source="epic_decomposition", parent=issue.number, parent_approved=True,
+            )
+    elif kind == "requirements" and issue is not None:
+        with _store_scope(ctx, store) as s:
+            publish_spec(ctx, issue=issue, run_id=result.run_id, store=s,
+                         base_ref=params.base_ref, pr_base=params.pr_base)
+    elif issue is not None and kind not in branch_kinds:
+        _intake_run_findings(ctx, store, issue, outcome)
 
     bailed = outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}
     return _PassResult(
@@ -1719,6 +1819,7 @@ def _run_conductor_watch(
                     params=params,
                     issue=by_number.get(resume_order.issue_number or -1),
                     store=store,
+                    events=events,
                 )
                 _print_loop_summary(res.summaries, bailed=res.bailed)
                 resume_count += res.dispatched
@@ -1737,6 +1838,7 @@ def _run_conductor_watch(
                 head_committed_at = None
                 ci_status = None
                 mergeable = None
+                spec_state = None
                 if stage in (Stage.QA, Stage.IN_DEV, Stage.TRACKING):
                     qa_pr = pr_number_for_issue(events, issue.number)
                     if qa_pr is not None:
@@ -1753,6 +1855,7 @@ def _run_conductor_watch(
                     # A1: Merge des Spec-PRs (meist durch einen Menschen) als
                     # PRMerged nachtragen → spec_pending fällt → design.
                     spec_pr = spec_pr_for_issue(events, issue.number)
+                    spec_state = None
                     if spec_pr is not None:
                         _, _, spec_state, _ = _pr_observation(ctx, spec_pr)
                         if spec_state == "MERGED":
@@ -1768,7 +1871,16 @@ def _run_conductor_watch(
                     ci_status=ci_status,
                     mergeable=mergeable,
                 )
-                if stage == Stage.RELEASE and ctx.spec.release.mode == "train":
+                if stage == Stage.REQUIREMENTS and spec_state == "CLOSED":
+                    signals = replace(signals, spec_rejected=True)
+                # L3: Train sammelt release-Items — außer Kinder eines
+                # Integrations-Epics: die landen nicht auf main, sondern werden
+                # einzeln als "integrated" abgeschlossen (G).
+                if (
+                    stage == Stage.RELEASE
+                    and ctx.spec.release.mode == "train"
+                    and not parse_integration_branch(issue.body)
+                ):
                     signals = replace(signals, release_batched=True)
                 if stage == Stage.TRACKING:
                     children = epic_children(events, issue.number)
@@ -1934,7 +2046,9 @@ def _run_conductor_watch(
             if ctx.spec.release.mode == "train":
                 waiting = [
                     w.number for w in items
-                    if w.stage == Stage.RELEASE and not w.signals.release_done
+                    if w.stage == Stage.RELEASE
+                    and w.signals.release_batched
+                    and not w.signals.release_done
                 ]
                 try:
                     train = train_tick(

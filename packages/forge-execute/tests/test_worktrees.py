@@ -445,3 +445,36 @@ def test_revert_tolerates_locked_files(repo: Path, monkeypatch) -> None:
     finally:
         monkeypatch.undo()
         wm.cleanup(wt)
+
+
+def test_commit_works_without_git_identity(tmp_path, monkeypatch) -> None:
+    """Frische Maschine/CI ohne user.name/email: forge committet als ``forge``
+    statt mit „Author identity unknown" abzubrechen."""
+    import subprocess
+
+    from forge_execute.worktrees import WorktreeManager
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.delenv("GIT_AUTHOR_NAME", raising=False)
+    monkeypatch.delenv("GIT_AUTHOR_EMAIL", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_NAME", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_EMAIL", raising=False)
+    monkeypatch.delenv("EMAIL", raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("a\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"],
+                   cwd=repo, check=True)
+    wm = WorktreeManager(repo)
+    wt = wm.create(run_id="idtest", base_ref="HEAD")
+    (wt.path / "b.txt").write_text("b\n")
+    wm.commit(wt, "forge: test")
+    author = subprocess.run(["git", "log", "-1", "--format=%an <%ae>"], cwd=wt.path,
+                            capture_output=True, text=True, check=True).stdout.strip()
+    assert author == "forge <forge@localhost>"
+    wm.cleanup(wt)

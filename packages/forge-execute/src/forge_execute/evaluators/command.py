@@ -251,6 +251,8 @@ def _kill_tree(pid: int) -> None:
 #   "5 failed in 0.45s"
 #   "1 error"
 #   "no tests ran"
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 _PYTEST_SUMMARY_RE = re.compile(
     r"(?:^|\s)"
     r"(?:(?P<failed>\d+) failed)?"
@@ -274,6 +276,9 @@ def parse_pytest_output(stdout: str, *, exit_code: int) -> dict[str, float]:
 
     Bei `no tests ran` liefern wir `pytest_pass_rate=1.0` (vacuously true).
     """
+    # Farbcodes entfernen: mit FORCE_COLOR/PY_COLORS färbt pytest die Summary
+    # (`\x1b[32m5 passed\x1b[0m`) — ohne Strip würde 0 Tests gelesen.
+    stdout = _ANSI_RE.sub("", stdout)
     if "no tests ran" in stdout.lower():
         return {
             "pytest_pass_rate": 1.0,

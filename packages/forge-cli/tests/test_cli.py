@@ -320,11 +320,16 @@ def test_run_requires_prompt_or_focus(mini_repo: Path, monkeypatch) -> None:
 
 
 def test_board_loop_help_works() -> None:
+    import click
+
     result = runner.invoke(app, ["board-loop", "--help"])
     assert result.exit_code == 0
-    assert "board" in result.stdout.lower()
-    assert "--auto-merge" in result.stdout
-    assert "--max" in result.stdout
+    # In der CI färbt Rich die Hilfe ein und zerlegt Optionen in einzeln
+    # gestylte Teile ("-" + "-auto" + "-merge") → vor dem Vergleich entfärben.
+    out = click.unstyle(result.stdout)
+    assert "board" in out.lower()
+    assert "--auto-merge" in out
+    assert "--max" in out
 
 
 def test_board_loop_errors_without_board_block(mini_repo: Path, monkeypatch) -> None:

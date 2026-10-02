@@ -24,6 +24,7 @@ from forge_adapters.base import (
     PRCreationResult,
     PRMetadata,
     TrackerError,
+    git_push_argv,
 )
 
 
@@ -179,8 +180,11 @@ class InMemoryCodeHost:
         self.ref_status: dict[str, str] = {}
         self._next = 100
 
-    def push_branch(self, *, branch: str, remote: str = "origin") -> None:
-        self.pushed.append(branch)
+    def push_branch(
+        self, *, branch: str, remote: str = "origin", target: str | None = None
+    ) -> None:
+        git_push_argv(branch=branch, remote=remote, target=target)  # Leitplanken
+        self.pushed.append(f"{branch}:{target}" if target else branch)
 
     def open_change(
         self,

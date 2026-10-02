@@ -27,7 +27,7 @@ from typing import Annotated, Any
 
 import typer
 from forge_adapters.base import CodeHostError, TrackerError, WorkTracker
-from forge_adapters.text import wrap_issue_body
+from forge_adapters.text import wrap_issue_body, wrap_untrusted
 from forge_core.events import (
     ConductorTickCompletedPayload,
     EventKind,
@@ -809,6 +809,169 @@ def _dispatch_design_run(
     )
 
 
+_REWORK_PREAMBLE = (
+    "This is a REWORK task on an EXISTING pull request (PR #{pr}). The working "
+    "tree already contains the PR's changes. A reviewer requested changes — "
+    "address every blocking finding below with the smallest correct change. Do "
+    "not start over and do not touch unrelated code. Re-run the relevant tests "
+    "before finishing.\n\n"
+)
+
+_CI_FIX_PREAMBLE = (
+    "This is a CI-FIX task on an EXISTING pull request (PR #{pr}). The working "
+    "tree already contains the PR's changes, but CI is red. Find the root cause "
+    "of the failing checks below and fix it with the smallest correct change. "
+    "Never skip, disable or weaken a test to make CI green.\n\n"
+)
+
+
+def _latest_review_reasoning(
+    ctx: ForgeContext, events: list, pr_number: int
+) -> str:
+    """Begründung des jüngsten ``PRReviewed`` für ``pr_number`` (aus dem CAS).
+
+    Best-effort: fehlt der Blob (alte 1.0-Events, Blob-GC), bleibt der Kontext
+    leer — der Nacharbeits-Run sieht dann nur das Issue."""
+    reviews = [
+        e
+        for e in events
+        if e.kind == EventKind.PR_REVIEWED
+        and (e.payload or {}).get("pr_number") == pr_number
+    ]
+    if not reviews:
+        return ""
+    blob = (max(reviews, key=lambda e: e.ts).payload or {}).get("reasoning_blob")
+    if not blob:
+        return ""
+    try:
+        return ctx.open_blobs().get_text(blob)
+    except (FileNotFoundError, OSError, ValueError):
+        return ""
+
+
+def _dispatch_branch_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    pr_number: int,
+    params: _DispatchParams,
+    kind: str,
+    context: str,
+    store: EventStore | None = None,
+) -> _PassResult:
+    """Run auf einem BESTEHENDEN PR-Branch (Nacharbeit L1 / CI-Fix L2).
+
+    Der Runner bleibt unverändert: er bekommt als ``base_ref`` den frisch
+    geholten PR-Head (``refs/remotes/origin/<head>``) und arbeitet wie immer auf
+    einem eigenen ``forge/<run_id>``-Branch. Behält er eine Generation
+    (``decision == pr_created``), pusht forge das Ergebnis **fast-forward** auf
+    den PR-Head — nie ``--force``, nur auf ``forge/*``-Branches
+    (``git_push_argv``). Kein neuer PR: der bestehende wird aktualisiert, sein
+    neuer Head-Commit macht das alte Review veraltet → ``in-dev → qa``.
+    """
+    label = "rework" if kind == "rework" else "ci-fix"
+    row = lambda decision, err=None, url=None: _LoopSummaryRow(  # noqa: E731
+        issue_number=issue.number,
+        issue_title=issue.title,
+        decision=decision,
+        pr_url=url,
+        auto_merge="-",
+        error=err,
+    )
+    code_host = ctx.get_code_host()
+    try:
+        meta = code_host.fetch_metadata(pr_number)
+    except CodeHostError as exc:
+        return _PassResult(summaries=[row("error", str(exc))], bailed=False,
+                           dispatched=0, skipped=0)
+    head = meta.head_branch
+    if not head.startswith("forge/"):
+        msg = f"PR #{pr_number} head {head!r} is not a forge/* branch — {label} skipped"
+        err_console.print(f"[yellow]skip[/yellow] {msg}")
+        return _PassResult(summaries=[row("skipped", msg)], bailed=False,
+                           dispatched=0, skipped=1)
+    try:
+        base_ref = WorktreeManager(ctx.repo_root).fetch_remote_branch(head)
+    except GitError as exc:
+        return _PassResult(summaries=[row("error", str(exc))], bailed=False,
+                           dispatched=0, skipped=0)
+
+    preamble = _REWORK_PREAMBLE if kind == "rework" else _CI_FIX_PREAMBLE
+    context_label = "review findings" if kind == "rework" else "ci failure"
+    prompt = preamble.format(pr=pr_number) + wrap_issue_body(
+        title=issue.title, body=issue.body
+    )
+    if context.strip():
+        prompt += "\n" + wrap_untrusted(label=context_label, text=context)
+    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    if context.strip():
+        acceptance += f"\n\n{context_label.title()}:\n{context}"
+    roster = (
+        _roster_for_issue(ctx.spec, issue.labels)
+        if kind == "rework"
+        else _ci_fix_roster(ctx.spec)
+    )
+    console.print(
+        f"\n[bold yellow]>>> board-loop[/bold yellow] {label} run for issue "
+        f"#{issue.number} on PR #{pr_number} ([dim]{head}[/dim])"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=prompt,
+            prompt_template_id=label,
+            trigger="rework" if kind == "rework" else "ci_failure",
+            focus=f"{label}:#{issue.number}",
+            base_ref=base_ref,
+            acceptance_criteria=acceptance,
+            max_iterations=params.max_iterations,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=issue.number,
+            pr_number=pr_number,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=params.multi_agent,
+            agents=roster,
+            create_pr=False,
+            pr_base=params.pr_base,
+            extra_labels=[],
+            pr_draft=False,
+            auto_merge=False,
+            announce=False,
+            store=store,
+        )
+    except Exception as exc:
+        err_console.print(f"[red]error[/red] in {label} run for #{issue.number}: {exc}")
+        return _PassResult(summaries=[row("error", str(exc))], bailed=True,
+                           dispatched=0, skipped=0)
+
+    result = outcome.result
+    if result.decision == "pr_created" and result.branch:
+        try:
+            code_host.push_branch(branch=result.branch, target=head)
+        except CodeHostError as exc:
+            err_console.print(f"[red]push failed[/red] for PR #{pr_number}: {exc}")
+            return _PassResult(summaries=[row("push_failed", str(exc))], bailed=False,
+                               dispatched=1, skipped=0)
+        console.print(f"  [green]pushed[/green] {label} → {head} (PR #{pr_number})")
+    bailed = result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}
+    return _PassResult(
+        summaries=[row(f"{label}:{result.decision}", url=f"#{pr_number}")],
+        bailed=bailed,
+        dispatched=1,
+        skipped=0,
+    )
+
+
+def _ci_fix_roster(spec) -> list[str] | None:
+    """Roster für CI-Fix-Runs: ``triggers.on_ci_failure.agents`` (Default
+    ``["developer"]``), sonst der execute_run-Default."""
+    cfg = getattr(getattr(spec, "triggers", None), "on_ci_failure", None)
+    return list(cfg.agents) if cfg is not None else ["developer"]
+
+
 def _dispatch_resume(
     *,
     ctx: ForgeContext,
@@ -1227,7 +1390,7 @@ def _run_conductor_watch(
                 # request_changes-PR erneut reviewt wird. Eine gh-Call pro
                 # QA-Item (nicht pro Issue); fail-open → None bei jedem Fehler.
                 head_committed_at = None
-                if stage == Stage.QA:
+                if stage in (Stage.QA, Stage.IN_DEV):
                     qa_pr = pr_number_for_issue(events, issue.number)
                     if qa_pr is not None:
                         head_committed_at = ctx.get_code_host().head_committed_at(
@@ -1302,6 +1465,19 @@ def _run_conductor_watch(
                     if order.stage == Stage.DESIGN:
                         return _dispatch_design_run(
                             ctx=ctx, issue=issue, params=params, store=store
+                        )
+                    if order.kind in ("rework", "ci_fix"):
+                        pr_num = pr_number_for_issue(events, order.number)
+                        if pr_num is None:
+                            return None
+                        context = (
+                            _latest_review_reasoning(ctx, events, pr_num)
+                            if order.kind == "rework"
+                            else ctx.get_code_host().ci_failure_summary(pr_num)
+                        )
+                        return _dispatch_branch_run(
+                            ctx=ctx, issue=issue, pr_number=pr_num, params=params,
+                            kind=order.kind, context=context, store=store,
                         )
                     if order.stage == Stage.QA:
                         pr_num = pr_number_for_issue(events, order.number)

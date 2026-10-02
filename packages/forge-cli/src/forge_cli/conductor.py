@@ -81,6 +81,10 @@ class DispatchOrder:
 
     number: int
     stage: Stage
+    kind: str = "run"
+    """Run-Art innerhalb der Stage: ``run`` (regulärer Stage-Run), ``rework``
+    (Nacharbeit nach ``request_changes`` auf dem PR-Branch, L1) oder
+    ``ci_fix`` (roten CI auf dem PR-Branch reparieren, L2)."""
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,10 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
         if nxt != w.stage:
             transitions.append(StageTransition(w.number, w.stage, nxt, reason))
             effective[w.number] = nxt
+            if nxt == Stage.BLOCKED:
+                # Eskalation aus advance (z.B. rework_exhausted): als
+                # WorkItemBlocked sichtbar machen, nicht nur als Label.
+                blocked.append(Blocked(w.number, reason, (), reason))
 
     # 2. CYCLES --------------------------------------------------------
     graph = {w.number: [d for d in w.depends_on] for w in items}
@@ -152,6 +160,35 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             if w.stage == Stage.QA and w.signals.review_done:
                 continue
             target = w.stage
+        elif (
+            w.stage == Stage.IN_DEV
+            and eff == Stage.IN_DEV
+            and w.signals.has_open_pr
+            and w.signals.changes_requested
+        ):
+            # L1: Nacharbeit auf dem bestehenden PR-Branch. Höchstens ein
+            # Nacharbeits-Run pro Review; scheitert er (nichts gepusht), wird
+            # eskaliert statt endlos neu zu versuchen.
+            if w.signals.rework_failed:
+                blocked.append(
+                    Blocked(
+                        w.number,
+                        "rework_no_change",
+                        (),
+                        "rework run produced no change for the requested review",
+                    )
+                )
+                transitions.append(
+                    StageTransition(
+                        w.number, Stage.IN_DEV, Stage.BLOCKED, "rework_no_change"
+                    )
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            if w.signals.rework_started:
+                continue  # läuft schon / wartet auf den Push
+            candidates.append(DispatchOrder(w.number, Stage.IN_DEV, "rework"))
+            continue
         elif w.stage == Stage.IN_DEV and w.signals.dev_failed_no_pr:
             # Dev-Run produzierte keinen PR. Beschränkter Re-Dispatch (A1):
             # bis MAX_DEV_RETRIES erneut dispatchen, danach nach blocked
@@ -205,7 +242,11 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
         # Der ready→in-dev-Übergang gehört NUR zum Erst-Dispatch aus der
         # Warteschlange — NICHT zum A1-Re-Dispatch eines Items, das bereits auf
         # in-dev steht (sonst ein illegaler ready→in-dev-Übergang).
-        if order.stage == Stage.IN_DEV and by_num[order.number].stage == Stage.READY:
+        if (
+            order.kind == "run"
+            and order.stage == Stage.IN_DEV
+            and by_num[order.number].stage == Stage.READY
+        ):
             transitions.append(
                 StageTransition(order.number, Stage.READY, Stage.IN_DEV, "dispatched")
             )
@@ -322,13 +363,16 @@ def derive_signals(
         and (e.payload or {}).get("pr_number") in pr_numbers
         for e in events
     )
-    review_tss = [
-        e.ts
-        for e in events
-        if e.kind == EventKind.PR_REVIEWED
-        and (e.payload or {}).get("pr_number") in pr_numbers
-    ]
-    latest_review_ts = max(review_tss) if review_tss else None
+    reviews = sorted(
+        (
+            e
+            for e in events
+            if e.kind == EventKind.PR_REVIEWED
+            and (e.payload or {}).get("pr_number") in pr_numbers
+        ),
+        key=lambda e: e.ts,
+    )
+    latest_review_ts = reviews[-1].ts if reviews else None
     # Veraltet, sobald ein Commit NACH dem jüngsten Review landete. ``<=`` →
     # ein Commit exakt zur Review-Zeit gilt als "nicht neuer" (bias zu weniger
     # teuren Re-Reviews). Ohne Board-Datum: altes Verhalten (Review existiert).
@@ -342,7 +386,43 @@ def derive_signals(
         and (e.payload or {}).get("issue_number") == issue_number
         for e in events
     )
+    # L1: Nacharbeit. Ein request_changes gilt, solange kein Commit danach kam
+    # (gleiche Veraltungs-Regel wie review_done). Gemergte PRs sind erledigt.
+    latest_verdict = (reviews[-1].payload or {}).get("verdict") if reviews else None
+    review_stale = (
+        latest_review_ts is not None
+        and head_committed_at is not None
+        and head_committed_at > latest_review_ts
+    )
+    changes_requested = (
+        latest_verdict == "request_changes" and not review_stale and not has_merged_pr
+    )
+    rework_rounds = sum(
+        1 for e in reviews if (e.payload or {}).get("verdict") == "request_changes"
+    )
+    rework_started = False
+    rework_failed = False
+    if latest_review_ts is not None:
+        rework_runs = {
+            e.run_id
+            for e in events
+            if e.kind == EventKind.RUN_STARTED
+            and e.run_id in run_ids
+            and (e.payload or {}).get("trigger") == "rework"
+            and e.ts > latest_review_ts
+        }
+        rework_started = bool(rework_runs)
+        rework_failed = any(
+            e.kind == EventKind.RUN_FINISHED
+            and e.run_id in rework_runs
+            and (e.payload or {}).get("decision") in _DEV_NO_PR_FAILURES
+            for e in events
+        )
     return StageSignals(
+        changes_requested=changes_requested,
+        rework_rounds=rework_rounds,
+        rework_started=rework_started,
+        rework_failed=rework_failed,
         has_refined_spec=has_refined_spec,
         has_plan=has_plan,
         has_open_pr=has_open_pr,
@@ -396,7 +476,7 @@ def _is_dev_run_started(payload: dict) -> bool:
     focus = payload.get("focus") or ""
     return not any(
         focus.startswith(prefix)
-        for prefix in ("design:", "requirements:", "review:")
+        for prefix in ("design:", "requirements:", "review:", "rework:", "ci-fix:")
     )
 
 

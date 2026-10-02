@@ -96,6 +96,9 @@ class RunConfig:
     max_turns_per_proposal: int = 8
     issue_number: int | None = None
     pr_number: int | None = None
+    provider: str | None = None
+    """Anbieter des Work-Trackers (``github``/``azure_devops``); wird nur ins
+    ``RunStarted``-Event gespiegelt (1.1), der Runner nutzt ihn nicht."""
 
     agents: list[str] = field(
         default_factory=lambda: ["architect", "developer", "tester"]
@@ -259,6 +262,7 @@ class SequentialRunner:
                 issue_number=self.config.issue_number,
                 pr_number=self.config.pr_number,
                 max_iterations=self.config.max_iterations,
+                provider=self.config.provider,
             ),
         )
 

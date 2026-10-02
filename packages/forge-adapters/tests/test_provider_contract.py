@@ -220,6 +220,14 @@ def test_push_branch_never_forces(provider: Provider) -> None:
     assert all("--force" not in c and "-f" not in c for c in calls)
 
 
+def test_push_onto_existing_branch_only_for_forge_branches(provider: Provider) -> None:
+    provider.code_host.push_branch(branch="forge/new", target="forge/pr-head")
+    with pytest.raises(CodeHostError, match="non-forge"):
+        provider.code_host.push_branch(branch="forge/new", target="main")
+    with pytest.raises(CodeHostError):
+        provider.code_host.push_branch(branch="forge/new", target="feature/human")
+
+
 def test_ci_helpers_fail_open(provider: Provider) -> None:
     assert provider.code_host.ci_failure_summary(424242) == ""
     assert provider.code_host.ref_ci_status("main") in {

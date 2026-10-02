@@ -23,6 +23,7 @@ from forge_adapters.base import (
     OpenChange,
     PRCreationResult,
     PRMetadata,
+    git_push_argv,
 )
 from forge_adapters.github.pr import (
     GitHubError,
@@ -66,14 +67,13 @@ class GitHubCodeHost:
 
     # --- Branch + PR ----------------------------------------------------
 
-    def push_branch(self, *, branch: str, remote: str = "origin") -> None:
-        result = self._run(
-            ["git", "push", "-u", remote, branch], cwd=str(self.repo_root), **_SUBPROCESS_KW
-        )
+    def push_branch(
+        self, *, branch: str, remote: str = "origin", target: str | None = None
+    ) -> None:
+        argv = git_push_argv(branch=branch, remote=remote, target=target)
+        result = self._run(argv, cwd=str(self.repo_root), **_SUBPROCESS_KW)
         if result.returncode != 0:
-            raise GitHubError(
-                f"git push -u {remote} {branch} failed: {(result.stderr or '').strip()}"
-            )
+            raise GitHubError(f"{' '.join(argv)} failed: {(result.stderr or '').strip()}")
 
     def open_change(
         self,

@@ -97,6 +97,26 @@ class WorktreeManager:
 
         return Worktree(path=path, branch=branch, base_commit=base_commit)
 
+    def fetch_remote_branch(self, branch: str, *, remote: str = "origin") -> str:
+        """Holt ``<remote>/<branch>`` und liefert den Remote-Tracking-Ref.
+
+        Basis für Nacharbeits-/CI-Fix-Runs auf einem bestehenden PR-Branch
+        (Conductor L1/L2): der Run startet mit ``base_ref`` = diesem Ref auf
+        einem frischen ``forge/<run_id>``-Branch; der Caller pusht das Ergebnis
+        fast-forward auf ``branch`` zurück. Nur der lokale Tracking-Ref wird
+        aktualisiert — kein Push, kein Eingriff in den Remote.
+        """
+        ref = f"refs/remotes/{remote}/{branch}"
+        result = self._run(
+            ["git", "fetch", remote, f"+refs/heads/{branch}:{ref}"],
+            cwd=self.repo_root,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git fetch {remote} {branch} failed: {result.stderr.strip()}"
+            )
+        return ref
+
     def attach(self, *, run_id: str) -> Worktree:
         """Hängt sich an einen BESTEHENDEN Worktree (Resume nach Usage-Limit).
 

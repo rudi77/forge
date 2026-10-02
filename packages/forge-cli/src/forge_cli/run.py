@@ -444,6 +444,8 @@ def execute_run(
         issue_number=issue_number,
         pr_number=pr_number,
         agents=roster,
+        # Nur Tracker-getriebene Runs (Issue-Bezug) tragen einen Anbieter.
+        provider=ctx.spec.provider.tracker if issue_number is not None else None,
     )
 
     if announce:

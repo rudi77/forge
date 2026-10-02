@@ -194,6 +194,12 @@ def execute_pr_review(
             except CodeHostError as exc:
                 result.merge_error = str(exc)
 
+        reasoning_blob: str | None = None
+        if outcome.reasoning.strip():
+            try:
+                reasoning_blob = ctx.open_blobs().put_text(outcome.reasoning)
+            except OSError:
+                reasoning_blob = None
         store.append(
             build_event(
                 kind=EventKind.PR_REVIEWED,
@@ -217,6 +223,7 @@ def execute_pr_review(
                     merge_blocked_reason=(
                         None if result.merged else (result.merge_error or decision.reason)
                     ),
+                    reasoning_blob=reasoning_blob,
                 ),
             )
         )

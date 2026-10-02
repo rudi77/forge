@@ -103,6 +103,24 @@ class StageSignals:
     """Ein ``ReleaseTagged`` liegt vor — forge hat Tag + Release erzeugt
     (Advance-Signal release→done; opt-in ``capabilities.create_release``)."""
 
+    changes_requested: bool = False
+    """L1: das jüngste ``PRReviewed`` des offenen PRs ist ``request_changes``
+    UND noch aktuell (kein Commit seit dem Review). Schickt das Item von ``qa``
+    zurück nach ``in-dev`` und hält es dort, bis ein Nacharbeits-Run gepusht
+    hat (dann ist der Review veraltet → ``in-dev → qa`` → frisches Review)."""
+
+    rework_rounds: int = 0
+    """L1: Anzahl ``request_changes``-Reviews über alle PRs des Items. Über
+    ``MAX_REWORK_ROUNDS`` eskaliert der Conductor nach ``blocked``."""
+
+    rework_started: bool = False
+    """L1: seit dem jüngsten Review wurde bereits ein Nacharbeits-Run gestartet
+    (in-flight oder fertig) → nicht erneut dispatchen."""
+
+    rework_failed: bool = False
+    """L1: ein Nacharbeits-Run seit dem jüngsten Review endete ohne Ergebnis
+    (nichts gepusht) → eskalieren statt endlos neu zu versuchen."""
+
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
 # Advance-Auslöser produziert (``design`` → architect-Team → ``PlanProposed`` →
@@ -158,6 +176,11 @@ def can_transition(frm: Stage, to: Stage) -> bool:
     return to in ALLOWED_TRANSITIONS.get(frm, frozenset())
 
 
+# L1: so viele request_changes-Runden darf ein Item durchlaufen, bevor der
+# Conductor nach ``blocked`` eskaliert (Roadmap E3: erst Konstante).
+MAX_REWORK_ROUNDS: int = 2
+
+
 def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     """Die nächste *automatische* Stage + Begründung, ohne Dependency-/
     Dispatch-Logik.
@@ -165,8 +188,11 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     Deckt nur die event-getriebenen Übergänge ab:
       - requirements → design   sobald die Akzeptanzkriterien verdichtet sind
       - design       → ready     sobald ein Plan vorliegt
-      - in-dev       → qa         sobald ein PR geöffnet wurde
+      - in-dev       → qa         sobald ein PR offen ist und kein aktuelles
+                                  ``request_changes`` mehr gilt
       - qa           → release    sobald der PR gemergt wurde
+      - qa           → in-dev     bei aktuellem ``request_changes`` (L1)
+      - qa           → blocked    nach mehr als ``MAX_REWORK_ROUNDS`` Runden
       - release      → done        sobald Tag + Release erzeugt sind
 
     ``ready → in-dev`` passiert beim DISPATCH (Conductor, mit Kapazität +
@@ -177,10 +203,18 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
         return Stage.DESIGN, "requirements_refined"
     if stage == Stage.DESIGN and signals.has_plan:
         return Stage.READY, "plan_proposed"
-    if stage == Stage.IN_DEV and signals.has_open_pr:
+    if (
+        stage == Stage.IN_DEV
+        and signals.has_open_pr
+        and not signals.changes_requested
+    ):
         return Stage.QA, "pr_created"
     if stage == Stage.QA and signals.has_merged_pr:
         return Stage.RELEASE, "pr_merged"
+    if stage == Stage.QA and signals.changes_requested:
+        if signals.rework_rounds > MAX_REWORK_ROUNDS:
+            return Stage.BLOCKED, "rework_exhausted"
+        return Stage.IN_DEV, "review_changes_requested"
     if stage == Stage.RELEASE and signals.release_done:
         return Stage.DONE, "released"
     return stage, ""

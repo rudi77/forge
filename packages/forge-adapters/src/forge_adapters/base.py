@@ -90,6 +90,23 @@ class LabelReport:
     created: list[str] = field(default_factory=list)
 
 
+def git_push_argv(*, branch: str, remote: str = "origin", target: str | None = None) -> list[str]:
+    """argv für einen forge-Push. Zwei harte Leitplanken, anbieter-neutral:
+
+    * nie ``--force`` (``push_force`` ist kategorisch verboten),
+    * ein ``target`` (Push auf fremden Branch-Namen) nur auf ``forge/*`` —
+      forge schreibt nie in menschliche Branches oder ``main``.
+    """
+    if target is None:
+        return ["git", "push", "-u", remote, branch]
+    if not target.startswith("forge/"):
+        raise CodeHostError(
+            f"refusing to push onto non-forge branch {target!r} "
+            "(only forge/* branches may be updated by forge)"
+        )
+    return ["git", "push", remote, f"{branch}:refs/heads/{target}"]
+
+
 @runtime_checkable
 class WorkTracker(Protocol):
     """Work-Items lesen und schreiben (Issues, Work Items)."""
@@ -145,8 +162,14 @@ class CodeHost(Protocol):
 
     provider: str
 
-    def push_branch(self, *, branch: str, remote: str = "origin") -> None:
-        """``git push -u <remote> <branch>`` — nie ``--force``."""
+    def push_branch(
+        self, *, branch: str, remote: str = "origin", target: str | None = None
+    ) -> None:
+        """``git push -u <remote> <branch>`` — nie ``--force``.
+
+        ``target`` gesetzt → ``git push <remote> <branch>:refs/heads/<target>``
+        (Nacharbeit auf einem bestehenden PR-Branch). git lehnt einen
+        Nicht-Fast-Forward ab; forge erzwingt nie."""
         ...
 
     def open_change(
@@ -218,4 +241,5 @@ __all__ = [
     "ReadyIssue",
     "TrackerError",
     "WorkTracker",
+    "git_push_argv",
 ]

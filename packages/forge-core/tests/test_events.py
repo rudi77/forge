@@ -47,7 +47,7 @@ def test_build_event_stamps_payload_schema_version() -> None:
         ),
         **COMMON,
     )
-    assert evt.payload_schema_version == "1.0"
+    assert evt.payload_schema_version == "1.1"
     assert evt.kind is EventKind.RUN_STARTED
 
 
@@ -244,3 +244,21 @@ def test_cost_usd_preserves_precision() -> None:
         **COMMON,
     )
     assert evt.cost_usd == Decimal("0.0185")
+
+
+def test_additive_schema_bumps_read_old_payloads() -> None:
+    """RunStarted 1.1 / PRReviewed 1.1 / WorkItemBlocked 1.2 sind additiv:
+    alte Payloads ohne die neuen Felder validieren weiter."""
+    from forge_core.events import PRReviewedPayload, WorkItemBlockedPayload
+
+    old_run = RunStartedPayload.model_validate(
+        {"trigger": "issue_label", "strategy": "sequential", "config_hash": "c"}
+    )
+    assert old_run.provider is None
+    assert RunStartedPayload(trigger="rework", strategy="sequential", config_hash="c")
+    old_review = PRReviewedPayload.model_validate(
+        {"pr_number": 1, "verdict": "approve", "score": 0.9, "ci_status": "pass",
+         "merged": True}
+    )
+    assert old_review.reasoning_blob is None
+    assert WorkItemBlockedPayload(issue_number=1, kind="file_conflict").kind == "file_conflict"

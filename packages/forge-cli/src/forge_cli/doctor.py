@@ -138,10 +138,13 @@ def _check_binary(
 def _check_api_key() -> Finding:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return Finding("env", "ok", "ANTHROPIC_API_KEY is set")
+    # Kein harter Fehler: `claude` kann auch über `claude login` (Abo)
+    # authentifiziert sein — dann braucht es keinen API-Key.
     return Finding(
         "env",
-        "error",
-        "ANTHROPIC_API_KEY is not set — `forge run` (without --dry-run) will fail",
+        "warn",
+        "ANTHROPIC_API_KEY is not set — fine if `claude` is logged in "
+        "(`claude login`), otherwise `forge run` will fail",
     )
 
 

@@ -165,12 +165,13 @@ def test_doctor_judge_check() -> None:
     assert _check_judge(enabled_with_gate).level == "ok"
 
 
-def test_doctor_fails_without_api_key(mini_repo: Path, monkeypatch) -> None:
+def test_doctor_warns_without_api_key(mini_repo: Path, monkeypatch) -> None:
+    """Fehlender Key ist nur eine Warnung: `claude login` (Abo) reicht auch."""
     monkeypatch.chdir(mini_repo)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     result = runner.invoke(app, ["doctor"])
-    assert result.exit_code == 1
     assert "ANTHROPIC_API_KEY" in result.stdout
+    assert "claude login" in result.stdout
 
 
 def test_doctor_errors_on_missing_spec(tmp_path: Path, monkeypatch) -> None:

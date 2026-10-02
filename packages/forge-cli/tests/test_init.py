@@ -60,3 +60,32 @@ def test_forge_init_does_not_clobber_existing_config(tmp_path, monkeypatch):
     assert sentinel in cfg.read_text(encoding="utf-8"), (
         "forge init darf eine existierende Config nicht überschreiben"
     )
+
+
+def test_forge_init_spec_is_valid_and_doctor_runs(tmp_path, monkeypatch):
+    """Die erzeugte Spec lädt fehlerfrei — `forge doctor` startet ohne Traceback."""
+    import subprocess
+
+    from forge_core.spec import load_spec
+
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    spec = load_spec(tmp_path / ".forge" / "project.yaml")
+    assert spec.name == tmp_path.name
+    assert spec.capabilities.create_work_items is False
+    result = runner.invoke(app, ["doctor"])
+    assert "loaded" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_invalid_spec_is_reported_not_crashed(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".forge").mkdir()
+    (tmp_path / ".forge" / "project.yaml").write_text("name: x\nspec_version: '1'\n")
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert "invalid spec" in result.output

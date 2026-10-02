@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import yaml
 from forge_core.blobs import BlobStore
-from forge_core.spec import ProjectSpec, load_spec
+from forge_core.spec import ProjectSpec, SpecValidationError, load_spec
 from forge_core.store import EventStore
+from pydantic import ValidationError
 from rich.console import Console
 
 if TYPE_CHECKING:
@@ -108,7 +110,10 @@ def load_context(
             f"Run `forge init` to create one or pass --spec."
         )
 
-    spec = load_spec(actual_spec)
+    try:
+        spec = load_spec(actual_spec)
+    except (SpecValidationError, ValidationError, yaml.YAMLError) as exc:
+        raise ContextError(f"invalid spec {actual_spec}:\n{exc}") from exc
     return ForgeContext(
         repo_root=repo,
         forge_dir=forge_dir,

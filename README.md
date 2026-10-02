@@ -206,6 +206,13 @@ forge replay <run_id>       # Timeline eines Runs
 
 > ⚠️ **Greenfield-Falle (rot→grün):** Bei leeren `scores` und bereits grüner Baseline verwirft forge eine neue (ebenfalls grüne) Generation als `no_improvement`. Ein **neues** Feature wird nur behalten, wenn ein Gate von **rot auf grün** springt — also einen vorab geschriebenen, fehlschlagenden Akzeptanztest grün macht (oder per opt-in LLM-Judge, siehe Spec v0.5). Details: [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) (Abschnitt „Features bauen — die rot→grün-Regel").
 
+## Installation auf einer anderen Maschine
+
+Kurzfassung: **Windows** → `forge-setup.exe` aus den GitHub-Releases (bzw. dem
+CI-Artefakt `forge-windows-x64`) ausführen, ohne Adminrechte; forge landet im
+PATH. Voraussetzungen (git, `claude`, `gh`/`az`) und Linux/macOS:
+[`docs/INSTALL.md`](docs/INSTALL.md).
+
 ## Binary bauen
 
 ```bash
@@ -213,7 +220,7 @@ uv run --with pyinstaller python packaging/build_binary.py
 # Ergebnis: dist/forge  (Linux/macOS)  bzw.  dist/forge.exe  (Windows)
 ```
 
-Die CI (`.github/workflows/ci.yml`) baut bei jedem Push die `forge.exe` auf einem Windows-Runner und lädt sie als Artefakt hoch. Tag-Pushes (`v*`) hängen das Binary an ein GitHub-Release.
+Die CI (`.github/workflows/ci.yml`) baut bei jedem Push `forge.exe` **und den Installer `forge-setup.exe`** (Inno Setup, `packaging/windows/forge.iss`) auf einem Windows-Runner, macht einen Smoke-Test (`init` + `doctor`) und lädt beides als Artefakt hoch. Tag-Pushes (`v*`) hängen beide Dateien an ein GitHub-Release.
 
 ## Repo-Layout
 

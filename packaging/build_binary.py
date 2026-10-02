@@ -18,6 +18,10 @@ Warum die expliziten Flags:
   Subcommands teils lazy, der Bundler sieht sie sonst nicht.
 - `--copy-metadata duckdb`: duckdb liest seine Version über
   `importlib.metadata`; ohne die Metadaten crasht der Import im Bundle.
+- `--collect-data` für forge_execute (Subagent-Templates `*.md`),
+  forge_adapters (GitHub-Action-/Azure-Pipeline-Templates `*.yml`) und
+  tzdata (IANA-Zeitzonen für das Limit-Reset-Parsing — Windows hat keine).
+  Ohne sie startet das Binary, scheitert aber erst mitten im ersten Run.
 """
 
 from __future__ import annotations
@@ -48,6 +52,12 @@ def build(*, onefile: bool = True, clean: bool = True) -> None:
         "forge_cli",
         "--copy-metadata",
         "duckdb",
+        "--collect-data",
+        "forge_execute",
+        "--collect-data",
+        "forge_adapters",
+        "--collect-data",
+        "tzdata",
         "--distpath",
         str(ROOT / "dist"),
         "--workpath",

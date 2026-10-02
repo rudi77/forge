@@ -141,6 +141,10 @@ class RunResult:
     branch: str | None = None
     final_commit: str | None = None
     final_diff: str | None = None
+    workitems_blocks: list[str] = field(default_factory=list)
+    """Rohe ``FORGE-WORKITEMS``-Blöcke aller Proposals dieses Runs (Roadmap
+    A2). Der Runner legt nie selbst Items an — forge-cli (Loop 2) parst sie und
+    effektiert über den Work-Tracker, gegated durch ``create_work_items``."""
 
 
 # --- Runner --------------------------------------------------------------
@@ -202,6 +206,7 @@ class SequentialRunner:
         self._baseline_gate_results: dict[str, bool] | None = None
         self._kept_outcomes: list[GenerationOutcome] = []
         self._all_outcomes: list[GenerationOutcome] = []
+        self._workitems_blocks: list[str] = []
         # Gesetzt, sobald ein propose-Aufruf in ein Usage-/Session-Limit lief —
         # trägt den Resume-Anker (session_id, reset_at). Beendet den Run als
         # `rate_limited` statt `no_improvement` (Mantra 1: echter Zustand).
@@ -341,6 +346,7 @@ class SequentialRunner:
             run_id=self.run_id,
             decision=decision,
             generations=list(self._all_outcomes),
+            workitems_blocks=list(self._workitems_blocks),
             final_score=final_score,
             score_delta=score_delta,
             total_cost_usd=self._total_cost,
@@ -400,6 +406,7 @@ class SequentialRunner:
             run_id=self.run_id,
             decision="rate_limited",
             generations=list(self._all_outcomes),
+            workitems_blocks=list(self._workitems_blocks),
             final_score=None,
             score_delta=None,
             total_cost_usd=self._total_cost,
@@ -812,6 +819,9 @@ class SequentialRunner:
         # Kuratierte Lektionen (Gedächtnis): der Master meldet sie optional im
         # ---FORGE-LESSONS-...---Block. Read-only-Auswertung in den Memory-Block
         # späterer Runs; speist NIE den Operator-Seed zurück (Mantra 3).
+        if result.workitems_block:
+            self._workitems_blocks.append(result.workitems_block)
+
         if result.lessons_block:
             self._emit_lessons_learned(
                 lessons_block=result.lessons_block,

@@ -141,6 +141,11 @@ class CapabilitiesConfig(BaseModel):
     + GitHub-Release zu erzeugen (``gh release create``). Default ``false``.
     Erlaubt KEIN push-to-main/force (die bleiben kategorisch deny) — ein
     Release schreibt einen neuen Ref, fasst weder main-History noch force an."""
+    create_work_items: bool = False
+    """Opt-in (Roadmap A): forge darf selbst Work-Items anlegen (Epic-Kinder,
+    Funde aus Runs, Bugs bei rotem ``main``-CI, Schedule-Epics). Zusätzlich
+    durch ``intake``-Obergrenzen und die Freigabe-Stage ``forge:proposed``
+    begrenzt."""
     push_to_main: Literal[False] = False
     push_force: Literal[False] = False
 
@@ -307,6 +312,41 @@ class ReleaseConfig(BaseModel):
     """Tagging ist OK (kein Code-Change). Merge ist es nicht."""
 
     changelog: NonEmptyStr | None = None
+
+
+IntakeKind = Literal["epic", "feature", "story", "bug", "task", "spec"]
+
+
+class IntakeConfig(BaseModel):
+    """Wie forge Arbeit erzeugt und Specs veröffentlicht (Roadmap A).
+
+    Eine Fabrik, die ihre eigene Arbeit erzeugt, ist die teuerste mögliche
+    Endlosschleife — daher harte Obergrenzen und per Default ein menschliches
+    Gate (``forge:proposed``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_items_per_epic: int = Field(default=8, gt=0)
+    """Höchstens so viele Items pro Zerlegung/Fund-Block."""
+
+    max_items_per_day: int = Field(default=20, gt=0)
+    """Höchstens so viele von forge angelegte Items in 24 h (alle Quellen)."""
+
+    auto_accept: list[IntakeKind] = Field(default_factory=list)
+    """Typen, die ohne Freigabe direkt in ``forge:requirements`` (bzw.
+    ``forge:epic``) starten. Leer = alles wartet in ``forge:proposed``. Kinder
+    eines vom Menschen freigegebenen Epics gelten immer als freigegeben."""
+
+    watch_main_ci: NonEmptyStr | None = None
+    """Branch, dessen CI der Conductor pro Tick prüft (z.B. ``main``). Rot →
+    ein Bug-Item (höchstens eins pro Tag). ``None`` = aus."""
+
+    spec_dir: NonEmptyStr = "docs/specs"
+    """Zielordner für Feature-Specs (Spec-PR)."""
+
+    spec_publish: Literal["auto", "pr", "comment", "off"] = "auto"
+    """``auto``: Features/Epics/Stories als Spec-PR, Bugs/Tasks als Kommentar.
+    ``pr``/``comment`` erzwingen eine Form, ``off`` veröffentlicht nicht."""
 
 
 class TriageConfig(BaseModel):
@@ -554,6 +594,10 @@ class ProjectSpec(BaseModel):
     """Optionaler Project-Board-Config; aktiviert ``forge board-loop`` (v0.4)."""
     triage: TriageConfig = Field(default_factory=TriageConfig)
     """Pre-Phase im board-loop. Default: disabled. Siehe :class:`TriageConfig`."""
+    intake: IntakeConfig = Field(default_factory=IntakeConfig)
+    """Arbeit erzeugen + Specs veröffentlichen (Roadmap A). Wirksam nur mit
+    ``capabilities.create_work_items`` (Items) bzw. ``comment_issue``/
+    ``open_pr`` (Spec-Veröffentlichung)."""
     judge: JudgeConfig = Field(default_factory=JudgeConfig)
     """LLM-Judge-Verifikationsphase pro Generation. Default: disabled.
     Siehe :class:`JudgeConfig`."""

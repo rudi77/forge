@@ -34,6 +34,12 @@ from forge_cli.stages import (
 # das konfigurierbar, wandert es als optionales Feld in die Conductor-Config.
 MAX_DEV_RETRIES: int = 2
 
+# A1: Label, das einen Spec-PR (docs/specs/…) von einem Code-PR unterscheidet.
+SPEC_PR_LABEL = "forge:spec"
+
+# A2: so viele Zerlegungs-Runs ohne erzeugte Items, bevor ein Epic eskaliert.
+MAX_EPIC_RUNS: int = 2
+
 # Decisions eines Dev-Runs, die als "kein PR, fehlgeschlagen" zählen. NICHT
 # enthalten: ``pr_created`` (Erfolg) und ``rate_limited`` (gehört dem
 # Resume-Pfad, ``derive_pending_resumes``).
@@ -164,6 +170,20 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             # review_done gegated: ein bereits gereviewter (aber nicht
             # gemergter) PR wird nicht jeden Tick erneut reviewt.
             if w.stage == Stage.QA and w.signals.review_done:
+                continue
+            # A1: Spec ist verdichtet, wartet nur noch auf den Spec-PR-Merge
+            # → kein erneuter requirements-Run.
+            if w.stage == Stage.REQUIREMENTS and w.signals.has_refined_spec:
+                continue
+            # A2: Zerlegung schlug wiederholt fehl → eskalieren statt Retry.
+            if w.stage == Stage.EPIC and w.signals.epic_failed_runs >= MAX_EPIC_RUNS:
+                blocked.append(
+                    Blocked(w.number, "error", (), "epic decomposition produced no items")
+                )
+                transitions.append(
+                    StageTransition(w.number, Stage.EPIC, Stage.BLOCKED, "epic_no_items")
+                )
+                effective[w.number] = Stage.BLOCKED
                 continue
             # L2: kein (teures) Review, solange CI noch läuft oder rot ist —
             # rot geht über advance in den CI-Fix-Pfad.
@@ -386,12 +406,23 @@ def derive_signals(
         and not (e.payload or {}).get("insufficient_context", False)
         for e in events
     )
-    pr_numbers = {
+    created = [
+        e for e in events if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+    ]
+    # A1: Spec-PRs (Label forge:spec) sind keine Code-PRs — sie gaten nur
+    # requirements → design und dürfen in-dev/qa/release nie auslösen.
+    spec_prs = {
         (e.payload or {}).get("pr_number")
-        for e in events
-        if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+        for e in created
+        if SPEC_PR_LABEL in ((e.payload or {}).get("labels") or [])
     }
+    pr_numbers = {(e.payload or {}).get("pr_number") for e in created} - spec_prs
     pr_numbers.discard(None)
+    spec_prs.discard(None)
+    merged_numbers = {
+        (e.payload or {}).get("pr_number") for e in events if e.kind == EventKind.PR_MERGED
+    }
+    spec_pending = bool(spec_prs) and not spec_prs <= merged_numbers
     has_open_pr = bool(pr_numbers)
     has_merged_pr = any(
         e.kind == EventKind.PR_MERGED
@@ -485,7 +516,29 @@ def derive_signals(
         ci_fix_started = bool(current) and (
             head_committed_at is not None or in_flight or ci_fix_failed
         )
+    # A2: Epic-Zerlegung (Kinder tragen parent = Epic im WorkItemCreated).
+    has_decomposition = any(
+        e.kind == EventKind.WORK_ITEM_CREATED
+        and (e.payload or {}).get("parent") == issue_number
+        and (e.payload or {}).get("source") == "epic_decomposition"
+        for e in events
+    )
+    epic_runs = {
+        e.run_id
+        for e in events
+        if e.kind == EventKind.RUN_STARTED
+        and e.run_id in run_ids
+        and str((e.payload or {}).get("focus") or "").startswith("epic:")
+    }
+    epic_failed_runs = (
+        0
+        if has_decomposition
+        else sum(1 for e in events if e.kind == EventKind.RUN_FINISHED and e.run_id in epic_runs)
+    )
     return StageSignals(
+        spec_pending=spec_pending,
+        has_decomposition=has_decomposition,
+        epic_failed_runs=epic_failed_runs,
         ci_status=ci_status,
         ci_fix_attempts=len(ci_runs),
         ci_fix_started=ci_fix_started,
@@ -501,6 +554,38 @@ def derive_signals(
         review_done=review_done,
         release_done=release_done,
     )
+
+
+def epic_children(events: list, epic_number: int) -> list[int]:
+    """Kind-Items eines Epics (aus ``WorkItemCreated.parent``), sortiert."""
+    return sorted(
+        {
+            int((e.payload or {}).get("number"))
+            for e in events
+            if e.kind == EventKind.WORK_ITEM_CREATED
+            and (e.payload or {}).get("parent") == epic_number
+        }
+    )
+
+
+def spec_pr_for_issue(events: list, issue_number: int) -> int | None:
+    """Offener (nicht gemergter) Spec-PR eines Items, oder ``None`` (A1)."""
+    run_ids = {
+        e.run_id
+        for e in events
+        if e.kind == EventKind.RUN_STARTED
+        and (e.payload or {}).get("issue_number") == issue_number
+    }
+    merged = {(e.payload or {}).get("pr_number") for e in events if e.kind == EventKind.PR_MERGED}
+    specs = [
+        (e.payload or {}).get("pr_number")
+        for e in events
+        if e.kind == EventKind.PR_CREATED
+        and e.run_id in run_ids
+        and SPEC_PR_LABEL in ((e.payload or {}).get("labels") or [])
+        and (e.payload or {}).get("pr_number") not in merged
+    ]
+    return max(specs) if specs else None
 
 
 def pr_number_for_issue(events: list, issue_number: int) -> int | None:
@@ -522,7 +607,9 @@ def pr_number_for_issue(events: list, issue_number: int) -> int | None:
     pr_numbers = {
         (e.payload or {}).get("pr_number")
         for e in events
-        if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+        if e.kind == EventKind.PR_CREATED
+        and e.run_id in run_ids
+        and SPEC_PR_LABEL not in ((e.payload or {}).get("labels") or [])
     }
     pr_numbers.discard(None)
     merged = {
@@ -547,7 +634,7 @@ def _is_dev_run_started(payload: dict) -> bool:
     focus = payload.get("focus") or ""
     return not any(
         focus.startswith(prefix)
-        for prefix in ("design:", "requirements:", "review:", "rework:", "ci-fix:")
+        for prefix in ("design:", "requirements:", "review:", "rework:", "ci-fix:", "epic:")
     )
 
 

@@ -60,6 +60,9 @@ class EventKind(StrEnum):
     # künftige Runs orientiert (Konventionen, Stolperfallen, Patterns). Nicht
     # aus anderen Events ableitbar — Selbstauskunft des Master-Agenten.
     LESSON_LEARNED = "LessonLearned"
+    # Arbeit erzeugen: forge hat ein Work-Item selbst angelegt (Epic-Zerlegung,
+    # Run-Fund, CI rot auf main, Schedule) — Roadmap A4.
+    WORK_ITEM_CREATED = "WorkItemCreated"
 
 
 class EventValidationError(ValueError):

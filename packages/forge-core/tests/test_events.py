@@ -31,7 +31,7 @@ def test_all_event_kinds_have_registered_payload_schemas() -> None:
     # + Pipeline-Ende vorne: RequirementsRefined = 24.
     # + Pipeline-Ende hinten: ReleaseTagged = 25.
     # + Gedächtnis: LessonLearned = 26.
-    assert len(EventKind) == 26
+    assert len(EventKind) == 27
     for kind in EventKind:
         assert kind in _PAYLOAD_REGISTRY, f"missing schema for {kind}"
 

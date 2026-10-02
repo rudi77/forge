@@ -60,8 +60,10 @@ from forge_cli.conductor import (
     derive_dev_failure,
     derive_pending_resumes,
     derive_signals,
+    epic_children,
     pr_number_for_issue,
     run_conductor_tick,
+    spec_pr_for_issue,
 )
 from forge_cli.dependencies import parse_depends_on
 from forge_cli.heartbeat import HeartbeatStats, TickResult, run_heartbeat
@@ -75,6 +77,13 @@ from forge_cli.runtime import (
     load_context,
 )
 from forge_cli.stages import Stage, stage_of
+from forge_cli.workgen import (
+    intake_blocks,
+    publish_spec,
+    refined_spec_text,
+    tick_sources,
+    with_refined_spec,
+)
 
 
 def board_loop_command(
@@ -409,6 +418,40 @@ class _PassResult:
     skipped: int
 
 
+@contextlib.contextmanager
+def _store_scope(ctx: ForgeContext, store: EventStore | None):
+    """Liefert ``store`` oder öffnet/schließt einen eigenen (Single-Pass)."""
+    if store is not None:
+        yield store
+        return
+    own = ctx.open_store()
+    try:
+        yield own
+    finally:
+        own.close()
+
+
+def _spec_for(ctx: ForgeContext, store: EventStore | None, issue_number: int) -> str:
+    """A1: verdichtete Akzeptanzkriterien des Items (leer, wenn keine)."""
+    with _store_scope(ctx, store) as s:
+        return refined_spec_text(s, ctx.open_blobs(), issue_number)
+
+
+def _intake_run_findings(
+    ctx: ForgeContext, store: EventStore | None, issue: ReadyIssue, outcome: Any
+) -> None:
+    """A2: ``FORGE-WORKITEMS``-Funde eines Runs → Items (best-effort)."""
+    result = getattr(outcome, "result", None)
+    blocks = list(getattr(result, "workitems_blocks", None) or [])
+    if not blocks:
+        return
+    with _store_scope(ctx, store) as s:
+        intake_blocks(
+            ctx, store=s, run_id=result.run_id, blocks=blocks, source="run_finding",
+            origin_issue=issue.number,
+        )
+
+
 def _dispatch_issues(
     *,
     ctx: ForgeContext,
@@ -450,13 +493,16 @@ def _dispatch_issues(
         # ist, bestimmt, welche Arbeitspferde mitwirken. Kein Treffer → der
         # multi_agent-Default in execute_run greift.
         roster = _roster_for_issue(ctx.spec, issue.labels)
-        prompt = wrap_issue_body(title=issue.title, body=issue.body)
+        spec_md = _spec_for(ctx, store, issue.number)
+        prompt = with_refined_spec(wrap_issue_body(title=issue.title, body=issue.body), spec_md)
         # Der vom Menschen geschriebene Issue-Text IST das Akzeptanz-
         # kriterium für den LLM-Judge (spec.judge.enabled). Wir geben den
         # rohen Titel+Body durch, nicht den UNTRUSTED-gewrappten Prompt —
         # der Judge bewertet gegen die Anforderung, nicht gegen die
-        # Sicherheits-Hülle.
-        acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+        # Sicherheits-Hülle. A1: die verdichtete Spec ergänzt ihn.
+        acceptance = with_refined_spec(
+            f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}", spec_md
+        )
         console.print(
             f"\n[bold cyan]>>> board-loop[/bold cyan] dispatching issue "
             f"#{issue.number} [italic]{issue.title}[/italic]"
@@ -507,6 +553,7 @@ def _dispatch_issues(
 
         dispatched += 1
         summaries.append(_summary_row_from_outcome(issue, outcome))
+        _intake_run_findings(ctx, store, issue, outcome)
 
         if outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}:
             err_console.print(
@@ -710,6 +757,15 @@ def _dispatch_requirements_run(
             f"[yellow]board-loop bailing[/yellow]: requirements run decision = "
             f"{outcome.result.decision}"
         )
+    # A1: verdichtete Spec als Artefakt veröffentlichen (Spec-PR oder
+    # Kommentar). Ohne Veröffentlichung bleibt sie trotzdem Akzeptanzkriterium
+    # aller späteren Runs (refined_spec_text).
+    if not bailed:
+        with _store_scope(ctx, store) as s:
+            publish_spec(
+                ctx, issue=issue, run_id=outcome.result.run_id, store=s,
+                base_ref=params.base_ref, pr_base=params.pr_base,
+            )
     return _PassResult(
         summaries=[_summary_row_from_outcome(issue, outcome)],
         bailed=bailed,
@@ -738,8 +794,11 @@ def _dispatch_design_run(
     Default. Keine Triage (das Item ist bereits past requirements).
     """
     roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
-    prompt = wrap_issue_body(title=issue.title, body=issue.body)
-    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    spec_md = _spec_for(ctx, store, issue.number)
+    prompt = with_refined_spec(wrap_issue_body(title=issue.title, body=issue.body), spec_md)
+    acceptance = with_refined_spec(
+        f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}", spec_md
+    )
     console.print(
         f"\n[bold magenta]>>> board-loop[/bold magenta] design run for issue "
         f"#{issue.number} [italic]{issue.title}[/italic] "
@@ -904,7 +963,10 @@ def _dispatch_branch_run(
     )
     if context.strip():
         prompt += "\n" + wrap_untrusted(label=context_label, text=context)
-    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    acceptance = with_refined_spec(
+        f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}",
+        _spec_for(ctx, store, issue.number),
+    )
     if context.strip():
         acceptance += f"\n\n{context_label.title()}:\n{context}"
     roster = (
@@ -949,6 +1011,7 @@ def _dispatch_branch_run(
                            dispatched=0, skipped=0)
 
     result = outcome.result
+    _intake_run_findings(ctx, store, issue, outcome)
     if result.decision == "pr_created" and result.branch:
         try:
             code_host.push_branch(branch=result.branch, target=head)
@@ -1020,6 +1083,93 @@ def _ci_fix_roster(spec) -> list[str] | None:
     ``["developer"]``), sonst der execute_run-Default."""
     cfg = getattr(getattr(spec, "triggers", None), "on_ci_failure", None)
     return list(cfg.agents) if cfg is not None else ["developer"]
+
+
+_EPIC_PREAMBLE = (
+    "This is an EPIC-DECOMPOSITION task, not an implementation task. Do NOT write "
+    "or change any code. Split the epic below into small, independently shippable "
+    "work items (each doable in one pull request), with testable acceptance "
+    "criteria in each body, explicit dependencies between them, and the file globs "
+    "each one will likely touch (items with overlapping `touches` cannot run in "
+    "parallel — keep them disjoint where you can). Return them ONLY in the "
+    "work-items block:\n\n"
+)
+
+
+def _dispatch_epic_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    params: _DispatchParams,
+    store: EventStore | None = None,
+) -> _PassResult:
+    """Dispatcht die **Epic-Zerlegung** (Roadmap A2): ein Planner-Run liefert
+    Kind-Items im ``FORGE-WORKITEMS``-Block; ``intake`` legt sie mit
+    ``parent`` = Epic an (``WorkItemCreated``) → ``has_decomposition`` →
+    ``epic → tracking``. Kinder eines vom Menschen in ``forge:epic``
+    gesetzten Epics gelten als freigegeben (starten in ``requirements``)."""
+    from forge_execute.agents.templates import WORKITEMS_FORMAT_HINT
+
+    roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
+    prompt = (
+        _EPIC_PREAMBLE
+        + "```\n" + WORKITEMS_FORMAT_HINT + "\n```\n\n"
+        + wrap_issue_body(title=issue.title, body=issue.body)
+    )
+    console.print(
+        f"\n[bold magenta]>>> board-loop[/bold magenta] epic decomposition for "
+        f"#{issue.number} [italic]{issue.title}[/italic]"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=prompt,
+            prompt_template_id="epic",
+            trigger="issue_label",
+            focus=f"epic:#{issue.number}",
+            base_ref=params.base_ref,
+            acceptance_criteria=None,
+            max_iterations=1,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=issue.number,
+            pr_number=None,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=False,
+            agents=roster,
+            create_pr=False,
+            pr_base=params.pr_base,
+            extra_labels=[],
+            pr_draft=False,
+            auto_merge=False,
+            announce=False,
+            store=store,
+        )
+    except Exception as exc:
+        err_console.print(f"[red]error[/red] in epic run for #{issue.number}: {exc}")
+        return _PassResult(
+            summaries=[_LoopSummaryRow(issue.number, issue.title, "error", None, "-", str(exc))],
+            bailed=True, dispatched=0, skipped=0,
+        )
+    blocks = list(outcome.result.workitems_blocks or [])
+    created: list[int] = []
+    if blocks:
+        with _store_scope(ctx, store) as s:
+            created = intake_blocks(
+                ctx, store=s, run_id=outcome.result.run_id, blocks=blocks,
+                source="epic_decomposition", parent=issue.number, parent_approved=True,
+            ).created
+    return _PassResult(
+        summaries=[_LoopSummaryRow(
+            issue.number, issue.title,
+            f"epic:{len(created)} items" if created else "epic:no_items",
+            None, "-", None,
+        )],
+        bailed=outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"},
+        dispatched=1, skipped=0,
+    )
 
 
 def _dispatch_resume(
@@ -1257,8 +1407,12 @@ def _dispatch_review_run(
     das nicht selbst.
     """
     from forge_execute.agents import ClaudeCodeCLIAgent
+    from forge_execute.agents.templates import extract_workitems_block
 
-    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    acceptance = with_refined_spec(
+        f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}",
+        _spec_for(ctx, store, issue.number),
+    )
     console.print(
         f"\n[bold magenta]>>> board-loop[/bold magenta] qa review for issue "
         f"#{issue.number} (PR #{pr_number}) [italic]{issue.title}[/italic]"
@@ -1294,6 +1448,14 @@ def _dispatch_review_run(
             skipped=0,
         )
 
+    # A2: nicht-blockierende Folgeaufgaben aus dem Review → Items.
+    followups = extract_workitems_block(outcome.reasoning or "")
+    if followups:
+        with _store_scope(ctx, store) as s:
+            intake_blocks(
+                ctx, store=s, run_id=str(ULID()), blocks=[followups],
+                source="review_followup", origin_issue=issue.number,
+            )
     merge_note = "merged" if outcome.merged else (outcome.merge_decision.reason or "no-merge")
     console.print(
         f"  [cyan]#{issue.number}[/cyan] review: {outcome.verdict} "
@@ -1393,6 +1555,13 @@ def _run_conductor_watch(
                 )
                 return TickResult()
 
+            # A2: deterministische Quellen (CI rot auf main, Schedules) zuerst —
+            # neu angelegte Items erscheinen ab dem nächsten Tick im Board.
+            try:
+                tick_sources(ctx, store=store, session_id=session_id, now=datetime.now(UTC))
+            except Exception as exc:  # Quellen dürfen den Tick nie killen
+                err_console.print(f"[yellow]intake sources failed[/yellow]: {exc}")
+
             events = []
             for kind in (
                 EventKind.RUN_STARTED,
@@ -1404,6 +1573,7 @@ def _run_conductor_watch(
                 EventKind.PR_MERGED,
                 EventKind.RELEASE_TAGGED,
                 EventKind.RUN_RESUME_SCHEDULED,
+                EventKind.WORK_ITEM_CREATED,
             ):
                 events.extend(store.events_by_kind(kind))
 
@@ -1453,12 +1623,32 @@ def _run_conductor_watch(
                             )
                             if merged_evt is not None:
                                 events.append(merged_evt)
+                if stage == Stage.REQUIREMENTS:
+                    # A1: Merge des Spec-PRs (meist durch einen Menschen) als
+                    # PRMerged nachtragen → spec_pending fällt → design.
+                    spec_pr = spec_pr_for_issue(events, issue.number)
+                    if spec_pr is not None:
+                        _, _, spec_state = _pr_observation(ctx, spec_pr)
+                        if spec_state == "MERGED":
+                            merged_evt = _record_observed_merge(
+                                ctx, store, events, spec_pr, session_id
+                            )
+                            if merged_evt is not None:
+                                events.append(merged_evt)
                 signals = derive_signals(
                     events,
                     issue.number,
                     head_committed_at=head_committed_at,
                     ci_status=ci_status,
                 )
+                if stage == Stage.TRACKING:
+                    children = epic_children(events, issue.number)
+                    stages_by_number = {i.number: stage_of(i.labels) for i in issues}
+                    signals = replace(
+                        signals,
+                        children_done=bool(children)
+                        and all(stages_by_number.get(c) == Stage.DONE for c in children),
+                    )
                 # A1: in-dev-Item, dessen Dev-Run keinen PR produzierte →
                 # Re-Dispatch-/Eskalations-Signale aus dem Event-Strom ableiten.
                 if stage == Stage.IN_DEV:
@@ -1521,6 +1711,10 @@ def _run_conductor_watch(
                     if order.stage == Stage.RELEASE:
                         return _dispatch_release_run(
                             ctx=ctx, issue=issue, store=store, session_id=session_id
+                        )
+                    if order.stage == Stage.EPIC:
+                        return _dispatch_epic_run(
+                            ctx=ctx, issue=issue, params=params, store=store
                         )
                     if order.stage == Stage.DESIGN:
                         return _dispatch_design_run(

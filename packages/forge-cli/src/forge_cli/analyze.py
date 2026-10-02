@@ -74,6 +74,7 @@ def _render_report(store, *, project: str, last_runs: int) -> str:
     sections.append(_section_pr_merge_rate(store))
     sections.append(_section_failure_modes(store))
     sections.append(_section_lessons(store))
+    sections.append(_section_intake(store))
     return "\n".join(sections)
 
 
@@ -299,6 +300,28 @@ def _section_lessons(store, *, limit: int = 25) -> str:
         )
         out.append(
             f"| {category} | {lesson} | {issue} | {r['times_seen']} | {last} |"
+        )
+    out.append("")
+    return "\n".join(out)
+
+
+def _section_intake(store) -> str:
+    """Roadmap A: Annahmequote der von forge erzeugten Arbeit pro Quelle."""
+    rows = store.query(
+        "SELECT source, created, reached_done, blocked, done_rate FROM factory_intake"
+    )
+    if not rows:
+        return "## Intake (forge-generated work)\n\n_no work items created by forge yet._\n"
+    out = [
+        "## Intake (forge-generated work)",
+        "",
+        "| source | created | done | blocked | done rate |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        out.append(
+            f"| {r['source']} | {r['created']} | {r['reached_done']} | {r['blocked']} "
+            f"| {r['done_rate']:.0%} |"
         )
     out.append("")
     return "\n".join(out)

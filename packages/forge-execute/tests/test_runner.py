@@ -525,3 +525,51 @@ def test_runner_blocks_capability_violation(
     assert violations[0].payload["guardrail_id"] == "forbidden_path"
 
     store.close()
+
+
+def test_runner_forwards_workitems_block_but_never_creates_items(
+    red_repo: Path, tmp_path: Path
+) -> None:
+    """Roadmap A2: der Runner reicht den FORGE-WORKITEMS-Block nur durch
+    (RunResult.workitems_blocks) — er emittiert kein WorkItemCreated (Mantra 3)."""
+    spec = _spec_for_red_repo()
+    store = EventStore(tmp_path / "events.duckdb")
+    blobs = BlobStore(tmp_path / "blobs")
+    block = "- id: A\n  kind: bug\n  title: Divide by zero in other module\n"
+
+    def fix_and_report(wt: Path, prompt: str) -> ProposalResult:
+        (wt / "src" / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n", encoding="utf-8"
+        )
+        import subprocess as sp
+
+        diff = sp.run(["git", "diff"], cwd=str(wt), capture_output=True, text=True).stdout
+        return ProposalResult(diff=diff, stop_reason="end_turn", workitems_block=block)
+
+    config = RunConfig(
+        spec=spec, project="red-repo", project_fingerprint="sha256:test",
+        factory_version="git:test", repo_root=red_repo, prompt_template_id="t1",
+        initial_prompt="Fix the failing test.", max_iterations=1,
+    )
+    result = SequentialRunner(
+        config=config, agent=MockCodingAgent(callable_=fix_and_report), store=store,
+        blobs=blobs,
+    ).run()
+    assert result.workitems_blocks == [block]
+    assert store.events_by_kind(EventKind.WORK_ITEM_CREATED) == []
+    store.close()
+
+
+def test_extract_workitems_block_and_prompt_mentions_it() -> None:
+    from forge_execute.agents.templates import (
+        WORKITEMS_BEGIN_MARKER,
+        WORKITEMS_END_MARKER,
+        build_orchestrator_prompt,
+        extract_workitems_block,
+    )
+
+    text = f"summary\n{WORKITEMS_BEGIN_MARKER}\n- id: A\n  title: x\n{WORKITEMS_END_MARKER}\n"
+    assert extract_workitems_block(text) == "- id: A\n  title: x"
+    assert extract_workitems_block("no block") is None
+    for roster in (["architect", "developer", "tester"], ["developer", "tester"]):
+        assert WORKITEMS_BEGIN_MARKER in build_orchestrator_prompt(roster)

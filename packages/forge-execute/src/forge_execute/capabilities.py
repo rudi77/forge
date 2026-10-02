@@ -33,6 +33,8 @@ CapabilityAction = Literal[
     "comment_issue",
     "close_issue",
     "merge_pr",
+    "create_release",
+    "create_work_items",
     "push_to_main",
     "push_force",
 ]

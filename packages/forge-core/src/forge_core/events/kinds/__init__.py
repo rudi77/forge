@@ -46,6 +46,10 @@ from forge_core.events.kinds.workitem import (
     WorkItemBlockedPayload,
     WorkItemStageChangedPayload,
 )
+from forge_core.events.kinds.workitem_created import (
+    WorkItemCreatedPayload,
+    WorkItemSource,
+)
 
 __all__ = [
     "BlockedKind",
@@ -79,5 +83,7 @@ __all__ = [
     "SubtaskStatus",
     "TriageDecision",
     "WorkItemBlockedPayload",
+    "WorkItemCreatedPayload",
+    "WorkItemSource",
     "WorkItemStageChangedPayload",
 ]

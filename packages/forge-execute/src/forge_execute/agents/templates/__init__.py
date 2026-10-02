@@ -265,13 +265,18 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "pattern) — NOT task-specific status or anything already obvious "
             "from the code. Omit the lines entirely if you learned nothing "
             "worth persisting.>\n"
-            f"{LESSONS_END_MARKER}\n"
+            f"{LESSONS_END_MARKER}\n\n"
+            f"{WORKITEMS_FORMAT_HINT}\n"
             "```\n\n"
             f"   The `{PLAN_BEGIN_MARKER}` / `{PLAN_END_MARKER}` and "
             f"`{AGENTS_BEGIN_MARKER}` / `{AGENTS_END_MARKER}` markers are "
             "MANDATORY and must appear on their own lines. The "
             f"`{LESSONS_BEGIN_MARKER}` / `{LESSONS_END_MARKER}` block is "
-            "optional — include it only when you have a real lesson."
+            "optional — include it only when you have a real lesson. The "
+            f"`{WORKITEMS_BEGIN_MARKER}` / `{WORKITEMS_END_MARKER}` block (YAML "
+            "list) is optional too: use it ONLY for real defects or follow-ups "
+            "you found OUTSIDE the scope of this task (do not fix them here). "
+            "Omit it when there is nothing."
         )
     else:
         steps.append(
@@ -289,6 +294,11 @@ def build_orchestrator_prompt(agents: list[str]) -> str:
             "then one sentence. Only non-obvious, lasting facts — omit if "
             "none.>\n"
             f"{LESSONS_END_MARKER}\n"
+            "```\n\n"
+            "   Optionally, for real defects/follow-ups found OUTSIDE this "
+            "task's scope (do not fix them here), add a YAML block:\n\n"
+            "```\n"
+            f"{WORKITEMS_FORMAT_HINT}\n"
             "```"
         )
 
@@ -414,6 +424,27 @@ AGENTS_END_MARKER = "---FORGE-AGENTS-END---"
 LESSONS_BEGIN_MARKER = "---FORGE-LESSONS-BEGIN---"
 LESSONS_END_MARKER = "---FORGE-LESSONS-END---"
 
+# Markers for NEW work the agent proposes (Roadmap A2): out-of-scope bugs the
+# tester/reviewer found, follow-ups, or — in an epic-decomposition run — the
+# child work items. Optional and fail-open like lessons. The runner only
+# forwards the raw block (RunResult.workitems_blocks); creating items is a
+# Loop-2 effect in forge-cli (`intake.py`) behind the opt-in capability
+# `create_work_items` — the runner never touches the tracker (Mantra 3).
+WORKITEMS_BEGIN_MARKER = "---FORGE-WORKITEMS-BEGIN---"
+WORKITEMS_END_MARKER = "---FORGE-WORKITEMS-END---"
+
+WORKITEMS_FORMAT_HINT = (
+    f"{WORKITEMS_BEGIN_MARKER}\n"
+    "- id: A                 # short local id, unique in this block\n"
+    "  kind: bug             # epic|feature|story|bug|task|spec\n"
+    "  title: <one line>\n"
+    "  depends_on: []        # local ids of items that must be done first\n"
+    "  touches: [src/x/**]   # globs of files this item will likely change\n"
+    "  body: |\n"
+    "    <what and why, with testable acceptance criteria>\n"
+    f"{WORKITEMS_END_MARKER}"
+)
+
 
 def extract_plan_from_master_output(text: str) -> str | None:
     """Extracts the architect's plan from the master claude's final output.
@@ -460,6 +491,19 @@ def extract_lessons_block(text: str) -> str | None:
     if begin == -1 or end == -1 or end <= begin:
         return None
     block = text[begin + len(LESSONS_BEGIN_MARKER) : end].strip()
+    return block or None
+
+
+def extract_workitems_block(text: str) -> str | None:
+    """Raw inner text of the ``---FORGE-WORKITEMS-...---`` block, or None.
+
+    Pure marker-slice like :func:`extract_lessons_block`; YAML parsing and all
+    guardrails live in forge-cli (``intake.parse_workitems``)."""
+    begin = text.find(WORKITEMS_BEGIN_MARKER)
+    end = text.find(WORKITEMS_END_MARKER, begin + 1) if begin != -1 else -1
+    if begin == -1 or end == -1:
+        return None
+    block = text[begin + len(WORKITEMS_BEGIN_MARKER) : end].strip()
     return block or None
 
 

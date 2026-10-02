@@ -263,6 +263,48 @@ ORDER BY last_seen DESC;
 """
 
 
+# Intake-Sicht (Roadmap A, Mantra 1): wie viel der von forge erzeugten Arbeit
+# erreicht `done`, wie viel landet in `blocked` — pro Quelle. Eine Quelle mit
+# niedriger Quote ist ein Signal, sie abzuschalten. Read-only.
+_VIEW_FACTORY_INTAKE = """
+CREATE OR REPLACE VIEW factory_intake AS
+WITH created AS (
+    SELECT
+        project,
+        json_extract_string(payload, '$.source') AS source,
+        TRY_CAST(json_extract_string(payload, '$.number') AS INTEGER) AS number
+    FROM events
+    WHERE kind = 'WorkItemCreated'
+),
+done AS (
+    SELECT DISTINCT TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER)
+        AS number
+    FROM events
+    WHERE kind = 'WorkItemStageChanged'
+      AND json_extract_string(payload, '$.to_stage') = 'forge:done'
+),
+blocked AS (
+    SELECT DISTINCT TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER)
+        AS number
+    FROM events
+    WHERE kind = 'WorkItemStageChanged'
+      AND json_extract_string(payload, '$.to_stage') = 'forge:blocked'
+)
+SELECT
+    c.project,
+    c.source,
+    COUNT(*)                                         AS created,
+    COUNT(d.number)                                  AS reached_done,
+    COUNT(b.number)                                  AS blocked,
+    CAST(COUNT(d.number) AS DOUBLE) / COUNT(*)       AS done_rate
+FROM created c
+LEFT JOIN done d ON d.number = c.number
+LEFT JOIN blocked b ON b.number = c.number
+GROUP BY c.project, c.source
+ORDER BY created DESC;
+"""
+
+
 _VIEWS = [
     _VIEW_RUNS_WITH_OUTCOMES,
     _VIEW_COST_PER_FOCUS,
@@ -271,6 +313,7 @@ _VIEWS = [
     _VIEW_FACTORY_KPIS,
     _VIEW_FACTORY_THROUGHPUT,
     _VIEW_LESSONS,
+    _VIEW_FACTORY_INTAKE,
 ]
 
 

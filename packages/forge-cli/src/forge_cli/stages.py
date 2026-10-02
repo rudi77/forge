@@ -27,6 +27,13 @@ class Stage(StrEnum):
     RELEASE = "forge:release"
     DONE = "forge:done"
     BLOCKED = "forge:blocked"
+    # Roadmap A: Arbeit erzeugen. ``epic`` wird von einem Planner-Run in
+    # Kind-Items zerlegt und wartet dann in ``tracking``, bis alle Kinder
+    # ``done`` sind. ``proposed`` = von forge erzeugt, wartet auf Freigabe durch
+    # einen Menschen — der Conductor verlässt diese Stage NIE selbst.
+    EPIC = "forge:epic"
+    TRACKING = "forge:tracking"
+    PROPOSED = "forge:proposed"
 
 
 # Marker-Labels, die forge zusätzlich zu den Stages setzt (keine Stage):
@@ -58,6 +65,9 @@ ALLOWED_TRANSITIONS: dict[Stage, frozenset[Stage]] = {
     Stage.RELEASE: frozenset({Stage.DONE, Stage.BLOCKED}),
     Stage.DONE: frozenset(),
     Stage.BLOCKED: frozenset(),
+    Stage.EPIC: frozenset({Stage.TRACKING, Stage.BLOCKED}),
+    Stage.TRACKING: frozenset({Stage.DONE, Stage.BLOCKED}),
+    Stage.PROPOSED: frozenset(),
 }
 
 
@@ -135,6 +145,21 @@ class StageSignals:
     ci_fix_failed: bool = False
     """L2: ein CI-Fix-Run für den aktuellen Head endete ohne Ergebnis."""
 
+    spec_pending: bool = False
+    """A1: für das Item ist ein Spec-PR (Label ``forge:spec``) offen und noch
+    nicht gemergt → ``requirements`` wartet auf den Merge (menschliches Gate)."""
+
+    has_decomposition: bool = False
+    """A2: ein Epic wurde in Kind-Items zerlegt (``WorkItemCreated`` mit
+    ``parent`` = Epic, Quelle ``epic_decomposition``) → ``epic → tracking``."""
+
+    children_done: bool = False
+    """A2: alle Kinder des Epics stehen auf ``done`` → ``tracking → done``."""
+
+    epic_failed_runs: int = 0
+    """A2: Zerlegungs-Runs, die keine Items erzeugten (Eskalation statt
+    Endlos-Retry)."""
+
     @property
     def ci_failed(self) -> bool:
         return self.ci_status == "fail"
@@ -163,7 +188,7 @@ class StageSignals:
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
 # Dispatch-Zweig in der board-loop-Wiring-Schicht.
 IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset(
-    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA, Stage.RELEASE}
+    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA, Stage.RELEASE, Stage.EPIC}
 )
 
 
@@ -179,8 +204,12 @@ def stage_of(labels: list[str]) -> Stage | None:
         return None
     if Stage.BLOCKED.value in present:
         return Stage.BLOCKED
-    # Am weitesten fortgeschrittene Pipeline-Stage gewinnt.
+    # Am weitesten fortgeschrittene Pipeline-Stage gewinnt (ein Mensch, der
+    # ein proposed-Item freigibt, setzt einfach forge:requirements dazu).
     for stage in reversed(PIPELINE):
+        if stage.value in present:
+            return stage
+    for stage in (Stage.TRACKING, Stage.EPIC, Stage.PROPOSED):
         if stage.value in present:
             return stage
     return None
@@ -222,8 +251,16 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     Dependencies) — hier bewusst NICHT automatisch. Gibt ``(stage, "")``
     zurück, wenn kein Übergang fällig ist.
     """
-    if stage == Stage.REQUIREMENTS and signals.has_refined_spec:
+    if (
+        stage == Stage.REQUIREMENTS
+        and signals.has_refined_spec
+        and not signals.spec_pending
+    ):
         return Stage.DESIGN, "requirements_refined"
+    if stage == Stage.EPIC and signals.has_decomposition:
+        return Stage.TRACKING, "epic_decomposed"
+    if stage == Stage.TRACKING and signals.children_done:
+        return Stage.DONE, "children_done"
     if stage == Stage.DESIGN and signals.has_plan:
         return Stage.READY, "plan_proposed"
     if (

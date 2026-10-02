@@ -17,9 +17,9 @@ Architektur:
   Tests und für Spec-Setups, die Triage konfigurieren, aber temporär
   ausgeschaltet halten wollen.
 
-Die GitHub-Side-Effects (Kommentar, Close) leben in
-:mod:`forge_execute.triage.gh`, getrennt vom LLM-Aufruf — damit Tests
-die Klassifikation isolieren können.
+Die Side-Effects (Kommentar, Close) führt der board-loop über den
+anbieter-neutralen ``WorkTracker`` (``forge_adapters``) aus — forge-execute
+kennt keinen Anbieter und importiert nichts aus forge-adapters.
 """
 
 from forge_execute.triage.base import (
@@ -28,7 +28,6 @@ from forge_execute.triage.base import (
     TriageError,
     TriageResult,
 )
-from forge_execute.triage.gh import close_issue, comment_issue
 from forge_execute.triage.llm import LLMTriager
 
 __all__ = [
@@ -37,6 +36,4 @@ __all__ = [
     "NoopTriager",
     "TriageError",
     "TriageResult",
-    "close_issue",
-    "comment_issue",
 ]

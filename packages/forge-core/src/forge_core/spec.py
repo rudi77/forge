@@ -415,15 +415,17 @@ class BoardConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["github"] = "github"
-    """In v1 nur github. ``provider`` ist explizit, damit spätere GitLab-/
-    Linear-Adapter additiv werden statt breaking."""
+    provider: Literal["github", "azure_devops"] | None = None
+    """Anbieter des Boards. ``None`` (Default) = ``provider.tracker`` der Spec.
+    Explizit gesetzt muss er mit ``provider.tracker`` übereinstimmen."""
 
-    owner: NonEmptyStr
-    """GitHub user oder org, der das Project besitzt."""
+    owner: NonEmptyStr | None = None
+    """GitHub user oder org, der das Project besitzt (Pflicht bei GitHub)."""
 
-    project_number: int = Field(gt=0)
-    """Project (v2) Nummer — die ID aus ``gh project list``."""
+    project_number: int | None = Field(default=None, gt=0)
+    """Project (v2) Nummer — die ID aus ``gh project list`` (Pflicht bei
+    GitHub). Bei Azure DevOps ungenutzt: das Board ist das Azure-Projekt aus
+    ``provider.azure``, ``filter_status`` ist der Work-Item-State."""
 
     filter_status: NonEmptyStr = "Todo"
     """Status-Field-Wert, der als 'ready to dispatch' zählt. Case-sensitiv,
@@ -440,6 +442,81 @@ class BoardConfig(BaseModel):
     default_template_id: NonEmptyStr = "board_loop_v1"
     """``prompt_template_id`` für jeden vom board-loop dispatched Run.
     Macht in `forge analyze`-Reports board-loop-Runs unterscheidbar."""
+
+
+_DEFAULT_AZURE_WORK_ITEM_TYPES: dict[str, str] = {
+    "epic": "Epic",
+    "feature": "Feature",
+    "story": "User Story",
+    "bug": "Bug",
+    "task": "Task",
+    "spec": "Feature",
+}
+
+
+class AzureDevOpsConfig(BaseModel):
+    """Azure-DevOps-Ziel (Boards + Repos). Auth über ``AZURE_DEVOPS_EXT_PAT``
+    bzw. ``az login`` — nie in der Spec."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    organization: NonEmptyStr
+    """Org-URL (``https://dev.azure.com/<org>``) oder nur der Org-Name."""
+
+    project: NonEmptyStr
+    repository: NonEmptyStr | None = None
+    """Repo-Name in Azure Repos. Default: gleich dem Projektnamen."""
+
+    work_item_types: dict[NonEmptyStr, NonEmptyStr] = Field(
+        default_factory=lambda: dict(_DEFAULT_AZURE_WORK_ITEM_TYPES)
+    )
+    """forge-``WorkItemKind`` → Work-Item-Type des Prozess-Templates
+    (Agile/Scrum/CMMI haben unterschiedliche Typen)."""
+
+    closed_state: NonEmptyStr = "Closed"
+    """State, auf den ``close`` ein Work Item setzt (Scrum: ``Done``)."""
+
+    @property
+    def org_url(self) -> str:
+        org = self.organization.rstrip("/")
+        if org.startswith("http://") or org.startswith("https://"):
+            return org
+        return f"https://dev.azure.com/{org}"
+
+    @property
+    def repo_name(self) -> str:
+        return self.repository or self.project
+
+
+ProviderKind = Literal["github", "azure_devops"]
+
+
+class ProviderConfig(BaseModel):
+    """Welcher Anbieter für Work-Items (``tracker``) und PRs (``code_host``).
+
+    Getrennt, weil gemischte Setups üblich sind (Azure Boards + GitHub-Repos).
+    Default: alles GitHub — rückwärtskompatibel zu Specs ohne ``provider:``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tracker: ProviderKind = "github"
+    code_host: ProviderKind | None = None
+    """``None`` = derselbe Anbieter wie ``tracker``."""
+
+    azure: AzureDevOpsConfig | None = None
+
+    @property
+    def effective_code_host(self) -> ProviderKind:
+        return self.code_host or self.tracker
+
+    @model_validator(mode="after")
+    def _azure_block_required(self) -> ProviderConfig:
+        if "azure_devops" in (self.tracker, self.effective_code_host) and self.azure is None:
+            raise SpecValidationError(
+                "provider: azure_devops needs an `azure:` block "
+                "(organization, project[, repository])"
+            )
+        return self
 
 
 # --- Top-Level ----------------------------------------------------------
@@ -471,6 +548,8 @@ class ProjectSpec(BaseModel):
     cost_caps: CostCapsConfig
     triggers: TriggersConfig = Field(default_factory=TriggersConfig)
     release: ReleaseConfig = Field(default_factory=ReleaseConfig)
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    """Anbieter für Tracker + Code-Host (GitHub, Azure DevOps). Default GitHub."""
     board: BoardConfig | None = None
     """Optionaler Project-Board-Config; aktiviert ``forge board-loop`` (v0.4)."""
     triage: TriageConfig = Field(default_factory=TriageConfig)
@@ -480,6 +559,23 @@ class ProjectSpec(BaseModel):
     Siehe :class:`JudgeConfig`."""
 
     # --- Cross-field validation ----------------------------------------
+
+    @model_validator(mode="after")
+    def _board_matches_provider(self) -> ProjectSpec:
+        if self.board is None:
+            return self
+        if self.board.provider is not None and self.board.provider != self.provider.tracker:
+            raise SpecValidationError(
+                f"board.provider={self.board.provider!r} contradicts "
+                f"provider.tracker={self.provider.tracker!r}"
+            )
+        if self.provider.tracker == "github" and (
+            self.board.owner is None or self.board.project_number is None
+        ):
+            raise SpecValidationError(
+                "board: GitHub boards need `owner` and `project_number`"
+            )
+        return self
 
     @model_validator(mode="after")
     def _surfaces_dont_overlap(self) -> ProjectSpec:

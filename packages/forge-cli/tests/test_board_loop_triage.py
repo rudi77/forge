@@ -14,7 +14,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from forge_adapters.github import ReadyIssue
 from forge_cli import board_loop as bl
 from forge_cli.runtime import ForgeContext
 from forge_core.events import EventKind, TriageDecision
@@ -26,6 +25,7 @@ from forge_core.spec import (
     TriageConfig,
 )
 from forge_core.store import EventStore
+from forge_core.tracking import ReadyIssue
 from forge_execute.capabilities import Capabilities
 from forge_execute.triage import TriageResult
 from forge_execute.triage.base import TriageError
@@ -87,12 +87,11 @@ def _issue(n: int = 42) -> ReadyIssue:
 
 
 def _patch_gh(monkeypatch: Any) -> tuple[MagicMock, MagicMock]:
-    """Patcht comment_issue + close_issue zu MagicMocks und liefert sie zurück."""
-    fake_comment = MagicMock()
-    fake_close = MagicMock()
-    monkeypatch.setattr(bl, "comment_issue", fake_comment)
-    monkeypatch.setattr(bl, "close_issue", fake_close)
-    return fake_comment, fake_close
+    """Ersetzt den Work-Tracker durch einen MagicMock; liefert dessen
+    ``comment``/``close``-Mocks zurück."""
+    fake_tracker = MagicMock()
+    monkeypatch.setattr(ForgeContext, "get_tracker", lambda self: fake_tracker)
+    return fake_tracker.comment, fake_tracker.close
 
 
 def test_relevant_outcome_dispatches_and_skips_side_effects(

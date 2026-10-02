@@ -29,6 +29,11 @@ class Stage(StrEnum):
     BLOCKED = "forge:blocked"
 
 
+# Marker-Labels, die forge zusätzlich zu den Stages setzt (keine Stage):
+# ``forge:generated`` kennzeichnet von forge selbst erzeugte Work-Items (A3).
+MARKER_LABELS: tuple[str, ...] = ("forge:generated",)
+
+
 # Kanonische Pipeline-Reihenfolge (ohne die Sonderzustände blocked/done-terminal).
 PIPELINE: tuple[Stage, ...] = (
     Stage.REQUIREMENTS,

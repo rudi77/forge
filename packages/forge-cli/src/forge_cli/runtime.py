@@ -9,13 +9,17 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from forge_core.blobs import BlobStore
 from forge_core.spec import ProjectSpec, load_spec
 from forge_core.store import EventStore
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from forge_adapters.base import CodeHost, WorkTracker
 
 console = Console()
 err_console = Console(stderr=True)
@@ -33,6 +37,25 @@ class ForgeContext:
     project_fingerprint: str
     store_path: Path
     blobs_path: Path
+    tracker: WorkTracker | None = field(default=None, repr=False)
+    """Work-Tracker (GitHub/Azure/…). ``None`` = lazy aus der Spec gebaut
+    (:meth:`get_tracker`); Tests setzen hier einen ``InMemoryTracker``."""
+    code_host: CodeHost | None = field(default=None, repr=False)
+    """Code-Host für PRs/Releases; lazy wie ``tracker``."""
+
+    def get_tracker(self) -> WorkTracker:
+        if self.tracker is None:
+            from forge_adapters.registry import build_tracker
+
+            self.tracker = build_tracker(self.spec, self.repo_root)
+        return self.tracker
+
+    def get_code_host(self) -> CodeHost:
+        if self.code_host is None:
+            from forge_adapters.registry import build_code_host
+
+            self.code_host = build_code_host(self.spec, self.repo_root)
+        return self.code_host
 
     def open_store(self) -> EventStore:
         return EventStore(self.store_path)

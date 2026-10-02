@@ -16,6 +16,7 @@ from forge_adapters.github.board import (
     set_issue_stage_label,
     wrap_issue_body,
 )
+from forge_adapters.github.code_host import GitHubCodeHost
 from forge_adapters.github.pr import (
     GitHubError,
     MergeResult,
@@ -34,6 +35,8 @@ from forge_adapters.github.pr import (
     render_pr_body,
     summarize_ci,
 )
+from forge_adapters.github.repo import detect_github_slug, parse_github_remote
+from forge_adapters.github.tracker import GitHubTracker
 from forge_adapters.github.webhook import (
     WebhookEvent,
     record_pr_merged,
@@ -42,7 +45,9 @@ from forge_adapters.github.webhook import (
 
 __all__ = [
     "BoardError",
+    "GitHubCodeHost",
     "GitHubError",
+    "GitHubTracker",
     "MergeResult",
     "PRCreationResult",
     "PRMetadata",
@@ -50,6 +55,7 @@ __all__ = [
     "WebhookEvent",
     "create_pr_for_run",
     "create_release",
+    "detect_github_slug",
     "fetch_pr_diff",
     "fetch_pr_head_committed_at",
     "fetch_pr_metadata",
@@ -57,6 +63,7 @@ __all__ = [
     "list_ready_items",
     "list_stage_items",
     "merge_pr",
+    "parse_github_remote",
     "post_pr_review",
     "push_branch",
     "queue_auto_merge",

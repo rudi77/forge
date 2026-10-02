@@ -6,7 +6,9 @@ Prüft fünf Kategorien:
 2. Tools aus `capabilities.run` sind im PATH
 3. `claude` CLI ist verfügbar (Warning, nicht Error — Mock-Mode möglich)
 4. `ANTHROPIC_API_KEY` ist gesetzt
-5. `gh` CLI ist verfügbar (für PR-Erzeugung)
+5. `gh` CLI ist verfügbar (für PR-Erzeugung) bzw. `az` bei Azure DevOps
+6. optional (`--board`): alle `forge:<stage>`-Labels existieren im Tracker;
+   mit `--fix` werden fehlende angelegt (Live-Verifikation, Roadmap L0)
 
 Liefert Exit-Code 0 wenn alle harten Checks ok sind, 1 bei mindestens
 einem Fehler.
@@ -38,6 +40,20 @@ def doctor_command(
         Path | None,
         typer.Option("--spec", help="Pfad zur project.yaml."),
     ] = None,
+    board: Annotated[
+        bool,
+        typer.Option(
+            "--board",
+            help=(
+                "Tracker live prüfen: existieren alle forge:<stage>-Labels "
+                "(GitHub-Labels bzw. Azure-Tags)?"
+            ),
+        ),
+    ] = False,
+    fix: Annotated[
+        bool,
+        typer.Option("--fix", help="Mit --board: fehlende Stage-Labels anlegen."),
+    ] = False,
 ) -> None:
     """Implementierung von `forge doctor`."""
     findings: list[Finding] = []
@@ -60,8 +76,16 @@ def doctor_command(
     # API-Key
     findings.append(_check_api_key())
 
-    # gh CLI
-    findings.append(_check_binary("gh", category="github", level_when_missing="warn"))
+    # Anbieter-CLIs (gh für GitHub, az für Azure DevOps)
+    providers = {ctx.spec.provider.tracker, ctx.spec.provider.effective_code_host}
+    if "github" in providers:
+        findings.append(_check_binary("gh", category="github", level_when_missing="warn"))
+    if "azure_devops" in providers:
+        findings.append(_check_binary("az", category="azure", level_when_missing="warn"))
+        findings.append(_check_azure_pat())
+
+    if board:
+        findings.extend(_check_board_labels(ctx, fix=fix))
 
     # forbidden paths sanity (Spec Teil 7.4: forge selbst muss in forbidden sein)
     findings.append(_check_forge_self_protection(ctx.spec))
@@ -119,6 +143,55 @@ def _check_api_key() -> Finding:
         "error",
         "ANTHROPIC_API_KEY is not set — `forge run` (without --dry-run) will fail",
     )
+
+
+def _check_azure_pat() -> Finding:
+    if os.environ.get("AZURE_DEVOPS_EXT_PAT"):
+        return Finding("azure", "ok", "AZURE_DEVOPS_EXT_PAT is set")
+    return Finding(
+        "azure",
+        "warn",
+        "AZURE_DEVOPS_EXT_PAT not set — az must be logged in (`az login`) instead",
+    )
+
+
+def required_board_labels() -> list[str]:
+    """Alle Labels/Tags, die der Conductor setzt: Stages + Marker."""
+    from forge_cli.stages import MARKER_LABELS, Stage
+
+    return [s.value for s in Stage] + list(MARKER_LABELS)
+
+
+def _check_board_labels(ctx, *, fix: bool) -> list[Finding]:
+    """Live-Check gegen den Tracker (Roadmap L0): fehlen Stage-Labels, laufen
+    ``set_stage``-Aufrufe des Conductors ins Leere (gh legt Labels beim
+    ``issue edit`` nicht an)."""
+    from forge_adapters.base import TrackerError
+
+    try:
+        tracker = ctx.get_tracker()
+        report = tracker.ensure_labels(required_board_labels(), create=fix)
+    except TrackerError as exc:
+        return [Finding("board", "error", f"tracker not reachable: {exc}")]
+    out = [
+        Finding(
+            "board",
+            "ok",
+            f"{tracker.provider}: {len(report.present)} forge labels present",
+        )
+    ]
+    if report.created:
+        out.append(Finding("board", "ok", f"created: {', '.join(report.created)}"))
+    if report.missing:
+        out.append(
+            Finding(
+                "board",
+                "error",
+                f"missing labels: {', '.join(report.missing)} — run "
+                "`forge doctor --board --fix`",
+            )
+        )
+    return out
 
 
 def _check_forge_self_protection(spec) -> Finding:

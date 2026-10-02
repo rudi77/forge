@@ -6,7 +6,8 @@ Architektur:
 * Optionale Pre-Phase ``IssueTriage`` (Spec v0.4 Teil 6.3), die per
   ``triage.enabled`` aktiviert wird — emittiert genau ein
   ``IssueTriaged``-Event pro Issue.
-* Idempotenz + Filter im Adapter (``forge_adapters.github.board``).
+* Idempotenz + Filter im Adapter (``WorkTracker`` aus ``forge_adapters``;
+  GitHub, Azure DevOps, …).
 * ``--auto-merge`` durchgereicht an jeden dispatched Run; Spec-Vertrag
   bleibt intakt (forge ruft selbst kein ``gh pr merge`` synchron auf,
   nur ``--auto`` als server-seitiges Queue).
@@ -15,10 +16,7 @@ Architektur:
 from __future__ import annotations
 
 import contextlib
-import json
-import re
 import signal
-import subprocess
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -28,17 +26,8 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from forge_adapters.github import (
-    BoardError,
-    GitHubError,
-    ReadyIssue,
-    create_release,
-    fetch_pr_head_committed_at,
-    list_ready_items,
-    list_stage_items,
-    set_issue_stage_label,
-    wrap_issue_body,
-)
+from forge_adapters.base import CodeHostError, TrackerError, WorkTracker
+from forge_adapters.text import wrap_issue_body
 from forge_core.events import (
     ConductorTickCompletedPayload,
     EventKind,
@@ -49,16 +38,14 @@ from forge_core.events import (
     build_event,
 )
 from forge_core.store import EventStore
+from forge_core.tracking import ReadyIssue
 from forge_execute.capabilities import Capabilities
 from forge_execute.triage import (
     IssueTriager,
     LLMTriager,
     TriageError,
     TriageResult,
-    close_issue,
-    comment_issue,
 )
-from forge_execute.triage.gh import GHTriageError
 from forge_execute.worktrees import GitError, WorktreeManager
 from rich.table import Table
 from ulid import ULID
@@ -87,10 +74,6 @@ from forge_cli.runtime import (
     load_context,
 )
 from forge_cli.stages import Stage, stage_of
-
-# Wir teilen denselben SubprocessRunner-DI-Pattern wie pr.py / board.py,
-# damit Tests gh-Aufrufe stubben können.
-SubprocessRunner = Callable[..., subprocess.CompletedProcess]
 
 
 def board_loop_command(
@@ -238,6 +221,17 @@ def board_loop_command(
             min=1,
         ),
     ] = 1,
+    max_ticks: Annotated[
+        int | None,
+        typer.Option(
+            "--max-ticks",
+            help=(
+                "Nur --watch: nach N Ticks sauber beenden (Smoke-/Live-Tests, "
+                "Cron-Betrieb). Default: unbegrenzt."
+            ),
+            min=1,
+        ),
+    ] = None,
 ) -> None:
     """Pull ready issues from the configured GitHub Project, dispatch each
     via the standard issue_label trigger pipeline."""
@@ -247,7 +241,11 @@ def board_loop_command(
         err_console.print(f"[red]error[/red]: {exc}")
         raise typer.Exit(code=2) from None
 
-    repo_owner, repo_name = _detect_repo_slug(ctx.repo_root)
+    try:
+        tracker = ctx.get_tracker()
+    except TrackerError as exc:
+        err_console.print(f"[red]error[/red]: {exc}")
+        raise typer.Exit(code=2) from None
 
     # ---- Garbage-Collection vor Loop-Start --------------------------
     # Verwaiste forge/* Worktrees (frühere Crashes) und lokale Branches,
@@ -308,25 +306,25 @@ def board_loop_command(
         if conductor:
             stats = _run_conductor_watch(
                 ctx=ctx,
-                repo_owner=repo_owner,
-                repo_name=repo_name,
+                tracker=tracker,
                 max_issues=max_issues,
                 interval_s=interval,
                 params=params,
                 triager=triager,
                 capabilities=capabilities,
                 max_parallel=max_parallel,
+                max_ticks=max_ticks,
             )
         else:
             stats = _run_watch(
                 ctx=ctx,
-                repo_owner=repo_owner,
-                repo_name=repo_name,
+                tracker=tracker,
                 max_issues=max_issues,
                 interval_s=interval,
                 params=params,
                 triager=triager,
                 capabilities=capabilities,
+                max_ticks=max_ticks,
             )
         console.print(
             f"\n[bold]heartbeat gestoppt[/bold] ({stats.stopped_reason}) — "
@@ -337,12 +335,8 @@ def board_loop_command(
     # ---- Single-Pass: Issue-Liste bestimmen -------------------------
     if issue_overrides:
         try:
-            ready = _fetch_issues_by_number(
-                repo_owner=repo_owner,
-                repo_name=repo_name,
-                numbers=issue_overrides,
-            )
-        except BoardError as exc:
+            ready = tracker.get_items(list(issue_overrides))
+        except TrackerError as exc:
             err_console.print(f"[red]error[/red]: {exc}")
             raise typer.Exit(code=2) from None
     else:
@@ -353,12 +347,8 @@ def board_loop_command(
             )
             raise typer.Exit(code=2)
         try:
-            ready = list_ready_items(
-                ctx.spec.board,
-                repo_owner=repo_owner,
-                repo_name=repo_name,
-            )
-        except BoardError as exc:
+            ready = tracker.list_ready_items(ctx.spec.board)
+        except TrackerError as exc:
             err_console.print(f"[red]error[/red]: {exc}")
             raise typer.Exit(code=2) from None
         ready = ready[:max_issues]
@@ -368,7 +358,7 @@ def board_loop_command(
         raise typer.Exit(code=0)
 
     if dry_run:
-        _print_dry_run_table(ready, repo_owner, repo_name)
+        _print_dry_run_table(ready, tracker.provider)
         raise typer.Exit(code=0)
 
     result = _dispatch_issues(
@@ -563,12 +553,11 @@ def _dispatch_release_run(
         return None
     tag = _release_tag_for_issue(issue.number)
     try:
-        url = create_release(
-            repo=ctx.repo_root,
+        url = ctx.get_code_host().create_release(
             tag=tag,
             title=f"{tag}: {issue.title}",
         )
-    except GitHubError as exc:
+    except CodeHostError as exc:
         err_console.print(
             f"[red]error[/red] in release for issue #{issue.number}: {exc}"
         )
@@ -988,8 +977,7 @@ def _heartbeat_session(
 def _run_watch(
     *,
     ctx: ForgeContext,
-    repo_owner: str,
-    repo_name: str,
+    tracker: WorkTracker | None = None,
     max_issues: int,
     interval_s: float,
     params: _DispatchParams,
@@ -999,14 +987,13 @@ def _run_watch(
 ) -> HeartbeatStats:
     """Flacher Dauerbetrieb (Phase B): pollt board-ready Issues und arbeitet
     sie ab — ohne Stage-State-Machine."""
+    tracker = tracker or ctx.get_tracker()
 
     def make_tick(_store: Any, _session_id: str) -> Callable[[int], TickResult]:
         def tick_fn(tick_index: int) -> TickResult:
             try:
-                ready = list_ready_items(
-                    ctx.spec.board, repo_owner=repo_owner, repo_name=repo_name
-                )[:max_issues]
-            except BoardError as exc:
+                ready = tracker.list_ready_items(ctx.spec.board)[:max_issues]
+            except TrackerError as exc:
                 err_console.print(
                     f"[red]board error[/red] (tick {tick_index}): {exc}"
                 )
@@ -1119,8 +1106,7 @@ def _dispatch_review_run(
 def _run_conductor_watch(
     *,
     ctx: ForgeContext,
-    repo_owner: str,
-    repo_name: str,
+    tracker: WorkTracker | None = None,
     max_issues: int,
     interval_s: float,
     params: _DispatchParams,
@@ -1144,6 +1130,7 @@ def _run_conductor_watch(
     sequenzielle Verhalten.
     """
     stage_labels = [s.value for s in Stage]
+    tracker = tracker or ctx.get_tracker()
 
     def make_tick(store: Any, session_id: str) -> Callable[[int], TickResult]:
         def _emit_stage_changed(t: StageTransition) -> None:
@@ -1184,13 +1171,10 @@ def _run_conductor_watch(
 
         def tick_fn(tick_index: int) -> TickResult:
             try:
-                issues = list_stage_items(
-                    repo_owner=repo_owner,
-                    repo_name=repo_name,
-                    stage_labels=stage_labels,
-                    state="all",
+                issues = tracker.list_stage_items(
+                    stage_labels=stage_labels, state="all"
                 )
-            except BoardError as exc:
+            except TrackerError as exc:
                 err_console.print(
                     f"[red]board error[/red] (tick {tick_index}): {exc}"
                 )
@@ -1246,8 +1230,8 @@ def _run_conductor_watch(
                 if stage == Stage.QA:
                     qa_pr = pr_number_for_issue(events, issue.number)
                     if qa_pr is not None:
-                        head_committed_at = fetch_pr_head_committed_at(
-                            repo=ctx.repo_root, pr_number=qa_pr
+                        head_committed_at = ctx.get_code_host().head_committed_at(
+                            qa_pr
                         )
                 signals = derive_signals(
                     events, issue.number, head_committed_at=head_committed_at
@@ -1279,10 +1263,8 @@ def _run_conductor_watch(
             counters = {"dispatched": 0, "bailed": resume_bailed}
 
             def set_stage(t: StageTransition) -> None:
-                set_issue_stage_label(
-                    issue_number=t.number,
-                    repo_owner=repo_owner,
-                    repo_name=repo_name,
+                tracker.set_stage(
+                    number=t.number,
                     add=t.to_stage.value,
                     remove=t.from_stage.value,
                 )
@@ -1482,12 +1464,11 @@ def _run_triage(
     if triage_cfg.auto_comment:
         if capabilities.check_action("comment_issue").allowed:
             try:
-                comment_issue(
-                    repo=ctx.repo_root,
-                    issue_number=issue.number,
+                ctx.get_tracker().comment(
+                    number=issue.number,
                     body=_format_triage_comment(result),
                 )
-            except GHTriageError as exc:
+            except TrackerError as exc:
                 err_console.print(
                     f"[yellow]triage comment failed for #{issue.number}[/yellow]: {exc}"
                 )
@@ -1503,12 +1484,11 @@ def _run_triage(
                 "completed" if result.decision == "already_solved" else "not planned"
             )
             try:
-                close_issue(
-                    repo=ctx.repo_root,
-                    issue_number=issue.number,
+                ctx.get_tracker().close(
+                    number=issue.number,
                     reason=close_reason,
                 )
-            except GHTriageError as exc:
+            except TrackerError as exc:
                 err_console.print(
                     f"[yellow]triage close failed for #{issue.number}[/yellow]: {exc}"
                 )
@@ -1628,95 +1608,6 @@ def _run_garbage_collection(repo_root: Path) -> None:
         )
 
 
-_REMOTE_RE = re.compile(
-    r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/.]+?)(?:\.git)?/?$"
-)
-
-
-def _detect_repo_slug(
-    repo: Path,
-    *,
-    run_subprocess: SubprocessRunner = subprocess.run,
-) -> tuple[str, str]:
-    """``git remote get-url origin`` → (owner, repo). Funktioniert mit ssh
-    und https Remotes."""
-    result = run_subprocess(
-        ["git", "remote", "get-url", "origin"],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
-        raise typer.BadParameter(
-            f"git remote get-url origin failed: {result.stderr.strip()}"
-        )
-    url = result.stdout.strip()
-    match = _REMOTE_RE.search(url)
-    if not match:
-        raise typer.BadParameter(
-            f"could not parse owner/repo from remote URL {url!r}"
-        )
-    return match.group("owner"), match.group("repo")
-
-
-def _fetch_issues_by_number(
-    *,
-    repo_owner: str,
-    repo_name: str,
-    numbers: list[int],
-    gh_bin: str = "gh",
-    run_subprocess: SubprocessRunner = subprocess.run,
-) -> list[ReadyIssue]:
-    """Lädt Issue-Daten via ``gh issue view --json`` für die gegebenen Nummern.
-
-    Wird vom ``--issue 42 43``-Override-Pfad gebraucht — wir gehen nicht
-    übers Project, also kein Board-Filter, kein Idempotenz-Check.
-    Operator weiß was er tut.
-    """
-    out: list[ReadyIssue] = []
-    for n in numbers:
-        cmd = [
-            gh_bin, "issue", "view", str(n),
-            "--repo", f"{repo_owner}/{repo_name}",
-            "--json", "number,title,body,labels,state,url",
-        ]
-        result = run_subprocess(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if result.returncode != 0:
-            raise BoardError(
-                f"gh issue view #{n} failed (exit {result.returncode}): "
-                f"{result.stderr.strip()}"
-            )
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise BoardError(
-                f"gh issue view #{n} returned invalid JSON: {exc}"
-            ) from exc
-        labels_raw = data.get("labels") or []
-        labels = [
-            entry.get("name", "") for entry in labels_raw if isinstance(entry, dict)
-        ]
-        out.append(
-            ReadyIssue(
-                number=int(data.get("number", n)),
-                title=str(data.get("title", "")),
-                body=str(data.get("body", "")),
-                labels=[lbl for lbl in labels if lbl],
-                project_status="(override)",
-                url=str(data.get("url", "")),
-            )
-        )
-    return out
-
-
 def _roster_for_issue(spec, labels: list[str]) -> list[str] | None:
     """Liefert das Subagent-Roster für ein Issue aus der Trigger-Config.
 
@@ -1769,11 +1660,9 @@ def _summary_row_from_outcome(
     )
 
 
-def _print_dry_run_table(
-    ready: list[ReadyIssue], repo_owner: str, repo_name: str
-) -> None:
+def _print_dry_run_table(ready: list[ReadyIssue], provider: str) -> None:
     table = Table(
-        title=f"board-loop dry-run · {repo_owner}/{repo_name} · {len(ready)} ready",
+        title=f"board-loop dry-run · {provider} · {len(ready)} ready",
         show_lines=False,
     )
     table.add_column("#", style="cyan", no_wrap=True)

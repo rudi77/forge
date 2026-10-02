@@ -1,6 +1,6 @@
 """Tests für den Conductor-Watch-Modus (Phase C Integration) im board-loop.
 
-Board (list_stage_items / set_issue_stage_label) und Dispatch (_dispatch_issues)
+Board (In-Memory-Tracker) und Dispatch (_dispatch_issues)
 werden gestubbt — die State-Machine + plan_tick sind separat unit-getestet.
 Hier interessiert die Verdrahtung: werden Übergänge effektiert, wird dispatcht,
 landen WorkItemStageChanged/WorkItemBlocked + ConductorTickCompleted im Store?
@@ -11,9 +11,8 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
-from forge_adapters.github import ReadyIssue
+from forge_adapters.fake import InMemoryCodeHost, InMemoryTracker
 from forge_cli import board_loop as bl
 from forge_cli.runtime import ForgeContext
 from forge_core.spec import (
@@ -23,6 +22,7 @@ from forge_core.spec import (
     ProjectSpec,
     TriageConfig,
 )
+from forge_core.tracking import ReadyIssue
 
 
 def _make_ctx(tmp_path: Path) -> ForgeContext:
@@ -48,7 +48,15 @@ def _make_ctx(tmp_path: Path) -> ForgeContext:
         project_fingerprint="sha256:test",
         store_path=tmp_path / "events.duckdb",
         blobs_path=tmp_path / "blobs",
+        tracker=InMemoryTracker(),
+        code_host=InMemoryCodeHost(),
     )
+
+
+def _board(ctx: ForgeContext, issues: list[ReadyIssue]) -> None:
+    """Belegt den In-Memory-Tracker mit ``issues`` vor."""
+    for issue in issues:
+        ctx.tracker.add(issue)
 
 
 def _issue(n: int, labels: list[str], body: str = "") -> ReadyIssue:
@@ -82,8 +90,6 @@ def _params() -> bl._DispatchParams:
 def _run(ctx: ForgeContext, max_ticks: int = 1) -> bl.HeartbeatStats:
     return bl._run_conductor_watch(
         ctx=ctx,
-        repo_owner="x",
-        repo_name="y",
         max_issues=3,
         interval_s=0,
         params=_params(),
@@ -108,11 +114,8 @@ def test_conductor_dispatches_ready_item_and_records_transition(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     ctx = _make_ctx(tmp_path)
-    monkeypatch.setattr(
-        bl, "list_stage_items", lambda **k: [_issue(5, ["forge:ready"])]
+    _board(ctx, [_issue(5, ["forge:ready"])]
     )
-    set_label = MagicMock()
-    monkeypatch.setattr(bl, "set_issue_stage_label", set_label)
     dispatched: list[int] = []
 
     def fake_dispatch(*, ctx, issues, params, triager, capabilities, store=None):
@@ -128,9 +131,7 @@ def test_conductor_dispatches_ready_item_and_records_transition(
     assert stats.total_dispatched == 1
     assert dispatched == [5]
     # ready→in-dev wurde via gh effektiert.
-    _, kwargs = set_label.call_args
-    assert kwargs["add"] == "forge:in-dev"
-    assert kwargs["remove"] == "forge:ready"
+    assert ctx.tracker.stage_calls == [(5, "forge:in-dev", "forge:ready")]
     # Events: ein Stage-Übergang + ein Tick.
     assert _events_of_kind(ctx, "WorkItemStageChanged") == 1
     assert _events_of_kind(ctx, "ConductorTickCompleted") == 1
@@ -141,12 +142,7 @@ def test_conductor_blocks_item_with_unmet_dependency(
 ) -> None:
     ctx = _make_ctx(tmp_path)
     # #2 (ready) hängt von #1 ab, das nirgends als done sichtbar ist → blocked.
-    monkeypatch.setattr(
-        bl,
-        "list_stage_items",
-        lambda **k: [_issue(2, ["forge:ready"], body="Depends-On: #1")],
-    )
-    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+    _board(ctx, [_issue(2, ["forge:ready"], body="Depends-On: #1")])
     dispatched: list[int] = []
     monkeypatch.setattr(
         bl,
@@ -166,15 +162,11 @@ def test_conductor_dispatches_when_dependency_done(
 ) -> None:
     ctx = _make_ctx(tmp_path)
     # #1 done (sichtbar via state=all), #2 ready depends on #1 → dispatch #2.
-    monkeypatch.setattr(
-        bl,
-        "list_stage_items",
-        lambda **k: [
+    _board(ctx, [
             _issue(1, ["forge:done"]),
             _issue(2, ["forge:ready"], body="Depends-On: #1"),
         ],
     )
-    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
     dispatched: list[int] = []
 
     def fake_dispatch(*, ctx, issues, params, triager, capabilities, store=None):
@@ -195,11 +187,8 @@ def test_conductor_dispatches_design_stage_to_design_run(
     ctx = _make_ctx(tmp_path)
     # Ein design-Item ohne Plan → der Design-Run (architect-Team) läuft,
     # NICHT der Dev-Loop. Kein Stage-Wechsel (bleibt design bis Plan vorliegt).
-    monkeypatch.setattr(
-        bl, "list_stage_items", lambda **k: [_issue(9, ["forge:design"])]
+    _board(ctx, [_issue(9, ["forge:design"])]
     )
-    set_label = MagicMock()
-    monkeypatch.setattr(bl, "set_issue_stage_label", set_label)
 
     design_runs: list[int] = []
 
@@ -224,7 +213,7 @@ def test_conductor_dispatches_design_stage_to_design_run(
     assert dev_runs == []  # kein Dev-Loop für ein design-Item
     assert stats.total_dispatched == 1
     # design bleibt design — kein gh-Label-Wechsel in diesem Tick.
-    set_label.assert_not_called()
+    assert ctx.tracker.stage_calls == []
     assert _events_of_kind(ctx, "WorkItemStageChanged") == 0
 
 
@@ -232,8 +221,7 @@ def test_conductor_empty_board_emits_tick_only(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     ctx = _make_ctx(tmp_path)
-    monkeypatch.setattr(bl, "list_stage_items", lambda **k: [])
-    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
+    _board(ctx, [])
 
     stats = _run(ctx, max_ticks=2)
     assert stats.total_dispatched == 0
@@ -248,12 +236,8 @@ def test_conductor_parallel_dispatches_two_ready_items(
     import threading
 
     ctx = _make_ctx(tmp_path)
-    monkeypatch.setattr(
-        bl,
-        "list_stage_items",
-        lambda **k: [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
+    _board(ctx, [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
     )
-    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
 
     lock = threading.Lock()
     dispatched: list[int] = []
@@ -268,7 +252,7 @@ def test_conductor_parallel_dispatches_two_ready_items(
     monkeypatch.setattr(bl, "_dispatch_issues", fake_dispatch)
 
     stats = bl._run_conductor_watch(
-        ctx=ctx, repo_owner="x", repo_name="y", max_issues=3, interval_s=0,
+        ctx=ctx, max_issues=3, interval_s=0,
         params=_params(), triager=None, capabilities=None, max_ticks=1,
         max_parallel=2,
     )
@@ -282,12 +266,8 @@ def test_conductor_parallel_worker_exception_does_not_crash_tick(
     # Ein Dispatch wirft → der parallele Tick (pool.map) darf NICHT den
     # Heartbeat killen; der Fehler wird als bailed-Result eingesammelt.
     ctx = _make_ctx(tmp_path)
-    monkeypatch.setattr(
-        bl,
-        "list_stage_items",
-        lambda **k: [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
+    _board(ctx, [_issue(5, ["forge:ready"]), _issue(6, ["forge:ready"])],
     )
-    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
 
     def boom(**k):
         raise RuntimeError("dispatch exploded")
@@ -296,7 +276,7 @@ def test_conductor_parallel_worker_exception_does_not_crash_tick(
 
     # Darf nicht propagieren — Heartbeat läuft den Tick zu Ende.
     stats = bl._run_conductor_watch(
-        ctx=ctx, repo_owner="x", repo_name="y", max_issues=3, interval_s=0,
+        ctx=ctx, max_issues=3, interval_s=0,
         params=_params(), triager=None, capabilities=None, max_ticks=1,
         max_parallel=2,
     )
@@ -338,10 +318,8 @@ def test_conductor_qa_stage_dispatches_review_run(
     ))
     store.close()
 
-    monkeypatch.setattr(
-        bl, "list_stage_items", lambda **k: [_issue(8, ["forge:qa"])]
+    _board(ctx, [_issue(8, ["forge:qa"])]
     )
-    monkeypatch.setattr(bl, "set_issue_stage_label", MagicMock())
 
     reviews: list[int] = []
 

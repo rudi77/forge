@@ -16,12 +16,9 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from forge_adapters.github import (
-    GitHubError,
-    create_pr_for_run,
-    queue_auto_merge,
-    render_pr_body,
-)
+from forge_adapters.base import CodeHostError
+from forge_adapters.text import render_pr_body
+from forge_core.events import EventKind, PRCreatedPayload, build_event
 from forge_core.store import EventStore
 from forge_execute.agents import ClaudeCodeCLIAgent, MockCodingAgent
 from forge_execute.runner import RunConfig, RunResult, SequentialRunner
@@ -484,9 +481,9 @@ def execute_run(
 
             if auto_merge and outcome.pr_number is not None:
                 try:
-                    queue_auto_merge(repo=ctx.repo_root, pr_number=outcome.pr_number)
+                    ctx.get_code_host().queue_auto_merge(pr_number=outcome.pr_number)
                     outcome.auto_merge_queued = True
-                except GitHubError as exc:
+                except CodeHostError as exc:
                     outcome.auto_merge_error = str(exc)
     finally:
         if owns_store:
@@ -619,24 +616,34 @@ def _create_pr_into_outcome(
     )
     labels = ["forge:auto", *extra_labels]
     try:
-        pr = create_pr_for_run(
-            repo=ctx.repo_root,
+        pr = ctx.get_code_host().open_change(
             branch=result.branch,
             title=title,
             body=body,
             base=pr_base,
             labels=labels,
             draft=draft,
-            store=store,
+        )
+    except CodeHostError as exc:
+        outcome.pr_error = f"PR creation failed: {exc}"
+        return
+    store.append(
+        build_event(
+            kind=EventKind.PR_CREATED,
             run_id=result.run_id,
             project=config.project,
             project_fingerprint=config.project_fingerprint,
             factory_version=config.factory_version,
             spec_version=ctx.spec.spec_version,
+            payload=PRCreatedPayload(
+                pr_number=pr.pr_number,
+                branch=pr.branch,
+                base_branch=pr_base,
+                labels=labels,
+                url=pr.url,
+            ),
         )
-    except GitHubError as exc:
-        outcome.pr_error = f"PR creation failed: {exc}"
-        return
+    )
     outcome.pr_url = pr.url
     outcome.pr_number = pr.pr_number
 

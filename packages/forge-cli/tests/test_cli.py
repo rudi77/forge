@@ -338,26 +338,37 @@ def test_board_loop_errors_without_board_block(mini_repo: Path, monkeypatch) -> 
 
 
 def test_detect_repo_slug_https() -> None:
-    from forge_cli.board_loop import _REMOTE_RE
-    m = _REMOTE_RE.search("https://github.com/rudi77/pytaskforce.git")
-    assert m is not None
-    assert m.group("owner") == "rudi77"
-    assert m.group("repo") == "pytaskforce"
+    from forge_adapters.github import parse_github_remote
+
+    assert parse_github_remote("https://github.com/rudi77/pytaskforce.git") == (
+        "rudi77",
+        "pytaskforce",
+    )
 
 
 def test_detect_repo_slug_ssh() -> None:
-    from forge_cli.board_loop import _REMOTE_RE
-    m = _REMOTE_RE.search("git@github.com:rudi77/pytaskforce.git")
-    assert m is not None
-    assert m.group("owner") == "rudi77"
-    assert m.group("repo") == "pytaskforce"
+    from forge_adapters.github import parse_github_remote
+
+    assert parse_github_remote("git@github.com:rudi77/pytaskforce.git") == (
+        "rudi77",
+        "pytaskforce",
+    )
 
 
 def test_detect_repo_slug_https_no_dotgit() -> None:
-    from forge_cli.board_loop import _REMOTE_RE
-    m = _REMOTE_RE.search("https://github.com/rudi77/pytaskforce")
-    assert m is not None
-    assert m.group("repo") == "pytaskforce"
+    from forge_adapters.github import parse_github_remote
+
+    assert parse_github_remote("https://github.com/rudi77/pytaskforce") == (
+        "rudi77",
+        "pytaskforce",
+    )
+
+
+def _use_tracker(monkeypatch, tracker) -> None:
+    """Ersetzt den aus der Spec gebauten Tracker durch ``tracker``."""
+    import forge_adapters.registry as registry
+
+    monkeypatch.setattr(registry, "build_tracker", lambda *a, **kw: tracker)
 
 
 def test_board_loop_backlog_empty_message(
@@ -376,10 +387,10 @@ def test_board_loop_backlog_empty_message(
     _git(mini_repo, "commit", "-m", "add board")
     _git(mini_repo, "remote", "add", "origin", "https://github.com/rudi77/test.git")
 
-    # Patch list_ready_items global, damit kein gh aufgerufen wird.
-    import forge_cli.board_loop as bl
+    # In-Memory-Tracker statt gh: leeres Board.
+    from forge_adapters.fake import InMemoryTracker
 
-    monkeypatch.setattr(bl, "list_ready_items", lambda *a, **kw: [])
+    _use_tracker(monkeypatch, InMemoryTracker())
     monkeypatch.chdir(mini_repo)
 
     result = runner.invoke(app, ["board-loop", "--max", "1"])
@@ -400,7 +411,7 @@ def test_board_loop_dry_run_lists_items(mini_repo: Path, monkeypatch) -> None:
     _git(mini_repo, "commit", "-m", "add board")
     _git(mini_repo, "remote", "add", "origin", "https://github.com/rudi77/test.git")
 
-    from forge_adapters.github.board import ReadyIssue
+    from forge_core.tracking import ReadyIssue
 
     fake_items = [
         ReadyIssue(
@@ -413,8 +424,9 @@ def test_board_loop_dry_run_lists_items(mini_repo: Path, monkeypatch) -> None:
         )
     ]
     import forge_cli.board_loop as bl
+    from forge_adapters.fake import InMemoryTracker
 
-    monkeypatch.setattr(bl, "list_ready_items", lambda *a, **kw: fake_items)
+    _use_tracker(monkeypatch, InMemoryTracker(fake_items))
 
     # Dispatch-Pfad muss NICHT aufgerufen werden — execute_run patchen
     # damit ein Test-Bypass-Crash sichtbar würde, falls der Code es doch
@@ -429,3 +441,29 @@ def test_board_loop_dry_run_lists_items(mini_repo: Path, monkeypatch) -> None:
     assert result.exit_code == 0
     assert "42" in result.output
     assert "Bug X" in result.output
+
+
+def test_doctor_board_reports_missing_labels_and_fix_creates_them(
+    mini_repo: Path, monkeypatch
+) -> None:
+    """``forge doctor --board`` prüft die Stage-Labels im Tracker; ``--fix``
+    legt fehlende an (Roadmap L0)."""
+    from forge_adapters.fake import InMemoryTracker
+
+    tracker = InMemoryTracker()
+    tracker.labels.add("forge:ready")
+    _use_tracker(monkeypatch, tracker)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.chdir(mini_repo)
+
+    result = runner.invoke(app, ["doctor", "--board"])
+    assert result.exit_code == 1
+    assert "missing labels" in result.output
+    assert "forge:qa" in result.output
+
+    result = runner.invoke(app, ["doctor", "--board", "--fix"])
+    assert "created" in result.output
+    assert "forge:qa" in tracker.labels
+    assert "forge:generated" in tracker.labels
+    result = runner.invoke(app, ["doctor", "--board"])
+    assert "missing labels" not in result.output

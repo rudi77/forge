@@ -259,7 +259,8 @@ def test_board_config_minimal_valid() -> None:
     d["board"] = {"owner": "rudi77", "project_number": 3}
     spec = ProjectSpec.model_validate(d)
     assert spec.board is not None
-    assert spec.board.provider == "github"
+    assert spec.board.provider is None  # erbt provider.tracker
+    assert spec.provider.tracker == "github"
     assert spec.board.owner == "rudi77"
     assert spec.board.project_number == 3
     assert spec.board.filter_status == "Todo"

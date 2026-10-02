@@ -7,8 +7,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
 
-from forge_adapters.github import ReadyIssue
 from forge_core.events import TriageDecision
+from forge_core.tracking import ReadyIssue
 
 
 class TriageError(RuntimeError):

@@ -22,7 +22,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from forge_adapters.github import ReadyIssue
+from forge_core.tracking import ReadyIssue
 
 from forge_execute.triage.base import TriageError, TriageResult
 

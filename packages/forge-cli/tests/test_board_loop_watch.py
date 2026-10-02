@@ -12,7 +12,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from forge_adapters.github import ReadyIssue
+from forge_adapters.base import TrackerError
+from forge_adapters.fake import InMemoryTracker
 from forge_cli import board_loop as bl
 from forge_cli.runtime import ForgeContext
 from forge_core.spec import (
@@ -22,6 +23,7 @@ from forge_core.spec import (
     ProjectSpec,
     TriageConfig,
 )
+from forge_core.tracking import ReadyIssue
 
 
 def _make_ctx(tmp_path: Path) -> ForgeContext:
@@ -82,7 +84,7 @@ def test_watch_runs_bounded_ticks_and_emits_events(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     ctx = _make_ctx(tmp_path)
-    monkeypatch.setattr(bl, "list_ready_items", lambda *a, **k: [_issue(1)])
+    ctx.tracker = InMemoryTracker([_issue(1)])
     # Dispatch stubben: ein Item dispatcht, kein bail.
     monkeypatch.setattr(
         bl,
@@ -94,8 +96,6 @@ def test_watch_runs_bounded_ticks_and_emits_events(
 
     stats = bl._run_watch(
         ctx=ctx,
-        repo_owner="x",
-        repo_name="y",
         max_issues=3,
         interval_s=0,
         params=_params(),
@@ -123,12 +123,10 @@ def test_watch_empty_backlog_emits_idle_ticks(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     ctx = _make_ctx(tmp_path)
-    monkeypatch.setattr(bl, "list_ready_items", lambda *a, **k: [])
+    ctx.tracker = InMemoryTracker()
 
     stats = bl._run_watch(
         ctx=ctx,
-        repo_owner="x",
-        repo_name="y",
         max_issues=3,
         interval_s=0,
         params=_params(),
@@ -156,15 +154,14 @@ def test_watch_board_error_does_not_crash_tick(
     ctx = _make_ctx(tmp_path)
 
     def _boom(*_a: Any, **_k: Any) -> list[ReadyIssue]:
-        raise bl.BoardError("gh exploded")
+        raise TrackerError("gh exploded")
 
-    monkeypatch.setattr(bl, "list_ready_items", _boom)
+    ctx.tracker = InMemoryTracker()
+    monkeypatch.setattr(ctx.tracker, "list_ready_items", _boom)
 
     # Board-Fehler pro Tick wird gefangen — der Heartbeat läuft weiter.
     stats = bl._run_watch(
         ctx=ctx,
-        repo_owner="x",
-        repo_name="y",
         max_issues=3,
         interval_s=0,
         params=_params(),

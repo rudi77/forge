@@ -618,6 +618,7 @@ def create_release(
     title: str,
     notes: str | None = None,
     generate_notes: bool = True,
+    target: str | None = None,
     gh_bin: str = "gh",
     run_subprocess: SubprocessRunner = subprocess.run,
 ) -> str:
@@ -641,6 +642,8 @@ def create_release(
         return existing
 
     cmd = [gh_bin, "release", "create", tag, "--title", title]
+    if target:
+        cmd += ["--target", target]
     if generate_notes:
         cmd.append("--generate-notes")
     if notes:

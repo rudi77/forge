@@ -240,7 +240,9 @@ class InMemoryCodeHost:
         pr.state = "MERGED"
         return MergeResult(merged=True, merger="fake", method=method)
 
-    def create_release(self, *, tag: str, title: str, notes: str | None = None) -> str:
+    def create_release(
+        self, *, tag: str, title: str, notes: str | None = None, target: str | None = None
+    ) -> str:
         self.releases.setdefault(tag, (title, notes))
         return f"fake://releases/{tag}"
 

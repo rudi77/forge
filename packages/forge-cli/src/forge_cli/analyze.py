@@ -76,6 +76,7 @@ def _render_report(store, *, project: str, last_runs: int) -> str:
     sections.append(_section_lessons(store))
     sections.append(_section_intake(store))
     sections.append(_section_parallelism(store))
+    sections.append(_section_releases(store))
     return "\n".join(sections)
 
 
@@ -347,5 +348,30 @@ def _section_parallelism(store, *, last_days: int = 14) -> str:
         mean = f"{r['mean_parallel']:.2f}" if r["mean_parallel"] is not None else "—"
         cap = r["min_capacity"] if r["min_capacity"] is not None else "—"
         out.append(f"| {r['day']} | {r['ticks']} | {mean} | {r['max_parallel'] or 0} | {cap} |")
+    out.append("")
+    return "\n".join(out)
+
+
+def _section_releases(store, *, limit: int = 10) -> str:
+    """Roadmap L3: Releases, Items pro Release, Lead-Time erster Run → Release."""
+    rows = store.query(
+        "SELECT tag, version, released_at, items, mean_lead_time_h "
+        "FROM factory_releases LIMIT ?",
+        [limit],
+    )
+    if not rows:
+        return "## Releases\n\n_no releases yet._\n"
+    out = [
+        "## Releases",
+        "",
+        "| tag | released | items | mean lead time |",
+        "|---|---|---|---|",
+    ]
+    for r in rows:
+        lead = f"{r['mean_lead_time_h']:.1f} h" if r["mean_lead_time_h"] is not None else "—"
+        out.append(
+            f"| {r['tag']} | {r['released_at'].isoformat(timespec='minutes')} | "
+            f"{r['items']} | {lead} |"
+        )
     out.append("")
     return "\n".join(out)

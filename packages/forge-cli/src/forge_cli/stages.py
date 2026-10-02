@@ -160,6 +160,10 @@ class StageSignals:
     """A2: Zerlegungs-Runs, die keine Items erzeugten (Eskalation statt
     Endlos-Retry)."""
 
+    release_batched: bool = False
+    """L3: Release-Train aktiv → ``release`` wird nicht pro Item dispatcht,
+    sondern gesammelt vom Train ausgeliefert (``ReleaseTagged.issue_numbers``)."""
+
     conflicting: bool = False
     """G: der Code-Host meldet den offenen PR als ``CONFLICTING`` (Basis hat
     sich nach einem Geschwister-Merge bewegt). Injiziert wie ``ci_status``."""

@@ -152,12 +152,15 @@ class GitHubCodeHost:
             delete_branch=delete_branch, gh_bin=self.gh_bin, run_subprocess=self._run,
         )
 
-    def create_release(self, *, tag: str, title: str, notes: str | None = None) -> str:
+    def create_release(
+        self, *, tag: str, title: str, notes: str | None = None, target: str | None = None
+    ) -> str:
         return create_release(
             repo=self.repo_root,
             tag=tag,
             title=title,
             notes=notes,
+            target=target,
             # Eigene Notes (Changelog) ersetzen GitHubs generierte.
             generate_notes=notes is None,
             gh_bin=self.gh_bin,

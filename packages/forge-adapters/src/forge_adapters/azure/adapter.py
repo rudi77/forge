@@ -481,7 +481,8 @@ class AzureReposCodeHost(_AzBase):
         )
         return MergeResult(merged=True, merger="azure-devops", method=method)
 
-    def create_release(self, *, tag: str, title: str, notes: str | None = None) -> str:
+    def create_release(self, *, tag: str, title: str, notes: str | None = None,
+                       target: str | None = None) -> str:
         url = (f"{self.config.org_url}/{self.config.project}/_git/{self.config.repo_name}"
                f"?version=GT{tag}")
         remote = self._git(["ls-remote", "--tags", "origin", f"refs/tags/{tag}"],
@@ -489,7 +490,10 @@ class AzureReposCodeHost(_AzBase):
         if remote:
             return url
         message = f"{title}\n\n{notes}" if notes else title
-        self._git(["tag", "-a", tag, "-m", message], what=f"git tag {tag}")
+        ref = "HEAD"
+        if target:
+            ref = self._fetch(target)
+        self._git(["tag", "-a", tag, ref, "-m", message], what=f"git tag {tag}")
         self._git(["push", "origin", f"refs/tags/{tag}"], what=f"git push tag {tag}")
         return url
 

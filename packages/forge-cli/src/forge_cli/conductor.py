@@ -174,6 +174,9 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             # gemergter) PR wird nicht jeden Tick erneut reviewt.
             if w.stage == Stage.QA and w.signals.review_done:
                 continue
+            # L3: Train sammelt release-Items selbst ein.
+            if w.stage == Stage.RELEASE and w.signals.release_batched:
+                continue
             # A1: Spec ist verdichtet, wartet nur noch auf den Spec-PR-Merge
             # → kein erneuter requirements-Run.
             if w.stage == Stage.REQUIREMENTS and w.signals.has_refined_spec:

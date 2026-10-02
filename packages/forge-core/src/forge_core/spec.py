@@ -308,10 +308,34 @@ class ReleaseConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conventional_commits: bool = True
+    """SemVer-Bump aus Conventional Commits (feat → minor, fix/perf → patch,
+    ``!``/``BREAKING CHANGE`` → major). ``false`` → jedes Release ist ein Patch."""
     on_main_green: Literal["auto_tag", "off"] = "off"
     """Tagging ist OK (kein Code-Change). Merge ist es nicht."""
 
     changelog: NonEmptyStr | None = None
+    """Changelog-Datei, die der Release-PR fortschreibt (Train-Modus). Default
+    ``CHANGELOG.md``."""
+
+    mode: Literal["per_issue", "train"] = "per_issue"
+    """Roadmap L3. ``per_issue`` (Default, bisheriges Verhalten): ein Tag
+    ``forge-issue-<N>`` pro Item. ``train``: Items sammeln sich in
+    ``forge:release``; ein Release-PR (Changelog + Version) geht durch die
+    normale Review-/Merge-Absicherung, danach Tag ``<tag_prefix>X.Y.Z`` für
+    alle enthaltenen Items. Nie ein direkter Push auf ``main``."""
+
+    schedule: NonEmptyStr | None = None
+    """Train: Cron, wann ein Release vorbereitet wird. ``None`` = sobald
+    ``min_items`` Items warten."""
+
+    min_items: int = Field(default=1, gt=0)
+    """Train: so viele Items müssen in ``forge:release`` warten."""
+
+    version_files: list[NonEmptyStr] = Field(default_factory=list)
+    """Train: Dateien, deren Version der Release-PR anhebt
+    (``pyproject.toml``, ``package.json``, ``VERSION``)."""
+
+    tag_prefix: str = "v"
 
 
 IntakeKind = Literal["epic", "feature", "story", "bug", "task", "spec"]

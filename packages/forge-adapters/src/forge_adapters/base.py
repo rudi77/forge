@@ -209,8 +209,13 @@ class CodeHost(Protocol):
     ) -> MergeResult:
         ...
 
-    def create_release(self, *, tag: str, title: str, notes: str | None = None) -> str:
-        """Tag + Release anlegen (idempotent). Liefert eine URL (oder ``""``)."""
+    def create_release(
+        self, *, tag: str, title: str, notes: str | None = None, target: str | None = None
+    ) -> str:
+        """Tag + Release anlegen (idempotent). Liefert eine URL (oder ``""``).
+
+        ``target``: Branch/Commit, auf den der Tag zeigt (Default: Default-Branch
+        bzw. lokaler HEAD)."""
         ...
 
     def ci_failure_summary(self, pr_number: int, *, max_chars: int = 8000) -> str:

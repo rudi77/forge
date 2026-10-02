@@ -72,6 +72,7 @@ from forge_cli.dependencies import (
     parse_touches,
 )
 from forge_cli.heartbeat import HeartbeatStats, TickResult, run_heartbeat
+from forge_cli.release import train_tick
 from forge_cli.review_pr import execute_pr_review
 from forge_cli.run import _DEFAULT_RESUME_PROMPT, RunOutcome, execute_run
 from forge_cli.runtime import (
@@ -1170,6 +1171,27 @@ def _dispatch_sync(
     )
 
 
+def _review_release_pr(
+    ctx: ForgeContext, pr_number: int, params: _DispatchParams, store: EventStore
+) -> None:
+    """L3: Release-PR durch denselben Agent-Review + Merge-Gates wie jeder PR."""
+    from forge_execute.agents import ClaudeCodeCLIAgent
+
+    agent = ClaudeCodeCLIAgent(default_model=params.model, claude_bin=params.claude_bin)
+    execute_pr_review(
+        ctx,
+        pr_number=pr_number,
+        agent=agent,
+        merge=True,
+        model=params.model,
+        issue_body=(
+            "Release pull request prepared by forge. It may ONLY change the changelog "
+            "and version files; approve if the changelog matches the listed changes."
+        ),
+        store=store,
+    )
+
+
 def _ci_fix_roster(spec) -> list[str] | None:
     """Roster für CI-Fix-Runs: ``triggers.on_ci_failure.agents`` (Default
     ``["developer"]``), sonst der execute_run-Default."""
@@ -1746,6 +1768,8 @@ def _run_conductor_watch(
                     ci_status=ci_status,
                     mergeable=mergeable,
                 )
+                if stage == Stage.RELEASE and ctx.spec.release.mode == "train":
+                    signals = replace(signals, release_batched=True)
                 if stage == Stage.TRACKING:
                     children = epic_children(events, issue.number)
                     stages_by_number = {i.number: stage_of(i.labels) for i in issues}
@@ -1905,6 +1929,23 @@ def _run_conductor_watch(
                 dispatch=dispatch,
                 on_blocked=_emit_blocked,
             )
+
+            # L3: Release-Train — ein Schritt pro Tick über alle release-Items.
+            if ctx.spec.release.mode == "train":
+                waiting = [
+                    w.number for w in items
+                    if w.stage == Stage.RELEASE and not w.signals.release_done
+                ]
+                try:
+                    train = train_tick(
+                        ctx, store=store, session_id=session_id, events=events,
+                        waiting_items=waiting, base=params.pr_base, now=datetime.now(UTC),
+                        review_fn=lambda n: _review_release_pr(ctx, n, params, store),
+                    )
+                    if train.action not in ("idle",):
+                        console.print(f"  [dim]release train: {train.action} {train.detail}[/dim]")
+                except Exception as exc:  # der Train darf den Tick nie killen
+                    err_console.print(f"[yellow]release train failed[/yellow]: {exc}")
 
             pass_results: list[_PassResult] = []
             if max_parallel > 1 and len(pending) > 1:

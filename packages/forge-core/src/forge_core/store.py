@@ -323,6 +323,53 @@ ORDER BY day DESC;
 """
 
 
+# Release-Sicht (Roadmap L3): jedes echte Release (keine Integrations-Marker)
+# mit Version, Anzahl ausgelieferter Items und mittlerer Lead-Time vom ersten
+# Run eines Items bis zum Release. Read-only.
+_VIEW_FACTORY_RELEASES = """
+CREATE OR REPLACE VIEW factory_releases AS
+WITH releases AS (
+    SELECT
+        project,
+        event_id,
+        ts AS released_at,
+        json_extract_string(payload, '$.tag')     AS tag,
+        json_extract_string(payload, '$.version') AS version,
+        CASE
+            WHEN json_array_length(json_extract(payload, '$.issue_numbers')) > 0
+            THEN json_extract(payload, '$.issue_numbers')
+            ELSE json_array(TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER))
+        END AS items
+    FROM events
+    WHERE kind = 'ReleaseTagged'
+      AND json_extract_string(payload, '$.integrated_into') IS NULL
+),
+item_rows AS (
+    SELECT r.project, r.event_id, r.released_at, r.tag, r.version,
+           CAST(unnest(from_json(r.items, '["INTEGER"]')) AS INTEGER) AS issue_number
+    FROM releases r
+),
+first_run AS (
+    SELECT TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER) AS issue_number,
+           MIN(ts) AS first_ts
+    FROM events
+    WHERE kind = 'RunStarted'
+    GROUP BY 1
+)
+SELECT
+    i.project,
+    i.tag,
+    i.version,
+    i.released_at,
+    COUNT(*)                                                       AS items,
+    AVG(EXTRACT(EPOCH FROM (i.released_at - f.first_ts)) / 3600.0) AS mean_lead_time_h
+FROM item_rows i
+LEFT JOIN first_run f ON f.issue_number = i.issue_number
+GROUP BY i.project, i.event_id, i.tag, i.version, i.released_at
+ORDER BY i.released_at DESC;
+"""
+
+
 _VIEWS = [
     _VIEW_RUNS_WITH_OUTCOMES,
     _VIEW_COST_PER_FOCUS,
@@ -333,6 +380,7 @@ _VIEWS = [
     _VIEW_LESSONS,
     _VIEW_FACTORY_INTAKE,
     _VIEW_FACTORY_PARALLELISM,
+    _VIEW_FACTORY_RELEASES,
 ]
 
 

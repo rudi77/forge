@@ -19,7 +19,13 @@ from datetime import UTC, datetime
 from forge_core.events import EventKind
 
 from forge_cli.dependencies import find_cycle, unmet_dependencies
-from forge_cli.stages import IN_PLACE_WORK_STAGES, Stage, StageSignals, advance
+from forge_cli.stages import (
+    IN_PLACE_WORK_STAGES,
+    MAX_CI_FIX_ATTEMPTS,
+    Stage,
+    StageSignals,
+    advance,
+)
 
 # Beschränkter Re-Dispatch eines in-dev-Items, dessen Run keinen PR produzierte,
 # bevor der Conductor nach ``blocked`` eskaliert (A1). Bewusst eine
@@ -159,6 +165,10 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             # gemergter) PR wird nicht jeden Tick erneut reviewt.
             if w.stage == Stage.QA and w.signals.review_done:
                 continue
+            # L2: kein (teures) Review, solange CI noch läuft oder rot ist —
+            # rot geht über advance in den CI-Fix-Pfad.
+            if w.stage == Stage.QA and w.signals.ci_status in ("pending", "fail"):
+                continue
             target = w.stage
         elif (
             w.stage == Stage.IN_DEV
@@ -188,6 +198,30 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             if w.signals.rework_started:
                 continue  # läuft schon / wartet auf den Push
             candidates.append(DispatchOrder(w.number, Stage.IN_DEV, "rework"))
+            continue
+        elif (
+            w.stage == Stage.IN_DEV
+            and eff == Stage.IN_DEV
+            and w.signals.has_open_pr
+            and w.signals.ci_failed
+        ):
+            # L2: roten CI auf dem PR-Branch reparieren (gleiches Primitiv wie
+            # L1). Ein Fix-Run pro Head; scheitert er, eskalieren.
+            if w.signals.ci_fix_failed or (
+                w.signals.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS
+                and not w.signals.ci_fix_started
+            ):
+                blocked.append(
+                    Blocked(w.number, "ci_fix_exhausted", (), "CI stays red after fix runs")
+                )
+                transitions.append(
+                    StageTransition(w.number, Stage.IN_DEV, Stage.BLOCKED, "ci_fix_exhausted")
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            if w.signals.ci_fix_started:
+                continue
+            candidates.append(DispatchOrder(w.number, Stage.IN_DEV, "ci_fix"))
             continue
         elif w.stage == Stage.IN_DEV and w.signals.dev_failed_no_pr:
             # Dev-Run produzierte keinen PR. Beschränkter Re-Dispatch (A1):
@@ -306,6 +340,7 @@ def derive_signals(
     issue_number: int,
     *,
     head_committed_at: datetime | None = None,
+    ci_status: str | None = None,
 ) -> StageSignals:
     """Leitet die Stage-Signale eines Work-Items aus dem Event-Strom ab.
 
@@ -418,7 +453,43 @@ def derive_signals(
             and (e.payload or {}).get("decision") in _DEV_NO_PR_FAILURES
             for e in events
         )
+    # L2: CI-Fix-Runs. "Für den aktuellen Head gestartet" = Run-Start nach dem
+    # Head-Commit (ein erfolgreicher Fix pusht einen neueren Head). Ohne
+    # Head-Datum: nur ein laufender/fehlgeschlagener jüngster Fix zählt.
+    ci_runs = sorted(
+        (
+            e
+            for e in events
+            if e.kind == EventKind.RUN_STARTED
+            and e.run_id in run_ids
+            and (e.payload or {}).get("trigger") == "ci_failure"
+        ),
+        key=lambda e: e.ts,
+    )
+    ci_fix_started = False
+    ci_fix_failed = False
+    if ci_runs:
+        current = [
+            e for e in ci_runs if head_committed_at is None or e.ts > head_committed_at
+        ]
+        if head_committed_at is None:
+            current = ci_runs[-1:]
+        current_ids = {e.run_id for e in current}
+        finished = {
+            e.run_id: (e.payload or {}).get("decision")
+            for e in events
+            if e.kind == EventKind.RUN_FINISHED and e.run_id in current_ids
+        }
+        ci_fix_failed = any(d in _DEV_NO_PR_FAILURES for d in finished.values())
+        in_flight = any(rid not in finished for rid in current_ids)
+        ci_fix_started = bool(current) and (
+            head_committed_at is not None or in_flight or ci_fix_failed
+        )
     return StageSignals(
+        ci_status=ci_status,
+        ci_fix_attempts=len(ci_runs),
+        ci_fix_started=ci_fix_started,
+        ci_fix_failed=ci_fix_failed,
         changes_requested=changes_requested,
         rework_rounds=rework_rounds,
         rework_started=rework_started,

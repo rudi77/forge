@@ -965,6 +965,20 @@ def _dispatch_branch_run(
     )
 
 
+def _pr_observation(ctx: ForgeContext, pr_number: int):
+    """(Head-Commit-Zeitstempel, CI-Status) eines offenen PRs vom Code-Host.
+
+    Fail-open: jeder Code-Host-Fehler → ``None`` (Signal unbekannt → altes
+    Verhalten), damit ein Schluckauf den Tick nicht wedged."""
+    host = ctx.get_code_host()
+    head = host.head_committed_at(pr_number)
+    try:
+        ci = host.fetch_metadata(pr_number).ci_status
+    except CodeHostError:
+        ci = None
+    return head, ci
+
+
 def _ci_fix_roster(spec) -> list[str] | None:
     """Roster für CI-Fix-Runs: ``triggers.on_ci_failure.agents`` (Default
     ``["developer"]``), sonst der execute_run-Default."""
@@ -1390,14 +1404,16 @@ def _run_conductor_watch(
                 # request_changes-PR erneut reviewt wird. Eine gh-Call pro
                 # QA-Item (nicht pro Issue); fail-open → None bei jedem Fehler.
                 head_committed_at = None
+                ci_status = None
                 if stage in (Stage.QA, Stage.IN_DEV):
                     qa_pr = pr_number_for_issue(events, issue.number)
                     if qa_pr is not None:
-                        head_committed_at = ctx.get_code_host().head_committed_at(
-                            qa_pr
-                        )
+                        head_committed_at, ci_status = _pr_observation(ctx, qa_pr)
                 signals = derive_signals(
-                    events, issue.number, head_committed_at=head_committed_at
+                    events,
+                    issue.number,
+                    head_committed_at=head_committed_at,
+                    ci_status=ci_status,
                 )
                 # A1: in-dev-Item, dessen Dev-Run keinen PR produzierte →
                 # Re-Dispatch-/Eskalations-Signale aus dem Event-Strom ableiten.

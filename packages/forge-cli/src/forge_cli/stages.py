@@ -121,6 +121,24 @@ class StageSignals:
     """L1: ein Nacharbeits-Run seit dem jüngsten Review endete ohne Ergebnis
     (nichts gepusht) → eskalieren statt endlos neu zu versuchen."""
 
+    ci_status: str | None = None
+    """L2: CI-Status des offenen PRs (pass|fail|pending|none|unknown), von der
+    Wiring-Schicht über den Code-Host injiziert (steht nicht im Event-Strom).
+    ``None`` = unbekannt → altes Verhalten (kein CI-Gate)."""
+
+    ci_fix_attempts: int = 0
+    """L2: Anzahl CI-Fix-Runs (``trigger=ci_failure``) für das Item."""
+
+    ci_fix_started: bool = False
+    """L2: für den aktuellen PR-Head läuft bereits ein CI-Fix-Run / ist fertig."""
+
+    ci_fix_failed: bool = False
+    """L2: ein CI-Fix-Run für den aktuellen Head endete ohne Ergebnis."""
+
+    @property
+    def ci_failed(self) -> bool:
+        return self.ci_status == "fail"
+
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
 # Advance-Auslöser produziert (``design`` → architect-Team → ``PlanProposed`` →
@@ -180,6 +198,9 @@ def can_transition(frm: Stage, to: Stage) -> bool:
 # Conductor nach ``blocked`` eskaliert (Roadmap E3: erst Konstante).
 MAX_REWORK_ROUNDS: int = 2
 
+# L2: so viele CI-Fix-Runs pro Item, bevor der Conductor eskaliert.
+MAX_CI_FIX_ATTEMPTS: int = 2
+
 
 def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     """Die nächste *automatische* Stage + Begründung, ohne Dependency-/
@@ -193,6 +214,8 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
       - qa           → release    sobald der PR gemergt wurde
       - qa           → in-dev     bei aktuellem ``request_changes`` (L1)
       - qa           → blocked    nach mehr als ``MAX_REWORK_ROUNDS`` Runden
+      - qa           → in-dev     bei rotem CI (L2), ``blocked`` nach
+                                  ``MAX_CI_FIX_ATTEMPTS`` Fix-Runs
       - release      → done        sobald Tag + Release erzeugt sind
 
     ``ready → in-dev`` passiert beim DISPATCH (Conductor, mit Kapazität +
@@ -207,6 +230,7 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
         stage == Stage.IN_DEV
         and signals.has_open_pr
         and not signals.changes_requested
+        and not signals.ci_failed
     ):
         return Stage.QA, "pr_created"
     if stage == Stage.QA and signals.has_merged_pr:
@@ -215,6 +239,10 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
         if signals.rework_rounds > MAX_REWORK_ROUNDS:
             return Stage.BLOCKED, "rework_exhausted"
         return Stage.IN_DEV, "review_changes_requested"
+    if stage == Stage.QA and signals.ci_failed:
+        if signals.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS:
+            return Stage.BLOCKED, "ci_fix_exhausted"
+        return Stage.IN_DEV, "ci_failed"
     if stage == Stage.RELEASE and signals.release_done:
         return Stage.DONE, "released"
     return stage, ""

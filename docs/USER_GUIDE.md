@@ -278,6 +278,100 @@ entscheidet rein aus dem Event-Strom (Mantra 3). Details:
 --auto`) — forge selbst merged weiterhin nicht; GitHub merged, sobald alle
 required Checks grün sind. Bewusst opt-in pro Aufruf.
 
+**Vor dem ersten Conductor-Lauf** die Labels anlegen (gh legt sie beim
+Stage-Wechsel nicht selbst an):
+
+```bash
+forge doctor --board --fix
+```
+
+### 8a. Azure DevOps statt GitHub
+
+```yaml
+provider:
+  tracker: azure_devops        # Work Items aus Azure Boards
+  # code_host: github          # optional: Code liegt auf GitHub
+  azure:
+    organization: contoso
+    project: Shop
+    repository: shop-web
+board:
+  filter_status: New           # Work-Item-State = "ready"
+  filter_labels: [auto-fix]    # Tags
+```
+
+Voraussetzung: `az` + Extension `azure-devops`, Auth über
+`AZURE_DEVOPS_EXT_PAT` oder `az login`. Stages sind Work-Item-Tags
+(`forge:ready` …), Abhängigkeiten stehen als `Depends-On: #12` in der
+Beschreibung. Vollständiges Beispiel: `examples/azure-devops/.forge/project.yaml`;
+Pipeline-Vorlagen für einen geplanten Conductor und PR-Reviews liegen in
+`forge_adapters/azure/templates/`.
+
+### 8b. Was die Fabrik selbst erledigt
+
+Ohne Konfiguration, sobald der Conductor läuft:
+
+- **Nacharbeit** — sagt das Review `request_changes`, geht das Item zurück nach
+  `forge:in-dev`; das Dev-Team arbeitet auf demselben PR-Branch nach (die
+  Review-Begründung ist Kontext). Nach 2 Runden → `forge:blocked`.
+- **Roter CI** — ein Fix-Run repariert den PR-Branch (Roster aus
+  `triggers.on_ci_failure`); das Review startet erst bei grünem CI.
+- **Merge-Konflikte** nach einem Geschwister-Merge — forge merged die Basis
+  in den PR-Branch; nur echte Konflikte gehen an einen Agenten.
+
+forge pusht dabei nur auf eigene `forge/*`-Branches und nie mit `--force`.
+
+### 8c. Arbeit erzeugen lassen (opt-in)
+
+```yaml
+capabilities:
+  create_work_items: true
+intake:
+  max_items_per_epic: 8
+  max_items_per_day: 20
+  auto_accept: []              # z.B. [bug] → Bugs starten ohne Freigabe
+  watch_main_ci: main          # roter CI auf main → Bug-Item
+  spec_publish: auto           # Features als Spec-PR, Bugs als Kommentar
+```
+
+- **Epics**: ein Issue mit Label `forge:epic` wird in Kind-Items zerlegt
+  (`Depends-On:`, `Touches:` im Body). Das Epic wandert nach `forge:tracking`
+  und wird `done`, sobald alle Kinder `done` sind. Mit `Integration: branch`
+  im Epic-Body landen alle Kinder in `forge/epic-<N>`; ausgeliefert wird per
+  Sammel-PR.
+- **Funde** aus Runs und Reviews, roter `main`-CI und fällige
+  `triggers.schedule` erzeugen Items mit Label `forge:generated`. Sie starten in
+  **`forge:proposed`** — forge rührt sie nicht an, bis ein Mensch das Label auf
+  `forge:requirements` (bzw. `forge:epic`) setzt.
+- **Specs**: der requirements-Run legt die Akzeptanzkriterien als Spec-PR
+  (`docs/specs/<n>-<slug>.md`, Label `forge:spec`) an. Ändere den Text im PR
+  gern — der gemergte Stand ist, wogegen alle folgenden Runs arbeiten.
+
+### 8d. Parallel arbeiten
+
+`--max-parallel N` erlaubt bis zu N Runs pro Tick, je in einem eigenen
+Worktree. forge parallelisiert nur Items, deren `Touches:`-Zeilen sich nicht
+überschneiden; ein Item ohne `Touches:` läuft allein. Die Kapazität sinkt
+automatisch, wenn das Tagesbudget knapp wird oder wenig Plattenplatz frei ist
+(`forge analyze` → Abschnitt *Parallelism*).
+
+### 8e. Release-Train
+
+```yaml
+capabilities:
+  create_release: true
+release:
+  mode: train                  # statt eines Tags pro Issue
+  min_items: 3
+  schedule: "0 9 * * 1"        # optional: montags 09:00
+  version_files: [pyproject.toml]
+```
+
+forge öffnet einen Release-PR `chore(release): vX.Y.Z` (Version aus
+Conventional Commits, Changelog-Abschnitt). Nach dem Merge — durch dich oder
+den Agent-Review mit `merge_pr: true` — taggt forge die Version und schließt
+alle enthaltenen Items ab.
+
 ---
 
 ## 9. Beobachten & auswerten

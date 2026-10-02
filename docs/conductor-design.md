@@ -5,6 +5,14 @@
 > Dieses Dokument ist Design, kein Vertrag — der Vertrag ist die Spec. Wenn ein
 > Vorschlag hier einem der drei Mantras widerspricht, gewinnt das Mantra.
 
+
+> **Stand v0.7:** Das Fließband ist um Nacharbeit, CI-Fix, Merge-Konflikt-
+> Sync, Epic-Zerlegung (`forge:epic`/`forge:tracking`/`forge:proposed`),
+> Touches-Konflikt-Scheduling und einen Release-Train erweitert und läuft
+> gegen GitHub oder Azure DevOps. Dieses Dokument beschreibt die Grundlagen;
+> die Erweiterungen stehen in [`sdlc-factory-roadmap.md`](sdlc-factory-roadmap.md)
+> und [`forge-spec-v0.7.md`](forge-spec-v0.7.md).
+
 ## 0. Worum es geht
 
 forge v1 optimiert **innerhalb** eines Work-Items: ein Issue → ein Run → mehrere
@@ -230,14 +238,19 @@ v1 nicht nötig.
 
 Kategorisch ausgeschlossen, gleiche Linie wie die Spec-v1-Ausschlüsse:
 
-- **Kein Auto-Merge durch forge selbst.** `qa → release` setzt voraus, dass der PR
-  *bereits* gemerged ist (Mensch oder GitHub-Auto-Merge-Feature). Der Conductor
-  merged nie.
+- ~~Kein Auto-Merge durch forge selbst.~~ **Geändert:** der QA-Agent merged
+  opt-in (`capabilities.merge_pr`, approve + grüner CI + kein Konflikt); der
+  Conductor selbst entscheidet weiterhin keinen Merge.
 - **Keine Self-Improvement.** Er ändert nie forges Config, Roster-Definitionen oder
   seine eigene Scheduling-Logik zur Laufzeit.
-- **Keine LLM-Dependency-Inferenz** (v1: deklarativ/geparst).
+- **Keine LLM-Dependency-Inferenz im Tick** (deklarativ/geparst). Seit v0.7
+  schlägt die Epic-Zerlegung Kanten vor — sie werden aber als `Depends-On:`/
+  `Touches:`-Zeilen in die Item-Bodies geschrieben; der Graph, den der
+  Conductor plant, bleibt geparst und replay-fähig.
 - **Keine Such-Parallelität / PBS** (gegated auf Daten).
-- **Keine Merge-Queue-/Konflikt-Auflösung über mehrere PRs** (Phase D).
+- **Keine Merge-Queue.** ~~Konflikt-Auflösung~~ **Geändert (v0.7):**
+  konfliktbehaftete Geschwister-PRs werden nachgezogen (deterministischer
+  Merge der Basis, nur echte Konflikte an einen Agenten).
 - **Kein Zurücknehmen menschlicher Eskalations-Labels.**
 
 ## 11. Phasenplan

@@ -82,7 +82,7 @@ flowchart TD
 
 ### Die Software-Fabrik (Loop 2 — Conductor)
 
-Über den einzelnen Runs liegt der **Conductor** (`forge board-loop --watch --conductor`): eine deterministische Stage-Maschine, die GitHub-Issues durch eine Pipeline taktet und pro Stage das passende Team dispatcht. Mantra 3 bleibt intakt — der Conductor leitet alle Entscheidungen **rein aus dem Event-Strom** ab und greift nie in Runner/Scoring/Gates ein.
+Über den einzelnen Runs liegt der **Conductor** (`forge board-loop --watch --conductor`): eine deterministische Stage-Maschine, die Work-Items — GitHub-Issues oder **Azure-DevOps**-Work-Items — durch eine Pipeline taktet und pro Stage das passende Team dispatcht. Mantra 3 bleibt intakt — der Conductor leitet alle Entscheidungen **rein aus dem Event-Strom** ab und greift nie in Runner/Scoring/Gates ein.
 
 ```
 forge:requirements → forge:design → forge:ready → forge:in-dev → forge:qa → forge:release → forge:done
@@ -94,15 +94,22 @@ forge:requirements → forge:design → forge:ready → forge:in-dev → forge:q
 
 Stage-Labels (`forge:<stage>`) sind zugleich die Trigger-Keys. Jeder Conductor-Tick ist ein `ConductorTickCompleted`-Event. Details: [`docs/conductor-design.md`](docs/conductor-design.md).
 
+Seit v0.7 ([`docs/forge-spec-v0.7.md`](docs/forge-spec-v0.7.md)) läuft die Fabrik ohne menschliches Nachschieben bis zum Release:
+
+- **Nacharbeit**: `request_changes` → zurück nach `in-dev`, das Dev-Team arbeitet auf demselben PR nach. **Roter CI** und **Merge-Konflikte** nach Geschwister-Merges repariert forge ebenfalls auf dem PR-Branch.
+- **Arbeit erzeugen** (opt-in): Specs als PR, **Epics** (`forge:epic`) werden in Items mit `Depends-On:`/`Touches:` zerlegt, Funde aus Runs/Reviews, roter `main`-CI und Schedules werden zu Items — erst nach Freigabe (`forge:proposed`) bearbeitet.
+- **Arbeitsgraph**: Items mit disjunkten `Touches:` laufen parallel in eigenen Worktrees, überlappende nacheinander; die Kapazität folgt Budget und Ressourcen.
+- **Release-Train**: SemVer + Changelog per Release-PR, Tag nach dem Merge.
+
 ## Befehle
 
 | Befehl | Zweck |
 |---|---|
 | `forge init` | Legt ein rudimentäres `.forge/project.yaml` an (idempotent, überschreibt nicht) |
-| `forge doctor` | Prüft Spec-Konsistenz, Tool-Verfügbarkeit, API-Key/Auth |
+| `forge doctor` | Prüft Spec-Konsistenz, Tool-Verfügbarkeit, API-Key/Auth; `--board [--fix]` prüft/legt die `forge:`-Labels im Tracker an |
 | `forge run` | Ein Sequential-Run gegen ein Issue/einen Prompt (`--multi-agent`, `--agents`, `--create-pr`, `--dry-run`, `--resume`) |
 | `forge plan` | Generiert einen Plan (architect-only, **kein** Code) |
-| `forge board-loop` | **Fabrik**: zieht ready-Items vom GitHub Project Board und dispatcht sie (`--watch`, `--conductor`, `--max-parallel`, `--auto-merge`) |
+| `forge board-loop` | **Fabrik**: zieht ready-Items vom Board (GitHub oder Azure DevOps) und dispatcht sie (`--watch`, `--conductor`, `--max-parallel`, `--max-ticks`, `--auto-merge`) |
 | `forge review-pr <N>` | Ein Agent reviewed einen offenen PR und merged ihn opt-in (approve + grüner CI + `capabilities.merge_pr`) |
 | `forge watch [RUN_ID]` | Live-Tracking eines laufenden Runs (Worktree-Aktivität + Event-Chronik) |
 | `forge analyze` | Markdown-Reports aus dem Event-Store (Merge-Rate, Cost/PR, Lead-Time, Lessons Learned) |
@@ -121,6 +128,7 @@ Volle Optionen: `forge <command> --help`. Aufgabenorientierte Anleitung: [`docs/
 | v0.4 | Board-Trigger + Issue-Triage + Auto-Merge-Queue | ✅ |
 | v0.5 | LLM-Judge — Verifikation gegen Akzeptanzkriterien (opt-in) | ✅ |
 | v0.6 | Loop-2-Conductor-Pipeline (requirements→done), `/simplify`, reviewer, Session-Resilienz (`--resume`), `review-pr`, Memory/Lessons-Learned, `forge init` | ✅ |
+| v0.7 | Software-Fabrik: GitHub + Azure DevOps, Nacharbeit/CI-Fix/Sync, Arbeit erzeugen (Specs/Epics/Bugs), Arbeitsgraph, Release-Train | ✅ (Live-Durchstich offen) |
 
 Detaillierter Fortschritt: [`docs/progress.md`](docs/progress.md).
 

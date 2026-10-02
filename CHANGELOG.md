@@ -2,6 +2,50 @@
 
 Alle bemerkenswerten Änderungen an forge werden hier dokumentiert. Format: [Keep a Changelog](https://keepachangelog.com/), Versionierung: [SemVer](https://semver.org/).
 
+## [Unreleased] — v0.7: Software-Fabrik über den ganzen SDLC
+
+740 Tests grün, ruff clean. Spec-Diff: `docs/forge-spec-v0.7.md`, Design:
+`docs/sdlc-factory-roadmap.md`.
+
+### Hinzugefügt
+
+- **Anbieter-Schnittstellen** `WorkTracker`/`CodeHost` (`forge_adapters.base`)
+  mit GitHub- und **Azure-DevOps**-Implementierung, In-Memory-Fakes, Registry
+  und Vertrags-Testsuite; Spec-Block `provider:` (gemischte Setups möglich),
+  Azure-Pipelines-Templates, Beispiel `examples/azure-devops/`.
+- `forge doctor --board [--fix]`, `board-loop --max-ticks`,
+  `scripts/conductor-smoke.sh` (Live-Durchstich).
+- **Nacharbeits-Loop** `qa → in-dev` bei `request_changes` (Review-Begründung
+  als Kontext), **CI-Autofix**, **Nachziehen konfliktbehafteter PRs** — alle auf
+  dem bestehenden PR-Branch, nur fast-forward, mit Eskalation nach `blocked`.
+- **Arbeit erzeugen** (opt-in `capabilities.create_work_items`, `intake:`):
+  Spec-PRs/-Kommentare, Epic-Zerlegung (`forge:epic` → `forge:tracking`),
+  Funde aus Runs und Reviews, Bug bei rotem `main`-CI, Schedule-Epics; Start in
+  `forge:proposed`, Fingerprint-Dedupe, Obergrenzen.
+- **Arbeitsgraph**: `Touches:`-Konfliktkanten, budget-/ressourcenabhängige
+  Kapazität, optionaler Integrations-Branch pro Epic.
+- **Release-Train** (`release.mode: train`): SemVer aus Conventional Commits,
+  Changelog, `version_files`, Release-PR, Tag nach dem Merge.
+- Views `factory_intake`, `factory_parallelism`, `factory_releases` +
+  `forge analyze`-Sektionen.
+- EventKind `WorkItemCreated` (27); additive Bumps `RunStarted` 1.1,
+  `PRReviewed` 1.1, `WorkItemBlocked` 1.2, `ReleaseTagged` 1.1,
+  `ConductorTickCompleted` 1.2.
+
+### Behoben
+
+- `forge-execute/triage` importierte aus `forge-adapters` (Package-Grenze) —
+  Side-Effects laufen jetzt über `WorkTracker`.
+- `_kill_tree` konnte auf POSIX die eigene Prozessgruppe (pytest/forge) killen.
+- Ein fortgesetzter Run (`--resume`) aus Design/Requirements öffnete einen PR.
+
+### Boundaries — was bewusst NICHT geändert wurde
+
+- Runner, Scoring, Gates, Keep/Discard unverändert (Mantra 3) — alles Neue lebt
+  in Loop 2, in den Adaptern und in additiven Spec-Feldern.
+- `push_to_main`/`push_force` bleiben `Literal[False]`; Pushes auf bestehende
+  Branches nur auf `forge/*`, nie `--force`.
+
 ## [Unreleased] — v0.5: LLM-Judge Verifikationsphase
 
 322 Tests grün, ruff clean.

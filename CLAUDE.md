@@ -7,7 +7,7 @@ Read the following file for additional important information:
 
 ## Einordnung
 
-forge ist die **messbare, replay-fähige Auto-PR-Maschine** aus `docs/forge-spec-v0.5.md` (Diff-Doku gegenüber v0.4/v0.3/v0.2, die als historische Snapshots im Repo bleiben). Die Spec ist Vertrag: wenn dein Vorschlag einem der drei Mantras widerspricht, ist es kein Bug, sondern eine Designentscheidung.
+forge ist die **messbare, replay-fähige Auto-PR-Maschine** aus `docs/forge-spec-v0.5.md` (Diff-Doku gegenüber v0.4/v0.3/v0.2, die als historische Snapshots im Repo bleiben), seit v0.6/v0.7 erweitert zur **Software-Fabrik über den ganzen SDLC** (`docs/forge-spec-v0.7.md`, Design + Entscheidungen: `docs/sdlc-factory-roadmap.md`). Die Spec ist Vertrag: wenn dein Vorschlag einem der drei Mantras widerspricht, ist es kein Bug, sondern eine Designentscheidung.
 
 Die drei Mantras:
 
@@ -34,17 +34,21 @@ forge-core ──── Schema, Store, CAS, Spec, Replay (keine internen Deps)
      │       │
      │       └── forge-cli ──── Endbenutzer-CLI
      │              │
-     └── forge-adapters ──── GitHub: PR + Webhook + Action-Templates
+     └── forge-adapters ──── WorkTracker/CodeHost: GitHub, Azure DevOps (+ Fakes, Templates)
             │
             └── forge-cli (transitiv)
 ```
 
-**Boundaries sind hart**:
+**Boundaries sind hart** (erzwungen per AST-Test `forge-cli/tests/test_package_boundaries.py`):
 - `forge-core` darf keine Imports aus `forge-execute`/`forge-cli`/`forge-adapters` haben
-- `forge-execute` darf keine Imports aus `forge-cli`/`forge-adapters` haben
-- `forge-cli` und `forge-adapters` dürfen sich gegenseitig referenzieren
+- `forge-execute` darf keine Imports aus `forge-cli`/`forge-adapters` haben (auch nicht für Typen — neutrale Typen wie `ReadyIssue` liegen in `forge_core.tracking`)
+- `forge-cli` nutzt aus `forge-adapters` nur die anbieter-neutralen Module `base`/`text`/`registry`/`fake` — nie `forge_adapters.github`/`.azure` direkt (Ausnahme: Legacy-`run_subprocess`-Pfad in `review_pr`)
 
 Wenn du eine Datei verschiebst, prüfe Import-Direction.
+
+### Anbieter: `WorkTracker` + `CodeHost`
+
+forge spricht mit GitHub und Azure DevOps über zwei Protocols in `forge_adapters/base.py`: `WorkTracker` (Items lesen, Stage-Labels/-Tags setzen, kommentieren, schließen, anlegen, Body-Suche) und `CodeHost` (Push, PR öffnen, Review, Merge, CI-Status, Release). Getrennt, weil gemischte Setups üblich sind (`provider.tracker` ≠ `provider.code_host`). `registry.build_tracker/build_code_host` baut die Implementierung aus der Spec; `ForgeContext.get_tracker()/get_code_host()` cached sie, Tests setzen `ctx.tracker`/`ctx.code_host` direkt auf `InMemoryTracker`/`InMemoryCodeHost`. Ein neuer Anbieter ist fertig, wenn er `forge-adapters/tests/test_provider_contract.py` besteht (läuft gegen In-Memory, GitHub über `gh_sim` und Azure über `az_sim`). Fehler sind immer `TrackerError`/`CodeHostError` — der Conductor fängt nur diese. Pushes laufen ausschließlich über `git_push_argv`: nie `--force`, ein Ziel-Branch (`target`) nur `forge/*`.
 
 ## Build / Test / Lint Commands
 
@@ -53,7 +57,7 @@ Wenn du eine Datei verschiebst, prüfe Import-Direction.
 uv sync --all-packages --extra dev
 
 # Volltest
-uv run pytest                            # 163 Tests, ~40s
+uv run pytest                            # ~740 Tests, ~90s
 uv run pytest packages/forge-core        # nur ein Package
 uv run pytest -v --tb=short              # verbose mit kurzem Traceback
 
@@ -143,15 +147,40 @@ verzweigt nach `DispatchOrder.stage`:
   `conductor.pr_number_for_issue`),
 - sonst → der bestehende Dev-Loop (`_dispatch_issues`, PR).
 
-Der QA-Dispatch ist zusätzlich durch `StageSignals.review_done` gegated: ein
-bereits gereviewter (aber nicht gemergter, z.B. `request_changes`) PR wird nicht
-jeden Tick erneut reviewt — sonst teure Endlosschleife. Neue executable Stage =
+Der QA-Dispatch ist zusätzlich durch `StageSignals.review_done` gegated (kein
+Endlos-Re-Review) und wartet auf fertigen, nicht-roten CI. Neue executable Stage =
 Eintrag in `IN_PLACE_WORK_STAGES` **+** Advance-Signal in `StageSignals`/`advance`
-**+** Dispatch-Zweig. `requirements`/`release` fehlt jeweils noch ihr
-„fertig"-Signal. **Noch offen:** Live-Verifikation der gh-Kommandos gegen ein
-echtes Board (bisher nur Stub-getestet); Re-Dispatch/Eskalation eines
-`in-dev`-Items, dessen Run keinen PR produzierte; Re-Review nach neuen Commits
-auf einem `request_changes`-PR (reaktiv, Inkrement 1c).
+**+** Dispatch-Zweig.
+
+**Seit v0.7 (Roadmap L1/L2/G/A/L3)** — alles Loop 2, Runner unverändert:
+- *Nacharbeit / CI-Fix / Merge-Konflikt* laufen als **Run auf dem bestehenden
+  PR-Branch** (`_dispatch_branch_run`): `base_ref` = frisch geholter PR-Head
+  (`WorktreeManager.fetch_remote_branch`), Ergebnis fast-forward zurück auf den
+  Head (`CodeHost.push_branch(target=…)`). `DispatchOrder.kind` ∈
+  `run|rework|ci_fix|sync`. Signale (`changes_requested`, `ci_status`,
+  `conflicting`, …) sind rein aus Events + injizierten Code-Host-Beobachtungen
+  (`_pr_observation`: Head-Zeit, CI, State, Mergeable). Höchstens ein Run pro
+  Review/Head; Scheitern (auch ein fehlgeschlagener Push) → `blocked`.
+  Obergrenzen `MAX_REWORK_ROUNDS`/`MAX_CI_FIX_ATTEMPTS` (2, Konstanten).
+- *Merge-Konflikte*: `workgraph.sync_branch` merged erst deterministisch die
+  Basis (sauber → Push, kein LLM); bei Konflikten wird der Konflikt-Stand lokal
+  committet und ein `conflict`-Run startet von dort (Auflösung = rot→grün-KEEP).
+- *Beobachtete Merges* ohne Event (Mensch, Azure) trägt der Tick als
+  `PRMerged(merger="external")` nach.
+- *Stages* `forge:epic` → `forge:tracking` (Zerlegung, Kinder) und
+  `forge:proposed` (von forge erzeugt — der Conductor verlässt sie NIE).
+- *Arbeitsgraph*: `Touches:`-Globs im Body → Konfliktkanten in
+  `plan_tick._select_with_file_conflicts` (pro Tick neu berechnet, nicht
+  gespeichert); Kapazität `conductor.effective_capacity` aus Budget/⌀Kosten/Disk.
+- *Release-Train* (`release.py`, `release.mode: train`): Release-PR statt Push
+  auf main, Tag nach dem Merge, `ReleaseTagged.issue_numbers`.
+- Effekt-Module neben `board_loop.py`: `workgen.py` (Specs + Intake-Effekte +
+  Tick-Quellen), `workgraph.py` (Kapazität, Sync, Integrations-Branch),
+  `release.py`; reine Logik in `intake.py`, `conductor.py`, `stages.py`,
+  `dependencies.py`.
+
+**Noch offen:** Live-Verifikation gegen ein echtes GitHub-Board bzw. Azure-
+Projekt (`scripts/conductor-smoke.sh` ist dafür da; bisher Simulator-getestet).
 
 Mantra 3: der Heartbeat taktet das Dispatchen von Runs
 (`execute_run`), greift aber nie in Runner/Scoring/Gates ein. Die
@@ -253,7 +282,9 @@ dann reviewed `forge review-pr` nur und merged nie.
 - Breaking Änderungen → eigentlich nicht erlaubt in v1, weil historische Daten nicht migriert werden
 - Neuer EventKind → neue Datei in `events/kinds/`, `register_payload(...)` aufrufen
 
-Vor jeder Schema-Änderung: `len(EventKind) == 26` und `len(_PAYLOAD_REGISTRY) == 26` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22; + Agent-Review-Merge: `PRReviewed` = 23; + Pipeline-Enden: `RequirementsRefined`/`ReleaseTagged` = 25; + Gedächtnis: `LessonLearned` = 26).
+Vor jeder Schema-Änderung: `len(EventKind) == 27` und `len(_PAYLOAD_REGISTRY) == 27` testen (v0.4 = v0.3-17 + `ISSUE_TRIAGED` = 18; + Loop 2: `ConductorTickCompleted`/`WorkItemStageChanged`/`WorkItemBlocked` = 21; + Resilienz: `RunResumeScheduled` = 22; + Agent-Review-Merge: `PRReviewed` = 23; + Pipeline-Enden: `RequirementsRefined`/`ReleaseTagged` = 25; + Gedächtnis: `LessonLearned` = 26; + Arbeit erzeugen: `WorkItemCreated` = 27).
+
+v0.7 (alle additiv): `RunStarted` **1.1** (`trigger="rework"`, `provider`), `PRReviewed` **1.1** (`reasoning_blob`), `WorkItemBlocked` **1.2** (kinds `rework_*`, `ci_fix_exhausted`, `file_conflict`, `merge_conflict`), `ReleaseTagged` **1.1** (`version`, `issue_numbers`, `integrated_into`), `ConductorTickCompleted` **1.2** (`parallel_running`, `capacity`).
 
 `PRMerged` steht auf Schema **1.1** (additiv: `merged_by_forge` + `merge_method` für forge-initiierte Merges). Alte 1.0-Events lesen weiter (Defaults).
 
@@ -295,6 +326,10 @@ Drei gemessene Kostentreiber orchestrierter Runs (Analyse eines $19/57-min-Runs:
 
 `_project_memory.py` baut den Memory-Block aus mehreren Quellen, alle **read-only aus dem Event-Strom** (bzw. dem Operator-Seed): Operator-Seed (`.forge/memory.md`), **Lessons learned** (`LessonLearned`-Events, s.u.), **Recent run outcomes** (`RunStarted` + `RunFinished` + `PRMerged`, korreliert über `run_id`), **Recurring failures & dead-ends** (gruppiert aus Events mit `success=false` nach `kind`+`error_class`), **Frequently touched files** (aggregiert aus `ProposalReceived.files_touched`, ab `_MIN_HOTSPOT_HITS` Proposals) und jüngsten Plan-Summaries. Die Outcomes/Failures/Hotspots existieren, weil der Seed zwangsläufig veraltet: `.forge/**` ist für den Agenten Forbidden Zone, forge selbst schreibt `memory.md` NIE (Operator-Datei) — ein „WP4 noch offen" im Seed bleibt also stehen, obwohl der PR längst gemerged ist. Der Addendum-Text legt fest: bei Widerspruch gewinnen die Run-Outcomes, nicht die Seed-Prosa. Wenn du hier erweiterst: Memory ist read-only-Auswertung des Event-Stroms (Mantra 3), keine neue Event-Logik.
 
+### Arbeit erzeugen: Runner liefert Rohdaten, Loop 2 legt an
+
+Der `---FORGE-WORKITEMS-BEGIN/END---`-Block (YAML-Liste: id, kind, title, depends_on, touches, body) steht im Orchestrator- und im Review-Prompt. `claude_cli` slict ihn (`extract_workitems_block`), der Runner reicht ihn nur als `RunResult.workitems_blocks` durch — er emittiert **kein** `WorkItemCreated` und kennt keinen Tracker (Mantra 3). `intake.py` (rein: Parser, Fingerprint, Start-Stage, Reihenfolge) + `workgen.py` (Effekte) legen an. Die verdichtete Spec aus dem requirements-Run (`RequirementsRefined.artifacts["spec"]`) wird Spec-PR (`forge:spec`, gated `requirements→design`) oder Kommentar; die **gemergte Spec-Datei gewinnt** über den Blob und fließt in alle folgenden Runs als Akzeptanzkriterium (`workgen.with_refined_spec`).
+
 ### Lessons learned: das einzige Gedächtnis-Schreibevent
 
 `LessonLearned` (forge-core, Schema 1.0) ist die **eine** Ausnahme zur reinen Derivation: eine kuratierte, destillierte Lektion (Konvention, Stolperfalle, Pattern), die der Master-Agent am Run-Ende im optionalen `---FORGE-LESSONS-BEGIN/END---`-Block zurückmeldet — **nicht** aus anderen Events ableitbar, deshalb ein eigenes Event. Pfad: Orchestrator-Prompt fordert den Block an → `extract_lessons_block` (templates) slict ihn → `_lesson_parser.parse_lessons` (best-effort, fail-open: kein Block = keine Lektion, forge erfindet nie welche) → Runner `_emit_lessons_learned` (eine Emission pro Lektion, `source="agent"`). Gelesen wird read-only via `collect_recent_lessons` (dedupe nach Text, neuestes gewinnt). **Wichtig (Mantra 3 + Forbidden Zone):** die Lektionen leben im replay-fähigen Event-Strom, NICHT in `.forge/memory.md`. forge schreibt den Operator-Seed weiterhin nie — so kann der Agent sein eigenes Gedächtnis nicht über die Forbidden Zone manipulieren. „Memory updatet sich automatisch" = neue `LessonLearned`-Events pro Run, die der Block beim nächsten Run reflektiert. Nebenbei repariert: `ProposalReceived.files_touched` war ein leerer Stub und wird jetzt aus dem Diff befüllt (`runner._changed_files`) — Datengrundlage der File-Heatmap.
@@ -324,6 +359,10 @@ Läuft ein orchestrierter Run mitten in der Arbeit in ein Claude-Usage-/Session-
 4. **Subprocess-Isolation** (Prozess-Ebene) — Worktree pro Run, separate venv kommt in M2
 
 `push_to_main` / `push_force` sind dreifach gesichert: in der Spec via `Literal[False]`, in `Capabilities.check_action` als hartkodiertes Deny, und im PR-Body steht der Hinweis explizit.
+
+Pushes auf **bestehende** Branches (Nacharbeit, CI-Fix, Sync, Integrations-Branch, Release-PR) sind nur auf `forge/*` erlaubt und nur fast-forward — `git_push_argv` (forge-adapters) ist die eine Stelle, die das für alle Anbieter erzwingt. Menschliche Branches und `main` fasst forge nie an.
+
+`create_work_items` (opt-in) erlaubt forge, selbst Work-Items anzulegen. Die Fabrik darf sich dabei nicht selbst zuschütten: `intake`-Obergrenzen pro Epic/Tag, Fingerprint-Dedupe und Start in `forge:proposed` (nur ein Mensch gibt frei; Ausnahme: Kinder eines vom Menschen freigegebenen Epics, Typen in `intake.auto_accept`). Agent-Text (Epic-Bodies, CI-Logs, Review-Begründungen) ist untrusted: nur argv, im Prompt gewrappt (`forge_adapters.text.wrap_untrusted`).
 
 `merge_pr` ist **nicht** mehr hart-deny (Agent-Review-Merge): `bool` in der Spec, gefolgt von `Capabilities.check_action`. Die Sicherheit liegt hier in der **Mehrfach-Bedingung** vor dem Merge (`pr_review.decide_merge`): opt-in-Capability **und** Agent-`approve` **und** `score >= threshold` **und** grüner CI **und** kein Merge-Konflikt. Fail-closed: scheitert der Review-Agent, gilt `request_changes`/`0.0` → kein Merge.
 

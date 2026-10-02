@@ -1,9 +1,10 @@
 # forge als Software-Fabrik — Roadmap: kompletter SDLC bis Release
 
-> Status: **Entwurf, nichts davon implementiert.** Dieses Dokument beschreibt
-> die Lücken zwischen dem heutigen Conductor-Fließband und einer Fabrik, die
-> ohne menschliches Nachschieben vom Wunsch bis zum Release läuft. Es endet mit
-> den Entscheidungen, die der Operator treffen muss, bevor Code entsteht.
+> Status: **umgesetzt** (Stand 2026-10-02, Branch `ccr-3e5ca8c7-cr78gv`). Alle
+> Abschnitte L0–L3, P, A und G sind implementiert und getestet; die
+> Entscheidungen E1–E14 wurden wie vorgeschlagen getroffen. Spec-Diff:
+> [`forge-spec-v0.7.md`](forge-spec-v0.7.md). Was bewusst vom Entwurf
+> abweicht und was noch offen ist, steht in **§8 Umsetzungsstand** am Ende.
 > Bezug: [`conductor-design.md`](conductor-design.md), [`forge-spec-v0.6.md`](forge-spec-v0.6.md).
 
 ## 0. Wo wir stehen
@@ -560,3 +561,49 @@ additiven Spec-Feldern.
 | E12 | A1: Feature-Specs als Datei im Repo (`docs/specs/`, via PR) oder nur als Kommentar am Work-Item? | **Datei via PR** für Features/Epics, Kommentar für Bugs/Tasks. |
 | E13 | G: Integrations-Branch pro Epic als Option anbieten oder immer direkt gegen `main`? | **Option, Default `direct`.** Integrations-Branch nur für Epics, die nur als Ganzes ausgeliefert werden dürfen. |
 | E14 | G: `Touches:` (erwartete Dateien) Pflicht für Parallelität, oder darf forge ohne Angabe parallelisieren? | **Pflicht** — ohne `Touches:` läuft ein Knoten allein. Sicher vor schnell. |
+
+
+---
+
+## 8. Umsetzungsstand
+
+| # | Abschnitt | Stand | Wo |
+|---|---|---|---|
+| L0 | Live-Verifikation | ✅ Werkzeug da: `forge doctor --board [--fix]`, `board-loop --max-ticks`, `scripts/conductor-smoke.sh`. Der Lauf gegen ein echtes Sandbox-Board steht noch aus. | `doctor.py` |
+| P0 | Provider-Schnittstelle | ✅ `WorkTracker`/`CodeHost`, Registry, Fakes, Vertrags-Suite, Grenzverstoß in `triage/` behoben (AST-Test) | `forge_adapters/base.py`, `registry.py`, `fake.py` |
+| L1 | Nacharbeit | ✅ | `conductor.py`, `stages.py`, `board_loop._dispatch_branch_run` |
+| L2 | CI-Autofix | ✅ | dito |
+| P1 | Azure DevOps | ✅ Boards/Repos/Pipelines über `az`, Pipelines-Templates, Beispiel-Spec | `forge_adapters/azure/` |
+| A | Arbeit erzeugen | ✅ Specs, Epics, Funde, Review-Folgeaufgaben, CI rot auf main, Schedules | `intake.py`, `workgen.py` |
+| G | Arbeitsgraph | ✅ Touches-Konflikte, Kapazität, Sync, Integrations-Branch | `conductor.py`, `workgraph.py` |
+| L3 | Release-Train | ✅ | `release.py` |
+
+**Bewusste Abweichungen vom Entwurf**
+
+- `RequirementsRefined` blieb auf 1.0: die Spec liegt schon als
+  `artifacts["spec"]` im Event, der Spec-PR ist ein normales `PRCreated` mit
+  Label `forge:spec`. Ein zusätzliches `spec_path`-Feld hätte nichts gebracht.
+- `EpicDecomposed` entfiel zugunsten des generischen `WorkItemCreated`
+  (Kanten + Eltern daraus rekonstruierbar) — wie in A4 vorgesehen.
+- E14 präzisiert: ein Code-Run **ohne** `Touches:` läuft nie gleichzeitig mit
+  einem anderen Code-Run; gegenüber bereits offenen PRs ohne `Touches:` gibt es
+  keine Kante (sonst wäre jede Fabrik ohne Touches-Angaben strikt seriell) —
+  Konflikte mit offenen PRs fängt das Nachziehen (`sync`) ab.
+- Azure DevOps kennt kein Release-Objekt → Release = annotierter Git-Tag.
+  PR-Diff und Head-Commit-Zeit liest der Adapter über git (die `az`-CLI
+  liefert beides nicht), Review-Kommentare über `az devops invoke`.
+- Merge-Konflikte: statt eines LLM-Runs für jeden Konflikt erst ein
+  deterministischer Merge der Basis; nur echte Konflikte gehen an einen Agenten,
+  der von einem lokal committeten Konflikt-Stand startet (rot→grün-Pfad).
+- Zusätzlich (nicht im Entwurf, aus der Azure-Arbeit gefolgt): der Conductor
+  trägt beim Code-Host beobachtete Merges als `PRMerged(merger="external")`
+  nach — ersetzt anbieter-neutral den Webhook.
+
+**Offen**
+
+- Der echte Live-Durchstich gegen ein GitHub-Board und ein Azure-Projekt
+  (`scripts/conductor-smoke.sh`). Bis dahin sind alle Anbieter-Kanten nur gegen
+  CLI-Simulatoren verifiziert.
+- Release-Notes-Agent (optional, fail-open) — der Changelog ist rein
+  deterministisch.
+- Deploy/Post-Release (§5) unverändert offen (E8).

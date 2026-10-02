@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from forge_cli.review_pr import execute_pr_review
+from forge_core.blobs import BlobStore
 from forge_core.events import EventKind
 from forge_core.spec import ProjectSpec
 from forge_core.store import EventStore
@@ -40,6 +41,9 @@ class _Ctx:
 
     def open_store(self) -> EventStore:
         return EventStore(self.store_path)
+
+    def open_blobs(self) -> BlobStore:
+        return BlobStore(self.store_path.parent / "blobs")
 
 
 def _ctx(tmp_path: Path, *, merge_pr: bool) -> _Ctx:
@@ -125,6 +129,9 @@ def test_review_does_not_merge_when_capability_off(tmp_path: Path) -> None:
     assert _kinds(ctx.store_path, EventKind.PR_MERGED) == []
     reviewed = _kinds(ctx.store_path, EventKind.PR_REVIEWED)
     assert reviewed[0].payload["merge_blocked_reason"] == "capability_disabled"
+    # L1: die Begründung liegt im CAS (Kontext für einen Nacharbeits-Run).
+    blob = reviewed[0].payload["reasoning_blob"]
+    assert blob and ctx.open_blobs().get_text(blob) == out.reasoning
 
 
 def test_review_does_not_merge_when_ci_red(tmp_path: Path) -> None:

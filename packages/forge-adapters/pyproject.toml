@@ -24,3 +24,4 @@ packages = ["src/forge_adapters"]
 
 [tool.hatch.build.targets.wheel.shared-data]
 "src/forge_adapters/github/templates" = "share/forge_adapters/github/templates"
+"src/forge_adapters/azure/templates" = "share/forge_adapters/azure/templates"

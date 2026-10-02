@@ -1,0 +1,64 @@
+# Beispiel: forge gegen Azure DevOps (Boards + Repos + Pipelines).
+#
+# Stages laufen über Work-Item-Tags (forge:<stage>), PRs über Azure Repos,
+# CI über die Build-Validation-Policies des PRs. Auth: AZURE_DEVOPS_EXT_PAT
+# oder `az login` — nie hier eintragen.
+#
+# Gemischt (Azure Boards + GitHub-Repos): provider.code_host: github setzen.
+
+spec_version: "1.0"
+name: shop
+language_stack: [python]
+
+provider:
+  tracker: azure_devops
+  # code_host: github          # optional: Code liegt auf GitHub
+  azure:
+    organization: contoso       # oder https://dev.azure.com/contoso
+    project: Shop
+    repository: shop-web        # Default: Projektname
+    closed_state: Closed        # Scrum: Done
+    # work_item_types: {story: "Product Backlog Item"}   # Scrum-Template
+
+# Ready-Items für den flachen board-loop: State + Tags.
+board:
+  filter_status: New
+  filter_labels: [auto-fix]
+
+surfaces:
+  app:
+    paths: ["src/"]
+    type: code
+
+forbidden:
+  - ".forge/**"
+  - ".github/workflows/**"
+  - "azure-pipelines*.yml"
+
+capabilities:
+  run: ["pytest *", "python *"]
+  merge_pr: false               # opt-in Agent-Review-Merge
+  create_release: false         # opt-in Tag in der release-Stage
+  network_egress: ["api.anthropic.com", "dev.azure.com"]
+
+eval_suites:
+  quick:
+    cmd: "python -m pytest -q --tb=no"
+    budget_s: 300
+    parses: pytest_json
+
+gates:
+  - {kind: pytest_pass_rate, threshold: 1.0, source: quick}
+
+cost_caps:
+  per_generation_usd: 0.50
+  per_run_usd: 2.00
+  per_project_per_day_usd: 10.00
+  per_project_per_month_usd: 100.00
+
+triggers:
+  on_issue_label:
+    "forge:design": {strategy: sequential, model: sonnet, agents: [architect]}
+    "forge:ready": {strategy: sequential, model: sonnet}
+  on_ci_failure:
+    model: sonnet

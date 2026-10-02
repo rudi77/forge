@@ -73,8 +73,6 @@ PROVIDERS = {"memory": _memory, "github": _github, "azure": _azure}
 
 @pytest.fixture(params=sorted(PROVIDERS))
 def provider(request, tmp_path: Path) -> Provider:
-    if request.param == "azure":
-        pytest.importorskip("forge_adapters.azure")
     return PROVIDERS[request.param](tmp_path)
 
 
@@ -89,7 +87,13 @@ def _public_methods(cls) -> dict[str, inspect.Signature]:
     }
 
 
-@pytest.mark.parametrize("impl", [InMemoryTracker, GitHubTracker])
+def _azure_classes():
+    from forge_adapters.azure import AzureBoardsTracker, AzureReposCodeHost
+
+    return AzureBoardsTracker, AzureReposCodeHost
+
+
+@pytest.mark.parametrize("impl", [InMemoryTracker, GitHubTracker, _azure_classes()[0]])
 def test_tracker_implements_full_protocol(impl) -> None:
     proto = _public_methods(WorkTracker)
     have = _public_methods(impl)
@@ -98,7 +102,7 @@ def test_tracker_implements_full_protocol(impl) -> None:
         assert list(have[name].parameters) == list(sig.parameters), name
 
 
-@pytest.mark.parametrize("impl", [InMemoryCodeHost, GitHubCodeHost])
+@pytest.mark.parametrize("impl", [InMemoryCodeHost, GitHubCodeHost, _azure_classes()[1]])
 def test_code_host_implements_full_protocol(impl) -> None:
     proto = _public_methods(CodeHost)
     have = _public_methods(impl)

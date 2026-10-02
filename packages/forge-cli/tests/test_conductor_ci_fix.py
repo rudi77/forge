@@ -209,3 +209,34 @@ def test_ci_fix_run_uses_ci_failure_trigger_and_roster(tmp_path: Path, monkeypat
     assert seen["agents"] == ["developer"]
     assert "BEGIN UNTRUSTED CI FAILURE" in seen["rendered_prompt"]
     assert ctx.code_host.pushed == ["forge/fix:forge/orig"]
+
+
+def test_conductor_records_externally_observed_merge(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ein beim Code-Host gemergter PR ohne PRMerged-Event (Mensch, Azure ohne
+    Webhook) wird nachgetragen → qa → release im selben Tick."""
+    from forge_core.events import PRCreatedPayload, RunStartedPayload, build_event
+
+    ctx = _ctx(tmp_path)
+    pr = ctx.code_host.open_change(branch="forge/r8", title="t", body="b", push=False)
+    ctx.code_host.prs[pr.pr_number].state = "MERGED"
+    ctx.tracker.add(ReadyIssue(number=8, title="t", body="b", labels=["forge:qa"],
+                               project_status="", url=""))
+    common = dict(project="p", project_fingerprint="sha256:test",
+                  factory_version="git:test", spec_version="1.0")
+    store = ctx.open_store()
+    store.append(build_event(kind=EK.RUN_STARTED, run_id="r8", payload=RunStartedPayload(
+        trigger="issue_label", strategy="sequential", config_hash="c", issue_number=8),
+        **common))
+    store.append(build_event(kind=EK.PR_CREATED, run_id="r8", payload=PRCreatedPayload(
+        pr_number=pr.pr_number, branch="forge/r8"), **common))
+    store.close()
+    monkeypatch.setattr(bl, "_dispatch_release_run", lambda **kw: None)
+
+    bl._run_conductor_watch(ctx=ctx, max_issues=3, interval_s=0, params=_params(),
+                            triager=None, capabilities=None, max_ticks=2)
+    assert ctx.tracker.stage_calls[0] == (8, "forge:release", "forge:qa")
+    store = ctx.open_store()
+    merged = store.events_by_kind(EK.PR_MERGED)
+    store.close()
+    assert len(merged) == 1  # idempotent über zwei Ticks
+    assert merged[0].payload["merger"] == "external"

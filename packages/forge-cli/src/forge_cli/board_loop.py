@@ -32,6 +32,7 @@ from forge_core.events import (
     ConductorTickCompletedPayload,
     EventKind,
     IssueTriagedPayload,
+    PRMergedPayload,
     ReleaseTaggedPayload,
     WorkItemBlockedPayload,
     WorkItemStageChangedPayload,
@@ -966,17 +967,52 @@ def _dispatch_branch_run(
 
 
 def _pr_observation(ctx: ForgeContext, pr_number: int):
-    """(Head-Commit-Zeitstempel, CI-Status) eines offenen PRs vom Code-Host.
+    """(Head-Commit-Zeitstempel, CI-Status, PR-State) vom Code-Host.
 
     Fail-open: jeder Code-Host-Fehler → ``None`` (Signal unbekannt → altes
     Verhalten), damit ein Schluckauf den Tick nicht wedged."""
     host = ctx.get_code_host()
     head = host.head_committed_at(pr_number)
     try:
-        ci = host.fetch_metadata(pr_number).ci_status
+        meta = host.fetch_metadata(pr_number)
+        ci, state = meta.ci_status, meta.state
     except CodeHostError:
-        ci = None
-    return head, ci
+        ci, state = None, None
+    return head, ci, state
+
+
+def _record_observed_merge(
+    ctx: ForgeContext, store: Any, events: list, pr_number: int, session_id: str
+) -> Any | None:
+    """Trägt einen beim Code-Host beobachteten, aber noch nicht als Event
+    erfassten Merge als ``PRMerged`` nach (Mensch hat gemergt, Auto-Merge, kein
+    Webhook — z.B. Azure DevOps). Damit bleibt der Event-Strom die einzige
+    Wahrheit für ``qa → release``, unabhängig vom Anbieter. Idempotent: nur
+    wenn noch kein ``PRMerged`` für ``pr_number`` existiert."""
+    if any(
+        e.kind == EventKind.PR_MERGED and (e.payload or {}).get("pr_number") == pr_number
+        for e in events
+    ):
+        return None
+    created = [
+        e.ts
+        for e in events
+        if e.kind == EventKind.PR_CREATED and (e.payload or {}).get("pr_number") == pr_number
+    ]
+    ttm = int((datetime.now(UTC) - min(created)).total_seconds()) if created else 0
+    evt = build_event(
+        kind=EventKind.PR_MERGED,
+        run_id=session_id,
+        project=ctx.spec.name,
+        project_fingerprint=ctx.project_fingerprint,
+        factory_version=ctx.factory_version,
+        spec_version=ctx.spec.spec_version,
+        payload=PRMergedPayload(
+            pr_number=pr_number, merger="external", time_to_merge_s=max(ttm, 0)
+        ),
+    )
+    store.append(evt)
+    return evt
 
 
 def _ci_fix_roster(spec) -> list[str] | None:
@@ -1408,7 +1444,15 @@ def _run_conductor_watch(
                 if stage in (Stage.QA, Stage.IN_DEV):
                     qa_pr = pr_number_for_issue(events, issue.number)
                     if qa_pr is not None:
-                        head_committed_at, ci_status = _pr_observation(ctx, qa_pr)
+                        head_committed_at, ci_status, pr_state = _pr_observation(
+                            ctx, qa_pr
+                        )
+                        if pr_state == "MERGED":
+                            merged_evt = _record_observed_merge(
+                                ctx, store, events, qa_pr, session_id
+                            )
+                            if merged_evt is not None:
+                                events.append(merged_evt)
                 signals = derive_signals(
                     events,
                     issue.number,

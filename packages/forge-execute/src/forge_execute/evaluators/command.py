@@ -233,7 +233,13 @@ def _kill_tree(pid: int) -> None:
         import signal
 
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            pgid = os.getpgid(pid)
+            # Teilt das Kind unsere Prozessgruppe (ohne start_new_session
+            # gestartet), würde killpg forge selbst mitreißen → nur das Kind.
+            if pgid == os.getpgrp():
+                os.kill(pid, signal.SIGKILL)
+            else:
+                os.killpg(pgid, signal.SIGKILL)
 
 
 # --- Parser -------------------------------------------------------------

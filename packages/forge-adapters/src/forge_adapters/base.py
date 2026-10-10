@@ -63,6 +63,10 @@ class PRMetadata:
     """pass|fail|pending|none|unknown."""
     mergeable: str
     """``MERGEABLE`` | ``CONFLICTING`` | ``UNKNOWN``."""
+    merge_commit: str | None = None
+    """SHA des Merge-Commits auf der Basis, sobald ``state == "MERGED"``. Der
+    Release-Train taggt genau diesen Commit, nicht die (evtl. weitergelaufene)
+    Branch-Spitze."""
 
 
 @dataclass(frozen=True)

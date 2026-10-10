@@ -121,6 +121,15 @@ def test_release_is_annotated_tag(tmp_path: Path) -> None:
     assert any(c[:3] == ["git", "tag", "-a"] for c in sim.calls)
 
 
+
+def test_release_tags_a_given_merge_commit_not_the_branch_tip(tmp_path: Path) -> None:
+    sim = AzSim()
+    host = AzureReposCodeHost(config=CFG, repo_root=tmp_path, run_subprocess=sim)
+    sha = "a" * 40
+    host.create_release(tag="v1.1.0", title="v1.1.0", notes="x", target=sha)
+    tag_call = next(c for c in sim.calls if c[:3] == ["git", "tag", "-a"])
+    assert tag_call[4] == sha
+
 def _spec(**provider) -> ProjectSpec:
     return ProjectSpec(
         spec_version="1.0", name="p",

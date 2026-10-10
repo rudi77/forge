@@ -40,6 +40,30 @@ SPEC_PR_LABEL = "forge:spec"
 # A2: so viele Zerlegungs-Runs ohne erzeugte Items, bevor ein Epic eskaliert.
 MAX_EPIC_RUNS: int = 2
 
+# So viele gescheiterte Review-Versuche (Agent-Timeout/-Fehler) in Folge, bevor
+# das fail-closed ``request_changes`` wie ein echtes Urteil zählt.
+MAX_REVIEW_ATTEMPTS: int = 2
+
+
+def effective_reviews(reviews: list) -> list:
+    """``PRReviewed``-Events ohne gescheiterte Review-Versuche.
+
+    Scheitert der Review-Agent (Timeout, ``CodingAgentError``), ist sein
+    ``request_changes`` fail-closed, aber kein Befund über den Code
+    (``success=False`` im Envelope). Solche Versuche zählen nicht: das Item
+    bleibt in ``qa`` und wird erneut gereviewt, statt eine Nacharbeit ohne
+    Befund zu starten. Erst ``MAX_REVIEW_ATTEMPTS`` Fehlschläge in Folge (nach
+    dem letzten echten Review) zählen wie ein Urteil — sonst reviewt der
+    Conductor bei dauerhaft kaputtem Agent jeden Tick neu."""
+    ordered = sorted(reviews, key=lambda e: e.ts)
+    trailing: list = []
+    for e in reversed(ordered):
+        if getattr(e, "success", None) is not False:
+            break
+        trailing.insert(0, e)
+    kept = [e for e in ordered if getattr(e, "success", None) is not False]
+    return kept + (trailing if len(trailing) >= MAX_REVIEW_ATTEMPTS else [])
+
 # Decisions eines Dev-Runs, die als "kein PR, fehlgeschlagen" zählen. NICHT
 # enthalten: ``pr_created`` (Erfolg) und ``rate_limited`` (gehört dem
 # Resume-Pfad, ``derive_pending_resumes``).
@@ -562,15 +586,12 @@ def derive_signals(
         and (e.payload or {}).get("pr_number") in pr_numbers
         for e in events
     )
-    reviews = sorted(
-        (
-            e
-            for e in events
-            if e.kind == EventKind.PR_REVIEWED
-            and (e.payload or {}).get("pr_number") in pr_numbers
-        ),
-        key=lambda e: e.ts,
-    )
+    reviews = effective_reviews([
+        e
+        for e in events
+        if e.kind == EventKind.PR_REVIEWED
+        and (e.payload or {}).get("pr_number") in pr_numbers
+    ])
     latest_review_ts = reviews[-1].ts if reviews else None
     # Veraltet, sobald ein Commit NACH dem jüngsten Review landete. ``<=`` →
     # ein Commit exakt zur Review-Zeit gilt als "nicht neuer" (bias zu weniger

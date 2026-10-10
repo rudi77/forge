@@ -204,7 +204,10 @@ def test_open_review_merge_lifecycle(provider: Provider) -> None:
     host.post_review(pr_number=pr.pr_number, approve=False, body="please fix")
     result = host.merge(pr_number=pr.pr_number)
     assert result.merged
-    assert host.fetch_metadata(pr.pr_number).state != "OPEN"
+    merged = host.fetch_metadata(pr.pr_number)
+    assert merged.state != "OPEN"
+    # Der Release-Train taggt genau diesen Commit (nicht die Branch-Spitze).
+    assert merged.merge_commit and len(merged.merge_commit) == 40
     assert host.list_open_changes() == []
     with pytest.raises(CodeHostError):
         host.merge(pr_number=pr.pr_number)

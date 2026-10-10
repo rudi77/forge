@@ -197,3 +197,24 @@ def test_dry_run_emits_no_events_and_no_gh_mutations(tmp_path: Path) -> None:
     # Keine Review/Merge-Subprozesse, keine Events.
     assert not any("review" in c or "merge" in c for c in runner.calls)  # type: ignore[attr-defined]
     assert _kinds(ctx.store_path, EventKind.PR_REVIEWED) == []
+
+
+def test_failed_review_agent_is_marked_unsuccessful(tmp_path: Path) -> None:
+    """Agent-Fehler: fail-closed request_changes, aber ``success=False`` —
+    der Conductor wertet das nicht als Code-Befund (effective_reviews)."""
+    from forge_execute.agents.base import CodingAgentError
+
+    class _Broken(MockCodingAgent):
+        def review(self, **kw):  # type: ignore[override]
+            raise CodingAgentError("boom")
+
+    ctx = _ctx(tmp_path, merge_pr=True)
+    out = execute_pr_review(
+        ctx, pr_number=7, agent=_Broken(callable_=lambda wt, p: None),
+        run_subprocess=_fake_gh(), threshold=0.8,
+    )
+    assert out.merged is False
+    (reviewed,) = _kinds(ctx.store_path, EventKind.PR_REVIEWED)
+    assert reviewed.payload["verdict"] == "request_changes"
+    assert reviewed.success is False
+    assert reviewed.error_class == "ReviewAgentError"

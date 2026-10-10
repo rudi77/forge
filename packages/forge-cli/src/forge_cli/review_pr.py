@@ -213,6 +213,12 @@ def execute_pr_review(
                 tokens_out=outcome.tokens_out,
                 model=outcome.model,
                 duration_ms=outcome.duration_ms,
+                # Gescheiterter Review-Agent: fail-closed request_changes, aber
+                # kein Code-Befund — der Conductor reviewt dann erneut statt
+                # Nacharbeit zu starten (conductor.effective_reviews).
+                success=False if outcome.error else None,
+                error_class="ReviewAgentError" if outcome.error else None,
+                error_msg=outcome.error,
                 payload=PRReviewedPayload(
                     pr_number=pr_number,
                     verdict=outcome.verdict,  # type: ignore[arg-type]

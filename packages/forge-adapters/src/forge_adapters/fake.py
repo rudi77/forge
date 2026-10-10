@@ -162,6 +162,7 @@ class FakePR:
     ci_status: str = "pass"
     mergeable: str = "MERGEABLE"
     head_committed_at: datetime | None = None
+    merge_commit: str | None = None
     reviews: list[tuple[bool, str]] = field(default_factory=list)
     diff: str = ""
     ci_failure: str = ""
@@ -176,6 +177,7 @@ class InMemoryCodeHost:
         self.prs: dict[int, FakePR] = {}
         self.pushed: list[str] = []
         self.releases: dict[str, tuple[str, str | None]] = {}
+        self.release_targets: dict[str, str | None] = {}
         self.auto_merge_queued: list[int] = []
         self.ref_status: dict[str, str] = {}
         self._next = 100
@@ -218,7 +220,7 @@ class InMemoryCodeHost:
         return PRMetadata(
             number=pr.number, title=pr.title, body=pr.body, state=pr.state,
             base_branch=pr.base, head_branch=pr.branch, ci_status=pr.ci_status,
-            mergeable=pr.mergeable,
+            mergeable=pr.mergeable, merge_commit=pr.merge_commit,
         )
 
     def fetch_diff(self, pr_number: int) -> str:
@@ -238,12 +240,14 @@ class InMemoryCodeHost:
         if pr.state != "OPEN":
             raise CodeHostError(f"PR #{pr_number} is not open")
         pr.state = "MERGED"
+        pr.merge_commit = pr.merge_commit or f"{pr_number:040x}"
         return MergeResult(merged=True, merger="fake", method=method)
 
     def create_release(
         self, *, tag: str, title: str, notes: str | None = None, target: str | None = None
     ) -> str:
         self.releases.setdefault(tag, (title, notes))
+        self.release_targets.setdefault(tag, target)
         return f"fake://releases/{tag}"
 
     def ci_failure_summary(self, pr_number: int, *, max_chars: int = 8000) -> str:

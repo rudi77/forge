@@ -53,6 +53,37 @@ def test_request_changes_sets_changes_requested_and_rounds() -> None:
     assert sig.rework_started is False
 
 
+
+def _failed_review(i: int, hour: int) -> _Evt:
+    evt = _Evt(EK.PR_REVIEWED, f"fail{i}",
+               {"pr_number": 100, "verdict": "request_changes"}, _t(hour))
+    evt.success = False  # Review-Agent scheiterte (Timeout/Fehler), fail-closed
+    return evt
+
+
+def test_failed_review_is_retried_in_qa_not_sent_to_rework() -> None:
+    events = [*_base_events(), _failed_review(0, 3)]
+    sig = derive_signals(events, 42)
+    assert sig.changes_requested is False
+    assert sig.review_done is False  # → QA reviewt erneut
+    assert sig.rework_rounds == 0
+
+
+def test_failed_review_after_approve_keeps_the_real_verdict() -> None:
+    events = [*_base_events(("approve", 3)), _failed_review(0, 4)]
+    sig = derive_signals(events, 42)
+    assert sig.review_done is True and sig.changes_requested is False
+
+
+def test_repeated_review_failures_count_as_verdict() -> None:
+    """Dauerhaft kaputter Review-Agent: nicht endlos neu reviewen."""
+    from forge_cli.conductor import MAX_REVIEW_ATTEMPTS
+
+    events = [*_base_events(),
+              *(_failed_review(i, 3 + i) for i in range(MAX_REVIEW_ATTEMPTS))]
+    sig = derive_signals(events, 42)
+    assert sig.changes_requested is True
+
 def test_new_commit_after_review_clears_changes_requested() -> None:
     events = _base_events(("request_changes", 3))
     assert derive_signals(events, 42, head_committed_at=_t(4)).changes_requested is False

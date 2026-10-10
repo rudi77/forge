@@ -201,8 +201,11 @@ def test_train_prepares_reviews_and_tags(repo: Path) -> None:
     assert reviewed == [pr.number]
 
     pr.state = "MERGED"
+    pr.merge_commit = "c" * 40
     res = _tick(ctx, [3, 4])
     assert (res.action, res.detail) == ("tagged", "v0.1.0")
+    # Getaggt wird der Merge-Commit, nicht die evtl. weitergelaufene Basis.
+    assert ctx.code_host.release_targets["v0.1.0"] == "c" * 40
     _title, notes = ctx.code_host.releases["v0.1.0"]
     assert "### Fixes" in notes and "Release-Items" not in notes
 

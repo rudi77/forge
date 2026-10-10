@@ -169,6 +169,35 @@ def test_merged_spec_file_wins_over_original_blob(tmp_path: Path) -> None:
     assert "edited by human" in text
 
 
+
+def test_merged_spec_is_read_from_fresh_remote_base_not_stale_head(tmp_path: Path) -> None:
+    """Ein Spec-PR-Merge bewegt den Conductor-Checkout nicht — gelesen wird
+    der frisch geholte ``origin/<base>``."""
+    def git(cwd, *a):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                       cwd=cwd, check=True, capture_output=True)
+
+    origin, local = tmp_path / "origin", tmp_path / "local"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    (origin / "README.md").write_text("x\n")
+    git(origin, "add", ".")
+    git(origin, "commit", "-q", "-m", "init")
+    git(tmp_path, "clone", "-q", str(origin), str(local))
+    # Spec-PR wird auf dem Remote gemergt — der lokale Checkout bleibt stehen.
+    (origin / "docs" / "specs").mkdir(parents=True)
+    (origin / "docs" / "specs" / "7-login.md").write_text("1. approved by human\n")
+    git(origin, "add", ".")
+    git(origin, "commit", "-q", "-m", "spec")
+
+    ctx = _ctx(local)
+    store = ctx.open_store()
+    stale = refined_spec_text(store, ctx.open_blobs(), 7, repo_root=local)
+    fresh = refined_spec_text(store, ctx.open_blobs(), 7, repo_root=local, base="main")
+    store.close()
+    assert "approved by human" not in stale
+    assert "approved by human" in fresh
+
 def test_same_titled_children_of_different_epics_are_not_deduplicated(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path, capabilities=CapabilitiesConfig(create_work_items=True))
     block = "- id: a\n  kind: task\n  title: Add integration tests\n"

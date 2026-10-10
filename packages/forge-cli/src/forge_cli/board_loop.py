@@ -60,6 +60,7 @@ from forge_cli.conductor import (
     derive_dev_failure,
     derive_pending_resumes,
     derive_signals,
+    effective_reviews,
     epic_children,
     pr_number_for_issue,
     run_conductor_tick,
@@ -445,12 +446,17 @@ def _store_scope(ctx: ForgeContext, store: EventStore | None):
         own.close()
 
 
-def _spec_for(ctx: ForgeContext, store: EventStore | None, issue_number: int) -> str:
-    """A1: verdichtete Akzeptanzkriterien des Items (leer, wenn keine)."""
+def _spec_for(
+    ctx: ForgeContext, store: EventStore | None, issue_number: int, *, base: str
+) -> str:
+    """A1: verdichtete Akzeptanzkriterien des Items (leer, wenn keine).
+
+    ``base`` ist die Basis, gegen die Spec-PRs gemergt werden — gelesen wird
+    ihr frisch geholter Remote-Stand, nicht der (stehende) Checkout-HEAD."""
     with _store_scope(ctx, store) as s:
         return refined_spec_text(
             s, ctx.open_blobs(), issue_number,
-            repo_root=ctx.repo_root, spec_dir=ctx.spec.intake.spec_dir,
+            repo_root=ctx.repo_root, spec_dir=ctx.spec.intake.spec_dir, base=base,
         )
 
 
@@ -510,7 +516,7 @@ def _dispatch_issues(
         # ist, bestimmt, welche Arbeitspferde mitwirken. Kein Treffer → der
         # multi_agent-Default in execute_run greift.
         roster = _roster_for_issue(ctx.spec, issue.labels)
-        spec_md = _spec_for(ctx, store, issue.number)
+        spec_md = _spec_for(ctx, store, issue.number, base=params.pr_base)
         prompt = with_refined_spec(wrap_issue_body(title=issue.title, body=issue.body), spec_md)
         # Der vom Menschen geschriebene Issue-Text IST das Akzeptanz-
         # kriterium für den LLM-Judge (spec.judge.enabled). Wir geben den
@@ -844,7 +850,7 @@ def _dispatch_design_run(
     Default. Keine Triage (das Item ist bereits past requirements).
     """
     roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
-    spec_md = _spec_for(ctx, store, issue.number)
+    spec_md = _spec_for(ctx, store, issue.number, base=params.pr_base)
     prompt = with_refined_spec(wrap_issue_body(title=issue.title, body=issue.body), spec_md)
     acceptance = with_refined_spec(
         f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}", spec_md
@@ -950,12 +956,12 @@ def _latest_review_reasoning(
 
     Best-effort: fehlt der Blob (alte 1.0-Events, Blob-GC), bleibt der Kontext
     leer — der Nacharbeits-Run sieht dann nur das Issue."""
-    reviews = [
+    reviews = effective_reviews([
         e
         for e in events
         if e.kind == EventKind.PR_REVIEWED
         and (e.payload or {}).get("pr_number") == pr_number
-    ]
+    ])
     if not reviews:
         return ""
     blob = (max(reviews, key=lambda e: e.ts).payload or {}).get("reasoning_blob")
@@ -1033,7 +1039,7 @@ def _dispatch_branch_run(
         prompt += "\n" + wrap_untrusted(label=context_label, text=context)
     acceptance = with_refined_spec(
         f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}",
-        _spec_for(ctx, store, issue.number),
+        _spec_for(ctx, store, issue.number, base=params.pr_base),
     )
     if context.strip():
         acceptance += f"\n\n{context_label.title()}:\n{context}"
@@ -1636,7 +1642,7 @@ def _dispatch_review_run(
 
     acceptance = with_refined_spec(
         f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}",
-        _spec_for(ctx, store, issue.number),
+        _spec_for(ctx, store, issue.number, base=params.pr_base),
     )
     console.print(
         f"\n[bold magenta]>>> board-loop[/bold magenta] qa review for issue "

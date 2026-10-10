@@ -38,6 +38,13 @@ Alle bemerkenswerten Änderungen an forge werden hier dokumentiert. Format: [Kee
   Side-Effects laufen jetzt über `WorkTracker`.
 - `_kill_tree` konnte auf POSIX die eigene Prozessgruppe (pytest/forge) killen.
 - Ein fortgesetzter Run (`--resume`) aus Design/Requirements öffnete einen PR.
+- Release-Train taggt den Merge-Commit des Release-PRs (`PRMetadata.merge_commit`)
+  statt der Branch-Spitze, die seit dem Merge weitergelaufen sein kann.
+- Gemergte Spec-Dateien werden vom frisch geholten `origin/<base>` gelesen, nicht
+  vom stehenden Checkout-`HEAD` des Conductors.
+- Ein gescheiterter Review-Agent (Timeout/Fehler) schickt das Item nicht mehr in
+  die Nacharbeit: `PRReviewed` trägt `success=False`, QA reviewt erneut; erst nach
+  `MAX_REVIEW_ATTEMPTS` (2) Fehlschlägen in Folge zählt er als Urteil.
 
 ### Boundaries — was bewusst NICHT geändert wurde
 

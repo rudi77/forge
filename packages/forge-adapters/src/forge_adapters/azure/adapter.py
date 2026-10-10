@@ -50,6 +50,8 @@ SubprocessRunner = Callable[..., subprocess.CompletedProcess]
 
 _KW = {"capture_output": True, "text": True, "encoding": "utf-8", "errors": "replace"}
 
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
 # Azure begrenzt PR-Beschreibungen auf 4000 Zeichen.
 _PR_DESCRIPTION_LIMIT = 4000
 
@@ -417,6 +419,7 @@ class AzureReposCodeHost(_AzBase):
             head_branch=_strip_ref(str(data.get("sourceRefName") or "")),
             ci_status=summarize_policies(self._policies(pr_number)),
             mergeable=_MERGEABLE.get(str(data.get("mergeStatus") or "").lower(), "UNKNOWN"),
+            merge_commit=(data.get("lastMergeCommit") or {}).get("commitId") or None,
         )
 
     def _fetch(self, branch: str) -> str:
@@ -491,7 +494,11 @@ class AzureReposCodeHost(_AzBase):
             return url
         message = f"{title}\n\n{notes}" if notes else title
         ref = "HEAD"
-        if target:
+        if target and _SHA_RE.fullmatch(target):
+            # Merge-Commit eines Release-PRs: genau diesen Commit taggen.
+            self._git(["fetch", "origin"], what="git fetch origin")
+            ref = target
+        elif target:
             ref = self._fetch(target)
         self._git(["tag", "-a", tag, ref, "-m", message], what=f"git tag {tag}")
         self._git(["push", "origin", f"refs/tags/{tag}"], what=f"git push tag {tag}")

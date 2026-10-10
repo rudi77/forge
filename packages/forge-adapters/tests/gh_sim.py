@@ -187,6 +187,7 @@ class GhSim:
             return _fail("not mergeable")
         if "--auto" not in argv:
             self.prs[n]["state"] = "MERGED"
+            self.prs[n]["mergeCommit"] = {"oid": f"{n:040x}"}
         return _ok()
 
     def _pr_list(self, argv):

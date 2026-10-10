@@ -40,6 +40,7 @@ from forge_execute.capabilities import Capabilities
 from forge_execute.worktrees import GitError, WorktreeManager
 from ulid import ULID
 
+from forge_cli.conductor import effective_reviews
 from forge_cli.runtime import ForgeContext, console
 from forge_cli.schedule import cron_due
 
@@ -368,10 +369,10 @@ def _advance_release_pr(ctx, *, store, session_id, events, pr_evt, merged, revie
             return TrainResult("abandoned", f"release PR #{pr_number} closed unmerged")
         if meta.state != "OPEN":
             return TrainResult("waiting", f"release PR #{pr_number} is {meta.state}")
-        reviewed = any(
-            e.kind == EventKind.PR_REVIEWED and (e.payload or {}).get("pr_number") == pr_number
-            for e in events
-        )
+        reviewed = bool(effective_reviews([
+            e for e in events
+            if e.kind == EventKind.PR_REVIEWED and (e.payload or {}).get("pr_number") == pr_number
+        ]))
         if review_fn is not None and not reviewed and meta.ci_status in ("pass", "none"):
             review_fn(pr_number)
             return TrainResult("reviewed", f"release PR #{pr_number}")
@@ -383,7 +384,10 @@ def _advance_release_pr(ctx, *, store, session_id, events, pr_evt, merged, revie
     items = parse_release_items(meta.body)
     notes = _ITEMS_LINE.sub("", meta.body).strip() + "\n"
     try:
-        url = host.create_release(tag=tag, title=tag, notes=notes, target=base)
+        # Genau den Merge-Commit des Release-PRs taggen: die Basis kann seit dem
+        # Merge weitergelaufen sein, und spätere Commits stehen nicht im Changelog.
+        url = host.create_release(tag=tag, title=tag, notes=notes,
+                                  target=meta.merge_commit or base)
     except CodeHostError as exc:
         return TrainResult("error", str(exc))
     blob = ctx.open_blobs().put_text(notes)

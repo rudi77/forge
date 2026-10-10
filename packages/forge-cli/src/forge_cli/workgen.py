@@ -67,6 +67,23 @@ def merged_spec_file(repo_root, spec_dir: str, issue_number: int, ref: str = "HE
     return show.stdout.strip() if show.returncode == 0 else ""
 
 
+def fresh_base_ref(repo_root, base: str) -> str:
+    """Holt ``origin/<base>`` frisch und gibt den Remote-Ref zurück.
+
+    Der Conductor-Checkout steht still: ein Spec-PR-Merge bewegt seinen
+    ``HEAD`` nicht. Ohne Remote (oder wenn der Fetch scheitert) bleibt es beim
+    lokalen ``HEAD``."""
+    import subprocess
+
+    ref = f"refs/remotes/origin/{base}"
+    res = subprocess.run(
+        ["git", "fetch", "--quiet", "origin", f"+refs/heads/{base}:{ref}"],
+        cwd=str(repo_root), capture_output=True, text=True, encoding="utf-8",
+        errors="replace",
+    )
+    return ref if res.returncode == 0 else "HEAD"
+
+
 def refined_spec_text(
     store: Any,
     blobs: Any,
@@ -74,11 +91,16 @@ def refined_spec_text(
     *,
     repo_root=None,
     spec_dir: str = "docs/specs",
+    base: str | None = None,
 ) -> str:
     """Verdichtete Spec eines Items: gemergte Spec-Datei (falls vorhanden),
-    sonst die jüngste ``RequirementsRefined.artifacts['spec']``."""
+    sonst die jüngste ``RequirementsRefined.artifacts['spec']``.
+
+    Mit ``base`` wird die Spec-Datei auf dem frisch geholten ``origin/<base>``
+    gesucht (dort landet der Spec-PR), sonst auf dem lokalen ``HEAD``."""
     if repo_root is not None:
-        merged = merged_spec_file(repo_root, spec_dir, issue_number)
+        ref = fresh_base_ref(repo_root, base) if base else "HEAD"
+        merged = merged_spec_file(repo_root, spec_dir, issue_number, ref=ref)
         if merged:
             return merged
     run_ids = {

@@ -384,7 +384,9 @@ def fetch_pr_diff(
     return result.stdout
 
 
-_PR_VIEW_FIELDS = "number,title,body,state,baseRefName,headRefName,mergeable,statusCheckRollup"
+_PR_VIEW_FIELDS = (
+    "number,title,body,state,baseRefName,headRefName,mergeable,statusCheckRollup,mergeCommit"
+)
 
 
 def fetch_pr_metadata(
@@ -422,6 +424,7 @@ def fetch_pr_metadata(
         head_branch=str(data.get("headRefName") or ""),
         ci_status=summarize_ci(data.get("statusCheckRollup") or []),
         mergeable=str(data.get("mergeable") or "UNKNOWN").upper(),
+        merge_commit=(data.get("mergeCommit") or {}).get("oid") or None,
     )
 
 

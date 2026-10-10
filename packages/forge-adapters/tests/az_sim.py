@@ -107,6 +107,7 @@ class AzSim:
                 return _fail("not active")
             if _opt(argv, "--status") == "completed":
                 self.prs[n]["status"] = "completed"
+                self.prs[n]["lastMergeCommit"] = {"commitId": f"{n:040x}"}
             return _ok()
         if head == ["repos", "pr", "set-vote"]:
             n = int(_opt(argv, "--id"))

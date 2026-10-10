@@ -118,6 +118,10 @@ class ProposalResult:
     Output, falls der Agent kuratierte Lektionen zurückmeldete. None, wenn die
     Marker fehlen (der Normalfall — Lektionen sind optional). Der Runner parst
     ihn (``_lesson_parser.parse_lessons``) und emittiert ``LessonLearned``."""
+    workitems_block: str | None = None
+    """Roher ``---FORGE-WORKITEMS-...---``-Block (neue Arbeit, die der Agent
+    vorschlägt: Funde außerhalb des Auftrags, Epic-Kinder). Der Runner reicht
+    ihn nur durch (``RunResult.workitems_blocks``); angelegt wird in forge-cli."""
     stream_log: str | None = None
     """Pfad zum stream-json-Log dieses propose-Aufrufs (ein Envelope
     ``{"ts", "event"}`` pro claude-Event). Lebt unter ``.forge/logs/<run_id>/``

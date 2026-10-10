@@ -1,0 +1,34 @@
+# forge — Agent-Review (+ opt-in Merge) für forge-PRs als Azure Pipeline.
+#
+# Als Build-Validation-Policy auf main hängen: läuft für jeden PR, reviewt aber
+# nur forge-PRs (Quell-Branch forge/*). Gemergt wird nur bei
+# capabilities.merge_pr: true + approve + grünen Build-Policies.
+name: forge-pr-review-$(Rev:r)
+
+trigger: none
+
+variables:
+  - group: forge
+
+jobs:
+  - job: review
+    condition: startsWith(variables['System.PullRequest.SourceBranch'], 'refs/heads/forge/')
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      - checkout: self
+        fetchDepth: 0
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: "3.12"
+      - script: |
+          pip install uv
+          uv tool install forge-cli
+          npm install -g @anthropic-ai/claude-code
+          az extension add --name azure-devops --upgrade -y
+        displayName: install forge + claude + az devops
+      - script: forge review-pr "$(System.PullRequest.PullRequestId)"
+        displayName: forge review-pr
+        env:
+          ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+          AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)

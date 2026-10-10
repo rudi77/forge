@@ -232,6 +232,7 @@ def test_pump_streaming_kills_on_timeout(tmp_path: Path) -> None:
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        start_new_session=sys.platform != "win32",
     )
     start = time_mod.monotonic()
     lines, _stderr, timed_out = _pump_streaming(proc, timeout_s=2, log_path=log_path)

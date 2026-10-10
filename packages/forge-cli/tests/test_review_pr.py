@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from forge_cli.review_pr import execute_pr_review
+from forge_core.blobs import BlobStore
 from forge_core.events import EventKind
 from forge_core.spec import ProjectSpec
 from forge_core.store import EventStore
@@ -40,6 +41,9 @@ class _Ctx:
 
     def open_store(self) -> EventStore:
         return EventStore(self.store_path)
+
+    def open_blobs(self) -> BlobStore:
+        return BlobStore(self.store_path.parent / "blobs")
 
 
 def _ctx(tmp_path: Path, *, merge_pr: bool) -> _Ctx:
@@ -125,6 +129,9 @@ def test_review_does_not_merge_when_capability_off(tmp_path: Path) -> None:
     assert _kinds(ctx.store_path, EventKind.PR_MERGED) == []
     reviewed = _kinds(ctx.store_path, EventKind.PR_REVIEWED)
     assert reviewed[0].payload["merge_blocked_reason"] == "capability_disabled"
+    # L1: die Begründung liegt im CAS (Kontext für einen Nacharbeits-Run).
+    blob = reviewed[0].payload["reasoning_blob"]
+    assert blob and ctx.open_blobs().get_text(blob) == out.reasoning
 
 
 def test_review_does_not_merge_when_ci_red(tmp_path: Path) -> None:
@@ -190,3 +197,24 @@ def test_dry_run_emits_no_events_and_no_gh_mutations(tmp_path: Path) -> None:
     # Keine Review/Merge-Subprozesse, keine Events.
     assert not any("review" in c or "merge" in c for c in runner.calls)  # type: ignore[attr-defined]
     assert _kinds(ctx.store_path, EventKind.PR_REVIEWED) == []
+
+
+def test_failed_review_agent_is_marked_unsuccessful(tmp_path: Path) -> None:
+    """Agent-Fehler: fail-closed request_changes, aber ``success=False`` —
+    der Conductor wertet das nicht als Code-Befund (effective_reviews)."""
+    from forge_execute.agents.base import CodingAgentError
+
+    class _Broken(MockCodingAgent):
+        def review(self, **kw):  # type: ignore[override]
+            raise CodingAgentError("boom")
+
+    ctx = _ctx(tmp_path, merge_pr=True)
+    out = execute_pr_review(
+        ctx, pr_number=7, agent=_Broken(callable_=lambda wt, p: None),
+        run_subprocess=_fake_gh(), threshold=0.8,
+    )
+    assert out.merged is False
+    (reviewed,) = _kinds(ctx.store_path, EventKind.PR_REVIEWED)
+    assert reviewed.payload["verdict"] == "request_changes"
+    assert reviewed.success is False
+    assert reviewed.error_class == "ReviewAgentError"

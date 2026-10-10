@@ -6,7 +6,8 @@ Architektur:
 * Optionale Pre-Phase ``IssueTriage`` (Spec v0.4 Teil 6.3), die per
   ``triage.enabled`` aktiviert wird — emittiert genau ein
   ``IssueTriaged``-Event pro Issue.
-* Idempotenz + Filter im Adapter (``forge_adapters.github.board``).
+* Idempotenz + Filter im Adapter (``WorkTracker`` aus ``forge_adapters``;
+  GitHub, Azure DevOps, …).
 * ``--auto-merge`` durchgereicht an jeden dispatched Run; Spec-Vertrag
   bleibt intakt (forge ruft selbst kein ``gh pr merge`` synchron auf,
   nur ``--auto`` als server-seitiges Queue).
@@ -15,10 +16,7 @@ Architektur:
 from __future__ import annotations
 
 import contextlib
-import json
-import re
 import signal
-import subprocess
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -28,37 +26,27 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-from forge_adapters.github import (
-    BoardError,
-    GitHubError,
-    ReadyIssue,
-    create_release,
-    fetch_pr_head_committed_at,
-    list_ready_items,
-    list_stage_items,
-    set_issue_stage_label,
-    wrap_issue_body,
-)
+from forge_adapters.base import CodeHostError, TrackerError, WorkTracker
+from forge_adapters.text import wrap_issue_body, wrap_untrusted
 from forge_core.events import (
     ConductorTickCompletedPayload,
     EventKind,
     IssueTriagedPayload,
+    PRMergedPayload,
     ReleaseTaggedPayload,
     WorkItemBlockedPayload,
     WorkItemStageChangedPayload,
     build_event,
 )
 from forge_core.store import EventStore
+from forge_core.tracking import ReadyIssue
 from forge_execute.capabilities import Capabilities
 from forge_execute.triage import (
     IssueTriager,
     LLMTriager,
     TriageError,
     TriageResult,
-    close_issue,
-    comment_issue,
 )
-from forge_execute.triage.gh import GHTriageError
 from forge_execute.worktrees import GitError, WorktreeManager
 from rich.table import Table
 from ulid import ULID
@@ -72,11 +60,20 @@ from forge_cli.conductor import (
     derive_dev_failure,
     derive_pending_resumes,
     derive_signals,
+    effective_reviews,
+    epic_children,
     pr_number_for_issue,
     run_conductor_tick,
+    spec_pr_for_issue,
 )
-from forge_cli.dependencies import parse_depends_on
+from forge_cli.dependencies import (
+    parse_depends_on,
+    parse_integration_branch,
+    parse_integration_mode,
+    parse_touches,
+)
 from forge_cli.heartbeat import HeartbeatStats, TickResult, run_heartbeat
+from forge_cli.release import train_tick
 from forge_cli.review_pr import execute_pr_review
 from forge_cli.run import _DEFAULT_RESUME_PROMPT, RunOutcome, execute_run
 from forge_cli.runtime import (
@@ -87,10 +84,21 @@ from forge_cli.runtime import (
     load_context,
 )
 from forge_cli.stages import Stage, stage_of
-
-# Wir teilen denselben SubprocessRunner-DI-Pattern wie pr.py / board.py,
-# damit Tests gh-Aufrufe stubben können.
-SubprocessRunner = Callable[..., subprocess.CompletedProcess]
+from forge_cli.workgen import (
+    intake_blocks,
+    publish_spec,
+    refined_spec_text,
+    tick_sources,
+    with_refined_spec,
+)
+from forge_cli.workgraph import (
+    ensure_integration_branch,
+    epic_run_id,
+    integration_branch_name,
+    open_integration_pr,
+    sync_branch,
+    tick_capacity,
+)
 
 
 def board_loop_command(
@@ -238,6 +246,17 @@ def board_loop_command(
             min=1,
         ),
     ] = 1,
+    max_ticks: Annotated[
+        int | None,
+        typer.Option(
+            "--max-ticks",
+            help=(
+                "Nur --watch: nach N Ticks sauber beenden (Smoke-/Live-Tests, "
+                "Cron-Betrieb). Default: unbegrenzt."
+            ),
+            min=1,
+        ),
+    ] = None,
 ) -> None:
     """Pull ready issues from the configured GitHub Project, dispatch each
     via the standard issue_label trigger pipeline."""
@@ -247,7 +266,11 @@ def board_loop_command(
         err_console.print(f"[red]error[/red]: {exc}")
         raise typer.Exit(code=2) from None
 
-    repo_owner, repo_name = _detect_repo_slug(ctx.repo_root)
+    try:
+        tracker = ctx.get_tracker()
+    except TrackerError as exc:
+        err_console.print(f"[red]error[/red]: {exc}")
+        raise typer.Exit(code=2) from None
 
     # ---- Garbage-Collection vor Loop-Start --------------------------
     # Verwaiste forge/* Worktrees (frühere Crashes) und lokale Branches,
@@ -308,25 +331,25 @@ def board_loop_command(
         if conductor:
             stats = _run_conductor_watch(
                 ctx=ctx,
-                repo_owner=repo_owner,
-                repo_name=repo_name,
+                tracker=tracker,
                 max_issues=max_issues,
                 interval_s=interval,
                 params=params,
                 triager=triager,
                 capabilities=capabilities,
                 max_parallel=max_parallel,
+                max_ticks=max_ticks,
             )
         else:
             stats = _run_watch(
                 ctx=ctx,
-                repo_owner=repo_owner,
-                repo_name=repo_name,
+                tracker=tracker,
                 max_issues=max_issues,
                 interval_s=interval,
                 params=params,
                 triager=triager,
                 capabilities=capabilities,
+                max_ticks=max_ticks,
             )
         console.print(
             f"\n[bold]heartbeat gestoppt[/bold] ({stats.stopped_reason}) — "
@@ -337,12 +360,8 @@ def board_loop_command(
     # ---- Single-Pass: Issue-Liste bestimmen -------------------------
     if issue_overrides:
         try:
-            ready = _fetch_issues_by_number(
-                repo_owner=repo_owner,
-                repo_name=repo_name,
-                numbers=issue_overrides,
-            )
-        except BoardError as exc:
+            ready = tracker.get_items(list(issue_overrides))
+        except TrackerError as exc:
             err_console.print(f"[red]error[/red]: {exc}")
             raise typer.Exit(code=2) from None
     else:
@@ -353,12 +372,8 @@ def board_loop_command(
             )
             raise typer.Exit(code=2)
         try:
-            ready = list_ready_items(
-                ctx.spec.board,
-                repo_owner=repo_owner,
-                repo_name=repo_name,
-            )
-        except BoardError as exc:
+            ready = tracker.list_ready_items(ctx.spec.board)
+        except TrackerError as exc:
             err_console.print(f"[red]error[/red]: {exc}")
             raise typer.Exit(code=2) from None
         ready = ready[:max_issues]
@@ -368,7 +383,7 @@ def board_loop_command(
         raise typer.Exit(code=0)
 
     if dry_run:
-        _print_dry_run_table(ready, repo_owner, repo_name)
+        _print_dry_run_table(ready, tracker.provider)
         raise typer.Exit(code=0)
 
     result = _dispatch_issues(
@@ -418,6 +433,48 @@ class _PassResult:
     skipped: int
 
 
+@contextlib.contextmanager
+def _store_scope(ctx: ForgeContext, store: EventStore | None):
+    """Liefert ``store`` oder öffnet/schließt einen eigenen (Single-Pass)."""
+    if store is not None:
+        yield store
+        return
+    own = ctx.open_store()
+    try:
+        yield own
+    finally:
+        own.close()
+
+
+def _spec_for(
+    ctx: ForgeContext, store: EventStore | None, issue_number: int, *, base: str
+) -> str:
+    """A1: verdichtete Akzeptanzkriterien des Items (leer, wenn keine).
+
+    ``base`` ist die Basis, gegen die Spec-PRs gemergt werden — gelesen wird
+    ihr frisch geholter Remote-Stand, nicht der (stehende) Checkout-HEAD."""
+    with _store_scope(ctx, store) as s:
+        return refined_spec_text(
+            s, ctx.open_blobs(), issue_number,
+            repo_root=ctx.repo_root, spec_dir=ctx.spec.intake.spec_dir, base=base,
+        )
+
+
+def _intake_run_findings(
+    ctx: ForgeContext, store: EventStore | None, issue: ReadyIssue, outcome: Any
+) -> None:
+    """A2: ``FORGE-WORKITEMS``-Funde eines Runs → Items (best-effort)."""
+    result = getattr(outcome, "result", None)
+    blocks = list(getattr(result, "workitems_blocks", None) or [])
+    if not blocks:
+        return
+    with _store_scope(ctx, store) as s:
+        intake_blocks(
+            ctx, store=s, run_id=result.run_id, blocks=blocks, source="run_finding",
+            origin_issue=issue.number,
+        )
+
+
 def _dispatch_issues(
     *,
     ctx: ForgeContext,
@@ -459,17 +516,31 @@ def _dispatch_issues(
         # ist, bestimmt, welche Arbeitspferde mitwirken. Kein Treffer → der
         # multi_agent-Default in execute_run greift.
         roster = _roster_for_issue(ctx.spec, issue.labels)
-        prompt = wrap_issue_body(title=issue.title, body=issue.body)
+        spec_md = _spec_for(ctx, store, issue.number, base=params.pr_base)
+        prompt = with_refined_spec(wrap_issue_body(title=issue.title, body=issue.body), spec_md)
         # Der vom Menschen geschriebene Issue-Text IST das Akzeptanz-
         # kriterium für den LLM-Judge (spec.judge.enabled). Wir geben den
         # rohen Titel+Body durch, nicht den UNTRUSTED-gewrappten Prompt —
         # der Judge bewertet gegen die Anforderung, nicht gegen die
-        # Sicherheits-Hülle.
-        acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+        # Sicherheits-Hülle. A1: die verdichtete Spec ergänzt ihn.
+        acceptance = with_refined_spec(
+            f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}", spec_md
+        )
         console.print(
             f"\n[bold cyan]>>> board-loop[/bold cyan] dispatching issue "
             f"#{issue.number} [italic]{issue.title}[/italic]"
         )
+        # G: Kind eines Integrations-Epics → Basis + PR-Ziel ist forge/epic-<N>.
+        base_ref, pr_base = params.base_ref, params.pr_base
+        integration = parse_integration_branch(issue.body)
+        if integration:
+            try:
+                base_ref = WorktreeManager(ctx.repo_root).fetch_remote_branch(integration)
+                pr_base = integration
+            except GitError as exc:
+                err_console.print(
+                    f"[yellow]integration branch {integration} unavailable[/yellow]: {exc}"
+                )
         try:
             outcome = execute_run(
                 ctx=ctx,
@@ -477,7 +548,7 @@ def _dispatch_issues(
                 prompt_template_id=params.template_id,
                 trigger="issue_label",
                 focus=focus,
-                base_ref=params.base_ref,
+                base_ref=base_ref,
                 acceptance_criteria=acceptance,
                 max_iterations=params.max_iterations,
                 max_turns=params.max_turns,
@@ -490,7 +561,7 @@ def _dispatch_issues(
                 multi_agent=params.multi_agent,
                 agents=roster,
                 create_pr=True,
-                pr_base=params.pr_base,
+                pr_base=pr_base,
                 extra_labels=[*(params.pr_label or []), f"issue-{issue.number}"],
                 pr_draft=False,
                 auto_merge=params.auto_merge,
@@ -516,6 +587,7 @@ def _dispatch_issues(
 
         dispatched += 1
         summaries.append(_summary_row_from_outcome(issue, outcome))
+        _intake_run_findings(ctx, store, issue, outcome)
 
         if outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}:
             err_console.print(
@@ -555,6 +627,28 @@ def _dispatch_release_run(
     analog zur ``merge_pr``-Ergonomie). push-to-main/force bleiben unberührt
     (ein Release schreibt nur einen neuen Ref).
     """
+    integration = parse_integration_branch(issue.body)
+    if integration:
+        # G: in den Integrations-Branch gemergt → fertig; ausgeliefert wird mit
+        # dem Epic (kein eigener Tag, keine Capability nötig).
+        store.append(
+            build_event(
+                kind=EventKind.RELEASE_TAGGED,
+                run_id=session_id,
+                project=ctx.spec.name,
+                project_fingerprint=ctx.project_fingerprint,
+                factory_version=ctx.factory_version,
+                spec_version=ctx.spec.spec_version,
+                payload=ReleaseTaggedPayload(
+                    issue_number=issue.number, tag=integration, integrated_into=integration
+                ),
+            )
+        )
+        console.print(f"  [green]integrated[/green] #{issue.number} → {integration}")
+        return _PassResult(
+            summaries=[_LoopSummaryRow(issue.number, issue.title, "integrated", None, "-")],
+            bailed=False, dispatched=1, skipped=0,
+        )
     if not ctx.spec.capabilities.create_release:
         console.print(
             f"[dim]release #{issue.number}: capabilities.create_release=false "
@@ -563,12 +657,11 @@ def _dispatch_release_run(
         return None
     tag = _release_tag_for_issue(issue.number)
     try:
-        url = create_release(
-            repo=ctx.repo_root,
+        url = ctx.get_code_host().create_release(
             tag=tag,
             title=f"{tag}: {issue.title}",
         )
-    except GitHubError as exc:
+    except CodeHostError as exc:
         err_console.print(
             f"[red]error[/red] in release for issue #{issue.number}: {exc}"
         )
@@ -720,6 +813,15 @@ def _dispatch_requirements_run(
             f"[yellow]board-loop bailing[/yellow]: requirements run decision = "
             f"{outcome.result.decision}"
         )
+    # A1: verdichtete Spec als Artefakt veröffentlichen (Spec-PR oder
+    # Kommentar). Ohne Veröffentlichung bleibt sie trotzdem Akzeptanzkriterium
+    # aller späteren Runs (refined_spec_text).
+    if not bailed:
+        with _store_scope(ctx, store) as s:
+            publish_spec(
+                ctx, issue=issue, run_id=outcome.result.run_id, store=s,
+                base_ref=params.base_ref, pr_base=params.pr_base,
+            )
     return _PassResult(
         summaries=[_summary_row_from_outcome(issue, outcome)],
         bailed=bailed,
@@ -748,8 +850,11 @@ def _dispatch_design_run(
     Default. Keine Triage (das Item ist bereits past requirements).
     """
     roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
-    prompt = wrap_issue_body(title=issue.title, body=issue.body)
-    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    spec_md = _spec_for(ctx, store, issue.number, base=params.pr_base)
+    prompt = with_refined_spec(wrap_issue_body(title=issue.title, body=issue.body), spec_md)
+    acceptance = with_refined_spec(
+        f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}", spec_md
+    )
     console.print(
         f"\n[bold magenta]>>> board-loop[/bold magenta] design run for issue "
         f"#{issue.number} [italic]{issue.title}[/italic] "
@@ -820,6 +925,446 @@ def _dispatch_design_run(
     )
 
 
+_REWORK_PREAMBLE = (
+    "This is a REWORK task on an EXISTING pull request (PR #{pr}). The working "
+    "tree already contains the PR's changes. A reviewer requested changes — "
+    "address every blocking finding below with the smallest correct change. Do "
+    "not start over and do not touch unrelated code. Re-run the relevant tests "
+    "before finishing.\n\n"
+)
+
+_CONFLICT_PREAMBLE = (
+    "This is a MERGE-CONFLICT task on an EXISTING pull request (PR #{pr}). The "
+    "base branch moved after a sibling pull request was merged; forge merged it "
+    "into this branch and committed the conflict markers. Resolve every conflict "
+    "in the files listed below so that BOTH sides' intent is preserved, remove all "
+    "markers, and make the tests pass. Do not drop the sibling's changes.\n\n"
+)
+
+_CI_FIX_PREAMBLE = (
+    "This is a CI-FIX task on an EXISTING pull request (PR #{pr}). The working "
+    "tree already contains the PR's changes, but CI is red. Find the root cause "
+    "of the failing checks below and fix it with the smallest correct change. "
+    "Never skip, disable or weaken a test to make CI green.\n\n"
+)
+
+
+def _latest_review_reasoning(
+    ctx: ForgeContext, events: list, pr_number: int
+) -> str:
+    """Begründung des jüngsten ``PRReviewed`` für ``pr_number`` (aus dem CAS).
+
+    Best-effort: fehlt der Blob (alte 1.0-Events, Blob-GC), bleibt der Kontext
+    leer — der Nacharbeits-Run sieht dann nur das Issue."""
+    reviews = effective_reviews([
+        e
+        for e in events
+        if e.kind == EventKind.PR_REVIEWED
+        and (e.payload or {}).get("pr_number") == pr_number
+    ])
+    if not reviews:
+        return ""
+    blob = (max(reviews, key=lambda e: e.ts).payload or {}).get("reasoning_blob")
+    if not blob:
+        return ""
+    try:
+        return ctx.open_blobs().get_text(blob)
+    except (FileNotFoundError, OSError, ValueError):
+        return ""
+
+
+def _dispatch_branch_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    pr_number: int,
+    params: _DispatchParams,
+    kind: str,
+    context: str,
+    store: EventStore | None = None,
+    base_ref_override: str | None = None,
+) -> _PassResult:
+    """Run auf einem BESTEHENDEN PR-Branch (Nacharbeit L1 / CI-Fix L2 /
+    Merge-Konflikt G).
+
+    ``base_ref_override``: Startpunkt statt des PR-Heads (G: der lokale
+    Konflikt-Commit aus ``sync_branch``, ein Nachfahre des Heads → der Push
+    bleibt fast-forward).
+
+    Der Runner bleibt unverändert: er bekommt als ``base_ref`` den frisch
+    geholten PR-Head (``refs/remotes/origin/<head>``) und arbeitet wie immer auf
+    einem eigenen ``forge/<run_id>``-Branch. Behält er eine Generation
+    (``decision == pr_created``), pusht forge das Ergebnis **fast-forward** auf
+    den PR-Head — nie ``--force``, nur auf ``forge/*``-Branches
+    (``git_push_argv``). Kein neuer PR: der bestehende wird aktualisiert, sein
+    neuer Head-Commit macht das alte Review veraltet → ``in-dev → qa``.
+    """
+    label = {"rework": "rework", "ci_fix": "ci-fix", "conflict": "conflict"}[kind]
+    row = lambda decision, err=None, url=None: _LoopSummaryRow(  # noqa: E731
+        issue_number=issue.number,
+        issue_title=issue.title,
+        decision=decision,
+        pr_url=url,
+        auto_merge="-",
+        error=err,
+    )
+    code_host = ctx.get_code_host()
+    try:
+        meta = code_host.fetch_metadata(pr_number)
+    except CodeHostError as exc:
+        return _PassResult(summaries=[row("error", str(exc))], bailed=False,
+                           dispatched=0, skipped=0)
+    head = meta.head_branch
+    if not head.startswith("forge/"):
+        msg = f"PR #{pr_number} head {head!r} is not a forge/* branch — {label} skipped"
+        err_console.print(f"[yellow]skip[/yellow] {msg}")
+        return _PassResult(summaries=[row("skipped", msg)], bailed=False,
+                           dispatched=0, skipped=1)
+    try:
+        base_ref = base_ref_override or WorktreeManager(ctx.repo_root).fetch_remote_branch(
+            head
+        )
+    except GitError as exc:
+        return _PassResult(summaries=[row("error", str(exc))], bailed=False,
+                           dispatched=0, skipped=0)
+
+    preamble = {"rework": _REWORK_PREAMBLE, "ci_fix": _CI_FIX_PREAMBLE,
+                "conflict": _CONFLICT_PREAMBLE}[kind]
+    context_label = {"rework": "review findings", "ci_fix": "ci failure",
+                     "conflict": "merge conflict"}[kind]
+    prompt = preamble.format(pr=pr_number) + wrap_issue_body(
+        title=issue.title, body=issue.body
+    )
+    if context.strip():
+        prompt += "\n" + wrap_untrusted(label=context_label, text=context)
+    acceptance = with_refined_spec(
+        f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}",
+        _spec_for(ctx, store, issue.number, base=params.pr_base),
+    )
+    if context.strip():
+        acceptance += f"\n\n{context_label.title()}:\n{context}"
+    roster = (
+        _ci_fix_roster(ctx.spec)
+        if kind == "ci_fix"
+        else _roster_for_issue(ctx.spec, issue.labels)
+    )
+    console.print(
+        f"\n[bold yellow]>>> board-loop[/bold yellow] {label} run for issue "
+        f"#{issue.number} on PR #{pr_number} ([dim]{head}[/dim])"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=prompt,
+            prompt_template_id=label,
+            trigger="ci_failure" if kind == "ci_fix" else "rework",
+            focus=f"{label}:#{issue.number}",
+            base_ref=base_ref,
+            acceptance_criteria=acceptance,
+            max_iterations=params.max_iterations,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=issue.number,
+            pr_number=pr_number,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=params.multi_agent,
+            agents=roster,
+            create_pr=False,
+            pr_base=params.pr_base,
+            extra_labels=[],
+            pr_draft=False,
+            auto_merge=False,
+            announce=False,
+            store=store,
+        )
+    except Exception as exc:
+        err_console.print(f"[red]error[/red] in {label} run for #{issue.number}: {exc}")
+        return _PassResult(summaries=[row("error", str(exc))], bailed=True,
+                           dispatched=0, skipped=0)
+
+    result = outcome.result
+    _intake_run_findings(ctx, store, issue, outcome)
+    if (
+        result.decision == "pr_created"
+        and result.branch
+        and not _push_branch_result(ctx, issue, pr_number, result.branch, store, head=head)
+    ):
+        return _PassResult(summaries=[row("push_failed")], bailed=False,
+                           dispatched=1, skipped=0)
+    bailed = result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}
+    return _PassResult(
+        summaries=[row(f"{label}:{result.decision}", url=f"#{pr_number}")],
+        bailed=bailed,
+        dispatched=1,
+        skipped=0,
+    )
+
+
+def _pr_observation(ctx: ForgeContext, pr_number: int):
+    """(Head-Commit-Zeitstempel, CI-Status, PR-State, Mergeable) vom Code-Host.
+
+    Fail-open: jeder Code-Host-Fehler → ``None`` (Signal unbekannt → altes
+    Verhalten), damit ein Schluckauf den Tick nicht wedged."""
+    host = ctx.get_code_host()
+    head = host.head_committed_at(pr_number)
+    try:
+        meta = host.fetch_metadata(pr_number)
+        ci, state, mergeable = meta.ci_status, meta.state, meta.mergeable
+    except CodeHostError:
+        ci, state, mergeable = None, None, None
+    return head, ci, state, mergeable
+
+
+def _record_observed_merge(
+    ctx: ForgeContext, store: Any, events: list, pr_number: int, session_id: str
+) -> Any | None:
+    """Trägt einen beim Code-Host beobachteten, aber noch nicht als Event
+    erfassten Merge als ``PRMerged`` nach (Mensch hat gemergt, Auto-Merge, kein
+    Webhook — z.B. Azure DevOps). Damit bleibt der Event-Strom die einzige
+    Wahrheit für ``qa → release``, unabhängig vom Anbieter. Idempotent: nur
+    wenn noch kein ``PRMerged`` für ``pr_number`` existiert."""
+    if any(
+        e.kind == EventKind.PR_MERGED and (e.payload or {}).get("pr_number") == pr_number
+        for e in events
+    ):
+        return None
+    created = [
+        e.ts
+        for e in events
+        if e.kind == EventKind.PR_CREATED and (e.payload or {}).get("pr_number") == pr_number
+    ]
+    ttm = int((datetime.now(UTC) - min(created)).total_seconds()) if created else 0
+    evt = build_event(
+        kind=EventKind.PR_MERGED,
+        run_id=session_id,
+        project=ctx.spec.name,
+        project_fingerprint=ctx.project_fingerprint,
+        factory_version=ctx.factory_version,
+        spec_version=ctx.spec.spec_version,
+        payload=PRMergedPayload(
+            pr_number=pr_number, merger="external", time_to_merge_s=max(ttm, 0)
+        ),
+    )
+    store.append(evt)
+    return evt
+
+
+def _original_run_started(events: list, run_id: str) -> dict:
+    """Payload des ERSTEN ``RunStarted`` eines Runs (Resume-Kontext)."""
+    starts = sorted(
+        (e for e in events if e.kind == EventKind.RUN_STARTED and e.run_id == run_id),
+        key=lambda e: e.ts,
+    )
+    return dict(starts[0].payload or {}) if starts else {}
+
+
+def _push_branch_result(
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    pr_number: int,
+    branch: str,
+    store: EventStore | None,
+    *,
+    head: str | None = None,
+) -> bool:
+    """Pusht ein Branch-Run-Ergebnis fast-forward auf den PR-Head.
+
+    Scheitert der Push (Head bewegte sich, Rechte), würde das Item sonst still
+    in ``in-dev`` hängen (der Run gilt als erfolgreich, der Head bleibt alt) →
+    sichtbar nach ``blocked`` eskalieren (``WorkItemBlocked`` kind ``error``)."""
+    host = ctx.get_code_host()
+    try:
+        if head is None:
+            head = host.fetch_metadata(pr_number).head_branch
+        host.push_branch(branch=branch, target=head)
+    except CodeHostError as exc:
+        err_console.print(f"[red]push failed[/red] for PR #{pr_number}: {exc}")
+        _escalate(ctx, store, issue, f"push to PR #{pr_number} failed: {exc}")
+        return False
+    console.print(f"  [green]pushed[/green] {branch} → {head} (PR #{pr_number})")
+    return True
+
+
+def _escalate(ctx: ForgeContext, store: EventStore | None, issue: ReadyIssue, reason: str) -> None:
+    """Item sichtbar nach ``forge:blocked`` (Label + ``WorkItemBlocked``)."""
+    stage = stage_of(issue.labels)
+    try:
+        ctx.get_tracker().set_stage(
+            number=issue.number, add=Stage.BLOCKED.value,
+            remove=stage.value if stage is not None else None,
+        )
+    except TrackerError as exc:
+        err_console.print(f"[yellow]escalation label failed[/yellow] #{issue.number}: {exc}")
+    with _store_scope(ctx, store) as s:
+        s.append(
+            build_event(
+                kind=EventKind.WORK_ITEM_BLOCKED,
+                run_id=str(ULID()),
+                project=ctx.spec.name,
+                project_fingerprint=ctx.project_fingerprint,
+                factory_version=ctx.factory_version,
+                spec_version=ctx.spec.spec_version,
+                payload=WorkItemBlockedPayload(
+                    issue_number=issue.number, kind="error", reason=reason[:500]
+                ),
+            )
+        )
+
+
+def _dispatch_sync(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    pr_number: int,
+    params: _DispatchParams,
+    store: EventStore | None = None,
+) -> _PassResult:
+    """G: konfliktbehafteten PR nach einem Geschwister-Merge nachziehen.
+
+    Erst deterministisch (``git merge`` der Basis, sauber → Fast-Forward-Push,
+    kein LLM). Nur bei echten Konflikten ein Agent-Run (``conflict``) ab dem
+    lokalen Konflikt-Commit."""
+    res = sync_branch(ctx, pr_number)
+    row = _LoopSummaryRow(issue.number, issue.title, f"sync:{res.status}", f"#{pr_number}",
+                          "-", res.detail or None)
+    if res.status == "synced":
+        console.print(f"  [green]synced[/green] PR #{pr_number} with its base")
+        return _PassResult(summaries=[row], bailed=False, dispatched=0, skipped=0)
+    if res.status != "conflict" or res.conflict_ref is None:
+        return _PassResult(summaries=[row], bailed=False, dispatched=0, skipped=1)
+    context = "Conflicting files:\n" + "\n".join(f"- {f}" for f in res.files)
+    return _dispatch_branch_run(
+        ctx=ctx, issue=issue, pr_number=pr_number, params=params, kind="conflict",
+        context=context, store=store, base_ref_override=res.conflict_ref,
+    )
+
+
+def _review_release_pr(
+    ctx: ForgeContext, pr_number: int, params: _DispatchParams, store: EventStore
+) -> None:
+    """L3: Release-PR durch denselben Agent-Review + Merge-Gates wie jeder PR."""
+    from forge_execute.agents import ClaudeCodeCLIAgent
+
+    agent = ClaudeCodeCLIAgent(default_model=params.model, claude_bin=params.claude_bin)
+    execute_pr_review(
+        ctx,
+        pr_number=pr_number,
+        agent=agent,
+        merge=True,
+        model=params.model,
+        issue_body=(
+            "Release pull request prepared by forge. It may ONLY change the changelog "
+            "and version files; approve if the changelog matches the listed changes."
+        ),
+        store=store,
+    )
+
+
+def _ci_fix_roster(spec) -> list[str] | None:
+    """Roster für CI-Fix-Runs: ``triggers.on_ci_failure.agents`` (Default
+    ``["developer"]``), sonst der execute_run-Default."""
+    cfg = getattr(getattr(spec, "triggers", None), "on_ci_failure", None)
+    return list(cfg.agents) if cfg is not None else ["developer"]
+
+
+_EPIC_PREAMBLE = (
+    "This is an EPIC-DECOMPOSITION task, not an implementation task. Do NOT write "
+    "or change any code. Split the epic below into small, independently shippable "
+    "work items (each doable in one pull request), with testable acceptance "
+    "criteria in each body, explicit dependencies between them, and the file globs "
+    "each one will likely touch (items with overlapping `touches` cannot run in "
+    "parallel — keep them disjoint where you can). Return them ONLY in the "
+    "work-items block:\n\n"
+)
+
+
+def _dispatch_epic_run(
+    *,
+    ctx: ForgeContext,
+    issue: ReadyIssue,
+    params: _DispatchParams,
+    store: EventStore | None = None,
+) -> _PassResult:
+    """Dispatcht die **Epic-Zerlegung** (Roadmap A2): ein Planner-Run liefert
+    Kind-Items im ``FORGE-WORKITEMS``-Block; ``intake`` legt sie mit
+    ``parent`` = Epic an (``WorkItemCreated``) → ``has_decomposition`` →
+    ``epic → tracking``. Kinder eines vom Menschen in ``forge:epic``
+    gesetzten Epics gelten als freigegeben (starten in ``requirements``)."""
+    from forge_execute.agents.templates import WORKITEMS_FORMAT_HINT
+
+    roster = _roster_for_issue(ctx.spec, issue.labels) or ["architect"]
+    prompt = (
+        _EPIC_PREAMBLE
+        + "```\n" + WORKITEMS_FORMAT_HINT + "\n```\n\n"
+        + wrap_issue_body(title=issue.title, body=issue.body)
+    )
+    console.print(
+        f"\n[bold magenta]>>> board-loop[/bold magenta] epic decomposition for "
+        f"#{issue.number} [italic]{issue.title}[/italic]"
+    )
+    try:
+        outcome = execute_run(
+            ctx=ctx,
+            rendered_prompt=prompt,
+            prompt_template_id="epic",
+            trigger="issue_label",
+            focus=f"epic:#{issue.number}",
+            base_ref=params.base_ref,
+            acceptance_criteria=None,
+            max_iterations=1,
+            max_turns=params.max_turns,
+            eval_suite=params.eval_suite,
+            model=params.model,
+            issue_number=issue.number,
+            pr_number=None,
+            dry_run=False,
+            claude_bin=params.claude_bin,
+            multi_agent=False,
+            agents=roster,
+            create_pr=False,
+            pr_base=params.pr_base,
+            extra_labels=[],
+            pr_draft=False,
+            auto_merge=False,
+            announce=False,
+            store=store,
+        )
+    except Exception as exc:
+        err_console.print(f"[red]error[/red] in epic run for #{issue.number}: {exc}")
+        return _PassResult(
+            summaries=[_LoopSummaryRow(issue.number, issue.title, "error", None, "-", str(exc))],
+            bailed=True, dispatched=0, skipped=0,
+        )
+    blocks = list(outcome.result.workitems_blocks or [])
+    created: list[int] = []
+    extra: tuple[str, ...] = ()
+    # G/E13: alle Kinder landen in forge/epic-<N>, ausgeliefert wird als Ganzes.
+    if (
+        blocks
+        and parse_integration_mode(issue.body) == "branch"
+        and ensure_integration_branch(ctx, issue.number, params.pr_base)
+    ):
+        extra = (f"Integration-Branch: {integration_branch_name(issue.number)}",)
+    if blocks:
+        with _store_scope(ctx, store) as s:
+            created = intake_blocks(
+                ctx, store=s, run_id=outcome.result.run_id, blocks=blocks,
+                source="epic_decomposition", parent=issue.number, parent_approved=True,
+                extra_lines=extra,
+            ).created
+    return _PassResult(
+        summaries=[_LoopSummaryRow(
+            issue.number, issue.title,
+            f"epic:{len(created)} items" if created else "epic:no_items",
+            None, "-", None,
+        )],
+        bailed=outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"},
+        dispatched=1, skipped=0,
+    )
+
+
 def _dispatch_resume(
     *,
     ctx: ForgeContext,
@@ -827,8 +1372,15 @@ def _dispatch_resume(
     params: _DispatchParams,
     issue: ReadyIssue | None,
     store: EventStore | None = None,
+    events: list | None = None,
 ) -> _PassResult:
     """Setzt einen vom Usage-/Session-Limit unterbrochenen Run fort (Loop 2).
+
+    Der Resume behält Trigger, Focus, PR-Nummer und damit die **Run-Art** des
+    Originals (aus dessen ``RunStarted``): ein Rework/CI-Fix/Konflikt-Run pusht
+    sein Ergebnis wieder fast-forward auf den bestehenden PR-Branch (kein neuer
+    PR), Epic/Design/Requirements-Runs öffnen nie einen PR, ein Kind eines
+    Integrations-Epics zielt auf ``forge/epic-<N>``.
 
     Reicht den Resume-Anker (run_id + session_id) an ``execute_run`` durch; der
     Runner dockt an den eingefrorenen Worktree an (``claude --resume``) und führt
@@ -839,6 +1391,17 @@ def _dispatch_resume(
     """
     roster = _roster_for_issue(ctx.spec, issue.labels) if issue is not None else None
     title = issue.title if issue is not None else f"resume {order.run_id[:10]}"
+    orig = _original_run_started(events or [], order.run_id)
+    focus = str(orig.get("focus") or f"resume:{order.run_id}")
+    kind = focus.split(":", 1)[0] if ":" in focus else "dev"
+    branch_kinds = {"rework", "ci-fix", "conflict"}
+    template = {"requirements": "requirements", "design": "design", "epic": "epic"}.get(
+        kind, "resume"
+    )
+    create_pr = kind not in branch_kinds | {"epic", "design", "requirements"}
+    pr_base = params.pr_base
+    if issue is not None and (integration := parse_integration_branch(issue.body)):
+        pr_base = integration
     console.print(
         f"\n[bold blue]>>> board-loop[/bold blue] resume run "
         f"[dim]{order.run_id[:10]}[/dim] (issue "
@@ -848,9 +1411,9 @@ def _dispatch_resume(
         outcome = execute_run(
             ctx=ctx,
             rendered_prompt=_DEFAULT_RESUME_PROMPT,
-            prompt_template_id="resume",
-            trigger="schedule",
-            focus=f"resume:{order.run_id}",
+            prompt_template_id=template,
+            trigger=str(orig.get("trigger") or "schedule"),
+            focus=focus,
             base_ref=params.base_ref,
             acceptance_criteria=None,
             max_iterations=params.max_iterations,
@@ -858,13 +1421,13 @@ def _dispatch_resume(
             eval_suite=params.eval_suite,
             model=params.model,
             issue_number=order.issue_number,
-            pr_number=None,
+            pr_number=orig.get("pr_number"),
             dry_run=False,
             claude_bin=params.claude_bin,
             multi_agent=params.multi_agent,
             agents=roster,
-            create_pr=True,
-            pr_base=params.pr_base,
+            create_pr=create_pr,
+            pr_base=pr_base,
             extra_labels=params.pr_label or [],
             pr_draft=False,
             auto_merge=params.auto_merge,
@@ -890,6 +1453,24 @@ def _dispatch_resume(
             dispatched=0,
             skipped=0,
         )
+
+    result = outcome.result
+    if kind in branch_kinds and result.decision == "pr_created" and result.branch:
+        pr_number = orig.get("pr_number")
+        if pr_number is not None and issue is not None:
+            _push_branch_result(ctx, issue, int(pr_number), result.branch, store)
+    elif kind == "epic" and issue is not None and result.workitems_blocks:
+        with _store_scope(ctx, store) as s:
+            intake_blocks(
+                ctx, store=s, run_id=result.run_id, blocks=list(result.workitems_blocks),
+                source="epic_decomposition", parent=issue.number, parent_approved=True,
+            )
+    elif kind == "requirements" and issue is not None:
+        with _store_scope(ctx, store) as s:
+            publish_spec(ctx, issue=issue, run_id=result.run_id, store=s,
+                         base_ref=params.base_ref, pr_base=params.pr_base)
+    elif issue is not None and kind not in branch_kinds:
+        _intake_run_findings(ctx, store, issue, outcome)
 
     bailed = outcome.result.decision in {"cost_cap_hit", "guardrail_blocked", "error"}
     return _PassResult(
@@ -960,6 +1541,8 @@ def _heartbeat_session(
                     skipped=result.skipped,
                     bailed=result.bailed,
                     scheduled_resume_count=result.scheduled_resume_count,
+                    parallel_running=result.parallel_running,
+                    capacity=result.capacity,
                 ),
             )
         )
@@ -988,8 +1571,7 @@ def _heartbeat_session(
 def _run_watch(
     *,
     ctx: ForgeContext,
-    repo_owner: str,
-    repo_name: str,
+    tracker: WorkTracker | None = None,
     max_issues: int,
     interval_s: float,
     params: _DispatchParams,
@@ -999,14 +1581,13 @@ def _run_watch(
 ) -> HeartbeatStats:
     """Flacher Dauerbetrieb (Phase B): pollt board-ready Issues und arbeitet
     sie ab — ohne Stage-State-Machine."""
+    tracker = tracker or ctx.get_tracker()
 
     def make_tick(_store: Any, _session_id: str) -> Callable[[int], TickResult]:
         def tick_fn(tick_index: int) -> TickResult:
             try:
-                ready = list_ready_items(
-                    ctx.spec.board, repo_owner=repo_owner, repo_name=repo_name
-                )[:max_issues]
-            except BoardError as exc:
+                ready = tracker.list_ready_items(ctx.spec.board)[:max_issues]
+            except TrackerError as exc:
                 err_console.print(
                     f"[red]board error[/red] (tick {tick_index}): {exc}"
                 )
@@ -1057,8 +1638,12 @@ def _dispatch_review_run(
     das nicht selbst.
     """
     from forge_execute.agents import ClaudeCodeCLIAgent
+    from forge_execute.agents.templates import extract_workitems_block
 
-    acceptance = f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}"
+    acceptance = with_refined_spec(
+        f"Issue #{issue.number} — {issue.title}\n\n{issue.body or ''}",
+        _spec_for(ctx, store, issue.number, base=params.pr_base),
+    )
     console.print(
         f"\n[bold magenta]>>> board-loop[/bold magenta] qa review for issue "
         f"#{issue.number} (PR #{pr_number}) [italic]{issue.title}[/italic]"
@@ -1094,6 +1679,14 @@ def _dispatch_review_run(
             skipped=0,
         )
 
+    # A2: nicht-blockierende Folgeaufgaben aus dem Review → Items.
+    followups = extract_workitems_block(outcome.reasoning or "")
+    if followups:
+        with _store_scope(ctx, store) as s:
+            intake_blocks(
+                ctx, store=s, run_id=str(ULID()), blocks=[followups],
+                source="review_followup", origin_issue=issue.number,
+            )
     merge_note = "merged" if outcome.merged else (outcome.merge_decision.reason or "no-merge")
     console.print(
         f"  [cyan]#{issue.number}[/cyan] review: {outcome.verdict} "
@@ -1119,8 +1712,7 @@ def _dispatch_review_run(
 def _run_conductor_watch(
     *,
     ctx: ForgeContext,
-    repo_owner: str,
-    repo_name: str,
+    tracker: WorkTracker | None = None,
     max_issues: int,
     interval_s: float,
     params: _DispatchParams,
@@ -1144,6 +1736,7 @@ def _run_conductor_watch(
     sequenzielle Verhalten.
     """
     stage_labels = [s.value for s in Stage]
+    tracker = tracker or ctx.get_tracker()
 
     def make_tick(store: Any, session_id: str) -> Callable[[int], TickResult]:
         def _emit_stage_changed(t: StageTransition) -> None:
@@ -1184,17 +1777,21 @@ def _run_conductor_watch(
 
         def tick_fn(tick_index: int) -> TickResult:
             try:
-                issues = list_stage_items(
-                    repo_owner=repo_owner,
-                    repo_name=repo_name,
-                    stage_labels=stage_labels,
-                    state="all",
+                issues = tracker.list_stage_items(
+                    stage_labels=stage_labels, state="all"
                 )
-            except BoardError as exc:
+            except TrackerError as exc:
                 err_console.print(
                     f"[red]board error[/red] (tick {tick_index}): {exc}"
                 )
                 return TickResult()
+
+            # A2: deterministische Quellen (CI rot auf main, Schedules) zuerst —
+            # neu angelegte Items erscheinen ab dem nächsten Tick im Board.
+            try:
+                tick_sources(ctx, store=store, session_id=session_id, now=datetime.now(UTC))
+            except Exception as exc:  # Quellen dürfen den Tick nie killen
+                err_console.print(f"[yellow]intake sources failed[/yellow]: {exc}")
 
             events = []
             for kind in (
@@ -1207,6 +1804,7 @@ def _run_conductor_watch(
                 EventKind.PR_MERGED,
                 EventKind.RELEASE_TAGGED,
                 EventKind.RUN_RESUME_SCHEDULED,
+                EventKind.WORK_ITEM_CREATED,
             ):
                 events.extend(store.events_by_kind(kind))
 
@@ -1227,6 +1825,7 @@ def _run_conductor_watch(
                     params=params,
                     issue=by_number.get(resume_order.issue_number or -1),
                     store=store,
+                    events=events,
                 )
                 _print_loop_summary(res.summaries, bailed=res.bailed)
                 resume_count += res.dispatched
@@ -1243,15 +1842,74 @@ def _run_conductor_watch(
                 # request_changes-PR erneut reviewt wird. Eine gh-Call pro
                 # QA-Item (nicht pro Issue); fail-open → None bei jedem Fehler.
                 head_committed_at = None
-                if stage == Stage.QA:
+                ci_status = None
+                mergeable = None
+                spec_state = None
+                if stage in (Stage.QA, Stage.IN_DEV, Stage.TRACKING):
                     qa_pr = pr_number_for_issue(events, issue.number)
                     if qa_pr is not None:
-                        head_committed_at = fetch_pr_head_committed_at(
-                            repo=ctx.repo_root, pr_number=qa_pr
+                        head_committed_at, ci_status, pr_state, mergeable = (
+                            _pr_observation(ctx, qa_pr)
                         )
+                        if pr_state == "MERGED":
+                            merged_evt = _record_observed_merge(
+                                ctx, store, events, qa_pr, session_id
+                            )
+                            if merged_evt is not None:
+                                events.append(merged_evt)
+                if stage == Stage.REQUIREMENTS:
+                    # A1: Merge des Spec-PRs (meist durch einen Menschen) als
+                    # PRMerged nachtragen → spec_pending fällt → design.
+                    spec_pr = spec_pr_for_issue(events, issue.number)
+                    spec_state = None
+                    if spec_pr is not None:
+                        _, _, spec_state, _ = _pr_observation(ctx, spec_pr)
+                        if spec_state == "MERGED":
+                            merged_evt = _record_observed_merge(
+                                ctx, store, events, spec_pr, session_id
+                            )
+                            if merged_evt is not None:
+                                events.append(merged_evt)
                 signals = derive_signals(
-                    events, issue.number, head_committed_at=head_committed_at
+                    events,
+                    issue.number,
+                    head_committed_at=head_committed_at,
+                    ci_status=ci_status,
+                    mergeable=mergeable,
                 )
+                if stage == Stage.REQUIREMENTS and spec_state == "CLOSED":
+                    signals = replace(signals, spec_rejected=True)
+                # L3: Train sammelt release-Items — außer Kinder eines
+                # Integrations-Epics: die landen nicht auf main, sondern werden
+                # einzeln als "integrated" abgeschlossen (G).
+                if (
+                    stage == Stage.RELEASE
+                    and ctx.spec.release.mode == "train"
+                    and not parse_integration_branch(issue.body)
+                ):
+                    signals = replace(signals, release_batched=True)
+                if stage == Stage.TRACKING:
+                    children = epic_children(events, issue.number)
+                    stages_by_number = {i.number: stage_of(i.labels) for i in issues}
+                    all_done = bool(children) and all(
+                        stages_by_number.get(c) == Stage.DONE for c in children
+                    )
+                    if parse_integration_mode(issue.body) == "branch":
+                        # G: alle Kinder im Integrations-Branch → Sammel-PR
+                        # öffnen (einmal); tracking → qa folgt über has_open_pr.
+                        if all_done and not signals.has_open_pr:
+                            run_id = epic_run_id(events, issue.number)
+                            if run_id and open_integration_pr(
+                                ctx, epic=issue, run_id=run_id, store=store,
+                                base=params.pr_base,
+                            ):
+                                events.extend(
+                                    e for e in store.events_by_kind(EventKind.PR_CREATED)
+                                    if e.run_id == run_id
+                                )
+                                signals = derive_signals(events, issue.number)
+                    else:
+                        signals = replace(signals, children_done=all_done)
                 # A1: in-dev-Item, dessen Dev-Run keinen PR produzierte →
                 # Re-Dispatch-/Eskalations-Signale aus dem Event-Strom ableiten.
                 if stage == Stage.IN_DEV:
@@ -1264,6 +1922,7 @@ def _run_conductor_watch(
                         number=issue.number,
                         stage=stage,
                         depends_on=tuple(parse_depends_on(issue.body)),
+                        touches=tuple(parse_touches(issue.body)),
                         signals=signals,
                     )
                 )
@@ -1279,10 +1938,8 @@ def _run_conductor_watch(
             counters = {"dispatched": 0, "bailed": resume_bailed}
 
             def set_stage(t: StageTransition) -> None:
-                set_issue_stage_label(
-                    issue_number=t.number,
-                    repo_owner=repo_owner,
-                    repo_name=repo_name,
+                tracker.set_stage(
+                    number=t.number,
                     add=t.to_stage.value,
                     remove=t.from_stage.value,
                 )
@@ -1317,9 +1974,33 @@ def _run_conductor_watch(
                         return _dispatch_release_run(
                             ctx=ctx, issue=issue, store=store, session_id=session_id
                         )
+                    if order.stage == Stage.EPIC:
+                        return _dispatch_epic_run(
+                            ctx=ctx, issue=issue, params=params, store=store
+                        )
                     if order.stage == Stage.DESIGN:
                         return _dispatch_design_run(
                             ctx=ctx, issue=issue, params=params, store=store
+                        )
+                    if order.kind == "sync":
+                        pr_num = pr_number_for_issue(events, order.number)
+                        if pr_num is None:
+                            return None
+                        return _dispatch_sync(
+                            ctx=ctx, issue=issue, pr_number=pr_num, params=params, store=store
+                        )
+                    if order.kind in ("rework", "ci_fix"):
+                        pr_num = pr_number_for_issue(events, order.number)
+                        if pr_num is None:
+                            return None
+                        context = (
+                            _latest_review_reasoning(ctx, events, pr_num)
+                            if order.kind == "rework"
+                            else ctx.get_code_host().ci_failure_summary(pr_num)
+                        )
+                        return _dispatch_branch_run(
+                            ctx=ctx, issue=issue, pr_number=pr_num, params=params,
+                            kind=order.kind, context=context, store=store,
                         )
                     if order.stage == Stage.QA:
                         pr_num = pr_number_for_issue(events, order.number)
@@ -1358,13 +2039,33 @@ def _run_conductor_watch(
             def dispatch(order: DispatchOrder) -> None:
                 pending.append(order)
 
+            capacity = tick_capacity(ctx, store, max_parallel)
             result = run_conductor_tick(
                 items=items,
-                capacity=max_parallel,
+                capacity=capacity,
                 set_stage=set_stage,
                 dispatch=dispatch,
                 on_blocked=_emit_blocked,
             )
+
+            # L3: Release-Train — ein Schritt pro Tick über alle release-Items.
+            if ctx.spec.release.mode == "train":
+                waiting = [
+                    w.number for w in items
+                    if w.stage == Stage.RELEASE
+                    and w.signals.release_batched
+                    and not w.signals.release_done
+                ]
+                try:
+                    train = train_tick(
+                        ctx, store=store, session_id=session_id, events=events,
+                        waiting_items=waiting, base=params.pr_base, now=datetime.now(UTC),
+                        review_fn=lambda n: _review_release_pr(ctx, n, params, store),
+                    )
+                    if train.action not in ("idle",):
+                        console.print(f"  [dim]release train: {train.action} {train.detail}[/dim]")
+                except Exception as exc:  # der Train darf den Tick nie killen
+                    err_console.print(f"[yellow]release train failed[/yellow]: {exc}")
 
             pass_results: list[_PassResult] = []
             if max_parallel > 1 and len(pending) > 1:
@@ -1388,6 +2089,8 @@ def _run_conductor_watch(
                 blocked=result.blocked,
                 bailed=bool(counters["bailed"]),
                 scheduled_resume_count=resume_count,
+                parallel_running=len(pending) if max_parallel > 1 else min(len(pending), 1),
+                capacity=capacity,
             )
 
         return tick_fn
@@ -1482,12 +2185,11 @@ def _run_triage(
     if triage_cfg.auto_comment:
         if capabilities.check_action("comment_issue").allowed:
             try:
-                comment_issue(
-                    repo=ctx.repo_root,
-                    issue_number=issue.number,
+                ctx.get_tracker().comment(
+                    number=issue.number,
                     body=_format_triage_comment(result),
                 )
-            except GHTriageError as exc:
+            except TrackerError as exc:
                 err_console.print(
                     f"[yellow]triage comment failed for #{issue.number}[/yellow]: {exc}"
                 )
@@ -1503,12 +2205,11 @@ def _run_triage(
                 "completed" if result.decision == "already_solved" else "not planned"
             )
             try:
-                close_issue(
-                    repo=ctx.repo_root,
-                    issue_number=issue.number,
+                ctx.get_tracker().close(
+                    number=issue.number,
                     reason=close_reason,
                 )
-            except GHTriageError as exc:
+            except TrackerError as exc:
                 err_console.print(
                     f"[yellow]triage close failed for #{issue.number}[/yellow]: {exc}"
                 )
@@ -1628,95 +2329,6 @@ def _run_garbage_collection(repo_root: Path) -> None:
         )
 
 
-_REMOTE_RE = re.compile(
-    r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/.]+?)(?:\.git)?/?$"
-)
-
-
-def _detect_repo_slug(
-    repo: Path,
-    *,
-    run_subprocess: SubprocessRunner = subprocess.run,
-) -> tuple[str, str]:
-    """``git remote get-url origin`` → (owner, repo). Funktioniert mit ssh
-    und https Remotes."""
-    result = run_subprocess(
-        ["git", "remote", "get-url", "origin"],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode != 0:
-        raise typer.BadParameter(
-            f"git remote get-url origin failed: {result.stderr.strip()}"
-        )
-    url = result.stdout.strip()
-    match = _REMOTE_RE.search(url)
-    if not match:
-        raise typer.BadParameter(
-            f"could not parse owner/repo from remote URL {url!r}"
-        )
-    return match.group("owner"), match.group("repo")
-
-
-def _fetch_issues_by_number(
-    *,
-    repo_owner: str,
-    repo_name: str,
-    numbers: list[int],
-    gh_bin: str = "gh",
-    run_subprocess: SubprocessRunner = subprocess.run,
-) -> list[ReadyIssue]:
-    """Lädt Issue-Daten via ``gh issue view --json`` für die gegebenen Nummern.
-
-    Wird vom ``--issue 42 43``-Override-Pfad gebraucht — wir gehen nicht
-    übers Project, also kein Board-Filter, kein Idempotenz-Check.
-    Operator weiß was er tut.
-    """
-    out: list[ReadyIssue] = []
-    for n in numbers:
-        cmd = [
-            gh_bin, "issue", "view", str(n),
-            "--repo", f"{repo_owner}/{repo_name}",
-            "--json", "number,title,body,labels,state,url",
-        ]
-        result = run_subprocess(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if result.returncode != 0:
-            raise BoardError(
-                f"gh issue view #{n} failed (exit {result.returncode}): "
-                f"{result.stderr.strip()}"
-            )
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise BoardError(
-                f"gh issue view #{n} returned invalid JSON: {exc}"
-            ) from exc
-        labels_raw = data.get("labels") or []
-        labels = [
-            entry.get("name", "") for entry in labels_raw if isinstance(entry, dict)
-        ]
-        out.append(
-            ReadyIssue(
-                number=int(data.get("number", n)),
-                title=str(data.get("title", "")),
-                body=str(data.get("body", "")),
-                labels=[lbl for lbl in labels if lbl],
-                project_status="(override)",
-                url=str(data.get("url", "")),
-            )
-        )
-    return out
-
-
 def _roster_for_issue(spec, labels: list[str]) -> list[str] | None:
     """Liefert das Subagent-Roster für ein Issue aus der Trigger-Config.
 
@@ -1769,11 +2381,9 @@ def _summary_row_from_outcome(
     )
 
 
-def _print_dry_run_table(
-    ready: list[ReadyIssue], repo_owner: str, repo_name: str
-) -> None:
+def _print_dry_run_table(ready: list[ReadyIssue], provider: str) -> None:
     table = Table(
-        title=f"board-loop dry-run · {repo_owner}/{repo_name} · {len(ready)} ready",
+        title=f"board-loop dry-run · {provider} · {len(ready)} ready",
         show_lines=False,
     )
     table.add_column("#", style="cyan", no_wrap=True)

@@ -44,6 +44,7 @@ from forge_execute.agents.templates import (
     extract_agents_from_master_output,
     extract_lessons_block,
     extract_plan_from_master_output,
+    extract_workitems_block,
     list_templates,
     normalize_agents,
     roster_needs_orchestration,
@@ -362,6 +363,9 @@ class ClaudeCodeCLIAgent:
         plan_md: str | None = None
         agents_invoked: list[str] | None = None
         lessons_block: str | None = None
+        # Vorgeschlagene neue Work-Items: in JEDEM Run möglich (auch Single-
+        # Agent), weil Funde außerhalb des Auftrags überall anfallen.
+        workitems_block = extract_workitems_block(str(raw.get("result") or ""))
         if self.multi_agent:
             result_text = str(raw.get("result") or "")
             if "architect" in self.agents:
@@ -384,6 +388,7 @@ class ClaudeCodeCLIAgent:
             plan_md=plan_md,
             agents_invoked=agents_invoked,
             lessons_block=lessons_block,
+            workitems_block=workitems_block,
             stream_log=str(log_path),
             session_id=session_id,
         )

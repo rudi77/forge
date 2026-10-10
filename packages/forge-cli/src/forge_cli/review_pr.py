@@ -27,13 +27,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from forge_adapters.github import (
-    GitHubError,
-    fetch_pr_diff,
-    fetch_pr_metadata,
-    merge_pr,
-    post_pr_review,
-)
+from forge_adapters.base import CodeHost, CodeHostError
 from forge_core.events import EventKind, PRMergedPayload, PRReviewedPayload, build_event
 from forge_execute.agents import ClaudeCodeCLIAgent, MockCodingAgent
 from forge_execute.agents.base import CodingAgent
@@ -87,25 +81,30 @@ def execute_pr_review(
     allow_missing_ci: bool = False,
     dry_run: bool = False,
     store=None,
+    code_host: CodeHost | None = None,
 ) -> PRReviewRunOutcome:
     """Reviewed (und merged opt-in) einen offenen PR. Effektiert via Events.
 
-    ``run_subprocess`` wird an die gh-Adapter durchgereicht (Tests injizieren
-    einen Fake); ``None`` = produktiv ``subprocess.run``.
+    Der Code-Host kommt aus ``code_host`` bzw. dem Kontext
+    (``ctx.get_code_host()`` — GitHub, Azure DevOps, …). Legacy-Pfad:
+    ``run_subprocess``/``gh_bin`` bauen explizit einen ``GitHubCodeHost``
+    (Tests injizieren so einen gh-Fake).
     """
-    import subprocess
+    if code_host is None:
+        if run_subprocess is not None:
+            from forge_adapters.github import GitHubCodeHost
 
-    sub = run_subprocess or subprocess.run
+            code_host = GitHubCodeHost(
+                repo_root=ctx.repo_root, gh_bin=gh_bin, run_subprocess=run_subprocess
+            )
+        else:
+            code_host = ctx.get_code_host()
     eff_threshold = threshold if threshold is not None else ctx.spec.judge.threshold
 
-    meta = fetch_pr_metadata(
-        repo=ctx.repo_root, pr_number=pr_number, gh_bin=gh_bin, run_subprocess=sub
-    )
+    meta = code_host.fetch_metadata(pr_number)
     if meta.state != "OPEN":
         raise ContextError(f"PR #{pr_number} is not open (state={meta.state})")
-    diff = fetch_pr_diff(
-        repo=ctx.repo_root, pr_number=pr_number, gh_bin=gh_bin, run_subprocess=sub
-    )
+    diff = code_host.fetch_diff(pr_number)
 
     reviewer = PRReviewer(agent)
     outcome = reviewer.review_open_pr(
@@ -149,16 +148,13 @@ def execute_pr_review(
     # GitHub-Review posten (nicht-fatal).
     if post_review:
         try:
-            post_pr_review(
-                repo=ctx.repo_root,
+            code_host.post_review(
                 pr_number=pr_number,
                 approve=outcome.approved,
                 body=_review_body(outcome.score, outcome.reasoning),
-                gh_bin=gh_bin,
-                run_subprocess=sub,
             )
             result.review_posted = True
-        except GitHubError as exc:
+        except CodeHostError as exc:
             result.review_post_error = str(exc)
 
     owns_store = store is None
@@ -166,13 +162,10 @@ def execute_pr_review(
     try:
         if decision.merge:
             try:
-                mres = merge_pr(
-                    repo=ctx.repo_root,
+                mres = code_host.merge(
                     pr_number=pr_number,
                     method=method,  # type: ignore[arg-type]
                     delete_branch=delete_branch,
-                    gh_bin=gh_bin,
-                    run_subprocess=sub,
                 )
                 result.merged = True
                 created_ts = _pr_created_ts(ctx, store, pr_number)
@@ -198,9 +191,15 @@ def execute_pr_review(
                         ),
                     )
                 )
-            except GitHubError as exc:
+            except CodeHostError as exc:
                 result.merge_error = str(exc)
 
+        reasoning_blob: str | None = None
+        if outcome.reasoning.strip():
+            try:
+                reasoning_blob = ctx.open_blobs().put_text(outcome.reasoning)
+            except OSError:
+                reasoning_blob = None
         store.append(
             build_event(
                 kind=EventKind.PR_REVIEWED,
@@ -214,6 +213,12 @@ def execute_pr_review(
                 tokens_out=outcome.tokens_out,
                 model=outcome.model,
                 duration_ms=outcome.duration_ms,
+                # Gescheiterter Review-Agent: fail-closed request_changes, aber
+                # kein Code-Befund — der Conductor reviewt dann erneut statt
+                # Nacharbeit zu starten (conductor.effective_reviews).
+                success=False if outcome.error else None,
+                error_class="ReviewAgentError" if outcome.error else None,
+                error_msg=outcome.error,
                 payload=PRReviewedPayload(
                     pr_number=pr_number,
                     verdict=outcome.verdict,  # type: ignore[arg-type]
@@ -224,6 +229,7 @@ def execute_pr_review(
                     merge_blocked_reason=(
                         None if result.merged else (result.merge_error or decision.reason)
                     ),
+                    reasoning_blob=reasoning_blob,
                 ),
             )
         )
@@ -331,7 +337,7 @@ def review_pr_command(
             allow_missing_ci=allow_missing_ci,
             dry_run=dry_run,
         )
-    except (ContextError, GitHubError) as exc:
+    except (ContextError, CodeHostError) as exc:
         err_console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 

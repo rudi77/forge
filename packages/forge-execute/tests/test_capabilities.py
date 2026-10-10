@@ -213,3 +213,11 @@ def test_allowed_tools_no_run_capabilities() -> None:
     caps = Capabilities(spec)
     s = caps.allowed_tools_string()
     assert "Bash(" not in s
+
+
+def test_create_work_items_is_opt_in() -> None:
+    """Roadmap A3: forge legt nur mit expliziter Capability Work-Items an."""
+    spec = _spec()
+    assert Capabilities(spec).check_action("create_work_items").allowed is False
+    spec.capabilities.create_work_items = True
+    assert Capabilities(spec).check_action("create_work_items").allowed is True

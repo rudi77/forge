@@ -27,6 +27,25 @@ class Stage(StrEnum):
     RELEASE = "forge:release"
     DONE = "forge:done"
     BLOCKED = "forge:blocked"
+    # Roadmap A: Arbeit erzeugen. ``epic`` wird von einem Planner-Run in
+    # Kind-Items zerlegt und wartet dann in ``tracking``, bis alle Kinder
+    # ``done`` sind. ``proposed`` = von forge erzeugt, wartet auf Freigabe durch
+    # einen Menschen — der Conductor verlässt diese Stage NIE selbst.
+    EPIC = "forge:epic"
+    TRACKING = "forge:tracking"
+    PROPOSED = "forge:proposed"
+
+
+# Marker-Labels, die forge zusätzlich zu den Stages setzt (keine Stage):
+# ``forge:generated`` kennzeichnet von forge selbst erzeugte Work-Items (A3).
+# ``forge:auto``/``forge:spec``/``forge:release-pr`` markieren PRs (gh bricht
+# ``pr create --label`` ab, wenn ein Label fehlt → ``doctor --board --fix``).
+MARKER_LABELS: tuple[str, ...] = (
+    "forge:generated",
+    "forge:auto",
+    "forge:spec",
+    "forge:release-pr",
+)
 
 
 # Kanonische Pipeline-Reihenfolge (ohne die Sonderzustände blocked/done-terminal).
@@ -53,6 +72,9 @@ ALLOWED_TRANSITIONS: dict[Stage, frozenset[Stage]] = {
     Stage.RELEASE: frozenset({Stage.DONE, Stage.BLOCKED}),
     Stage.DONE: frozenset(),
     Stage.BLOCKED: frozenset(),
+    Stage.EPIC: frozenset({Stage.TRACKING, Stage.BLOCKED}),
+    Stage.TRACKING: frozenset({Stage.DONE, Stage.QA, Stage.BLOCKED}),
+    Stage.PROPOSED: frozenset(),
 }
 
 
@@ -98,6 +120,75 @@ class StageSignals:
     """Ein ``ReleaseTagged`` liegt vor — forge hat Tag + Release erzeugt
     (Advance-Signal release→done; opt-in ``capabilities.create_release``)."""
 
+    changes_requested: bool = False
+    """L1: das jüngste ``PRReviewed`` des offenen PRs ist ``request_changes``
+    UND noch aktuell (kein Commit seit dem Review). Schickt das Item von ``qa``
+    zurück nach ``in-dev`` und hält es dort, bis ein Nacharbeits-Run gepusht
+    hat (dann ist der Review veraltet → ``in-dev → qa`` → frisches Review)."""
+
+    rework_rounds: int = 0
+    """L1: Anzahl ``request_changes``-Reviews über alle PRs des Items. Über
+    ``MAX_REWORK_ROUNDS`` eskaliert der Conductor nach ``blocked``."""
+
+    rework_started: bool = False
+    """L1: seit dem jüngsten Review wurde bereits ein Nacharbeits-Run gestartet
+    (in-flight oder fertig) → nicht erneut dispatchen."""
+
+    rework_failed: bool = False
+    """L1: ein Nacharbeits-Run seit dem jüngsten Review endete ohne Ergebnis
+    (nichts gepusht) → eskalieren statt endlos neu zu versuchen."""
+
+    ci_status: str | None = None
+    """L2: CI-Status des offenen PRs (pass|fail|pending|none|unknown), von der
+    Wiring-Schicht über den Code-Host injiziert (steht nicht im Event-Strom).
+    ``None`` = unbekannt → altes Verhalten (kein CI-Gate)."""
+
+    ci_fix_attempts: int = 0
+    """L2: Anzahl CI-Fix-Runs (``trigger=ci_failure``) für das Item."""
+
+    ci_fix_started: bool = False
+    """L2: für den aktuellen PR-Head läuft bereits ein CI-Fix-Run / ist fertig."""
+
+    ci_fix_failed: bool = False
+    """L2: ein CI-Fix-Run für den aktuellen Head endete ohne Ergebnis."""
+
+    spec_pending: bool = False
+    """A1: für das Item ist ein Spec-PR (Label ``forge:spec``) offen und noch
+    nicht gemergt → ``requirements`` wartet auf den Merge (menschliches Gate)."""
+
+    spec_rejected: bool = False
+    """A1: der Spec-PR wurde ungemergt geschlossen → eskalieren (ein Mensch
+    entscheidet, ob neu verdichtet werden soll), statt still zu warten."""
+
+    has_decomposition: bool = False
+    """A2: ein Epic wurde in Kind-Items zerlegt (``WorkItemCreated`` mit
+    ``parent`` = Epic, Quelle ``epic_decomposition``) → ``epic → tracking``."""
+
+    children_done: bool = False
+    """A2: alle Kinder des Epics stehen auf ``done`` → ``tracking → done``."""
+
+    epic_failed_runs: int = 0
+    """A2: Zerlegungs-Runs, die keine Items erzeugten (Eskalation statt
+    Endlos-Retry)."""
+
+    release_batched: bool = False
+    """L3: Release-Train aktiv → ``release`` wird nicht pro Item dispatcht,
+    sondern gesammelt vom Train ausgeliefert (``ReleaseTagged.issue_numbers``)."""
+
+    conflicting: bool = False
+    """G: der Code-Host meldet den offenen PR als ``CONFLICTING`` (Basis hat
+    sich nach einem Geschwister-Merge bewegt). Injiziert wie ``ci_status``."""
+
+    conflict_fix_started: bool = False
+    """G: für den aktuellen Head läuft/lief bereits ein Konflikt-Run."""
+
+    conflict_fix_failed: bool = False
+    """G: ein Konflikt-Run für den aktuellen Head endete ohne Ergebnis."""
+
+    @property
+    def ci_failed(self) -> bool:
+        return self.ci_status == "fail"
+
 
 # Stages, in denen ein Team *in-place* arbeitet und dabei seinen
 # Advance-Auslöser produziert (``design`` → architect-Team → ``PlanProposed`` →
@@ -122,7 +213,7 @@ class StageSignals:
 # zusätzlich ein Advance-Signal in ``advance`` + ``StageSignals`` und einen
 # Dispatch-Zweig in der board-loop-Wiring-Schicht.
 IN_PLACE_WORK_STAGES: frozenset[Stage] = frozenset(
-    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA, Stage.RELEASE}
+    {Stage.REQUIREMENTS, Stage.DESIGN, Stage.QA, Stage.RELEASE, Stage.EPIC}
 )
 
 
@@ -138,8 +229,12 @@ def stage_of(labels: list[str]) -> Stage | None:
         return None
     if Stage.BLOCKED.value in present:
         return Stage.BLOCKED
-    # Am weitesten fortgeschrittene Pipeline-Stage gewinnt.
+    # Am weitesten fortgeschrittene Pipeline-Stage gewinnt (ein Mensch, der
+    # ein proposed-Item freigibt, setzt einfach forge:requirements dazu).
     for stage in reversed(PIPELINE):
+        if stage.value in present:
+            return stage
+    for stage in (Stage.TRACKING, Stage.EPIC, Stage.PROPOSED):
         if stage.value in present:
             return stage
     return None
@@ -153,6 +248,14 @@ def can_transition(frm: Stage, to: Stage) -> bool:
     return to in ALLOWED_TRANSITIONS.get(frm, frozenset())
 
 
+# L1: so viele request_changes-Runden darf ein Item durchlaufen, bevor der
+# Conductor nach ``blocked`` eskaliert (Roadmap E3: erst Konstante).
+MAX_REWORK_ROUNDS: int = 2
+
+# L2: so viele CI-Fix-Runs pro Item, bevor der Conductor eskaliert.
+MAX_CI_FIX_ATTEMPTS: int = 2
+
+
 def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     """Die nächste *automatische* Stage + Begründung, ohne Dependency-/
     Dispatch-Logik.
@@ -160,22 +263,54 @@ def advance(stage: Stage, signals: StageSignals) -> tuple[Stage, str]:
     Deckt nur die event-getriebenen Übergänge ab:
       - requirements → design   sobald die Akzeptanzkriterien verdichtet sind
       - design       → ready     sobald ein Plan vorliegt
-      - in-dev       → qa         sobald ein PR geöffnet wurde
+      - in-dev       → qa         sobald ein PR offen ist und kein aktuelles
+                                  ``request_changes`` mehr gilt
       - qa           → release    sobald der PR gemergt wurde
+      - qa           → in-dev     bei aktuellem ``request_changes`` (L1)
+      - qa           → blocked    nach mehr als ``MAX_REWORK_ROUNDS`` Runden
+      - qa           → in-dev     bei rotem CI (L2), ``blocked`` nach
+                                  ``MAX_CI_FIX_ATTEMPTS`` Fix-Runs
       - release      → done        sobald Tag + Release erzeugt sind
 
     ``ready → in-dev`` passiert beim DISPATCH (Conductor, mit Kapazität +
     Dependencies) — hier bewusst NICHT automatisch. Gibt ``(stage, "")``
     zurück, wenn kein Übergang fällig ist.
     """
-    if stage == Stage.REQUIREMENTS and signals.has_refined_spec:
+    if (
+        stage == Stage.REQUIREMENTS
+        and signals.has_refined_spec
+        and not signals.spec_pending
+    ):
         return Stage.DESIGN, "requirements_refined"
+    if stage == Stage.EPIC and signals.has_decomposition:
+        return Stage.TRACKING, "epic_decomposed"
+    if stage == Stage.TRACKING and signals.has_open_pr:
+        # G: Integrations-Branch-Epic — der Sammel-PR geht durch die normale QA.
+        return Stage.QA, "integration_pr"
+    if stage == Stage.TRACKING and signals.children_done:
+        return Stage.DONE, "children_done"
     if stage == Stage.DESIGN and signals.has_plan:
         return Stage.READY, "plan_proposed"
-    if stage == Stage.IN_DEV and signals.has_open_pr:
+    if (
+        stage == Stage.IN_DEV
+        and signals.has_open_pr
+        and not signals.changes_requested
+        and not signals.ci_failed
+        and not signals.conflicting
+    ):
         return Stage.QA, "pr_created"
     if stage == Stage.QA and signals.has_merged_pr:
         return Stage.RELEASE, "pr_merged"
+    if stage == Stage.QA and signals.changes_requested:
+        if signals.rework_rounds > MAX_REWORK_ROUNDS:
+            return Stage.BLOCKED, "rework_exhausted"
+        return Stage.IN_DEV, "review_changes_requested"
+    if stage == Stage.QA and signals.conflicting:
+        return Stage.IN_DEV, "merge_conflict"
+    if stage == Stage.QA and signals.ci_failed:
+        if signals.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS:
+            return Stage.BLOCKED, "ci_fix_exhausted"
+        return Stage.IN_DEV, "ci_failed"
     if stage == Stage.RELEASE and signals.release_done:
         return Stage.DONE, "released"
     return stage, ""

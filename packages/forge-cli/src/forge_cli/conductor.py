@@ -18,8 +18,14 @@ from datetime import UTC, datetime
 
 from forge_core.events import EventKind
 
-from forge_cli.dependencies import find_cycle, unmet_dependencies
-from forge_cli.stages import IN_PLACE_WORK_STAGES, Stage, StageSignals, advance
+from forge_cli.dependencies import find_cycle, touches_overlap, unmet_dependencies
+from forge_cli.stages import (
+    IN_PLACE_WORK_STAGES,
+    MAX_CI_FIX_ATTEMPTS,
+    Stage,
+    StageSignals,
+    advance,
+)
 
 # Beschränkter Re-Dispatch eines in-dev-Items, dessen Run keinen PR produzierte,
 # bevor der Conductor nach ``blocked`` eskaliert (A1). Bewusst eine
@@ -27,6 +33,36 @@ from forge_cli.stages import IN_PLACE_WORK_STAGES, Stage, StageSignals, advance
 # harte Ressourcen-Grenze sind Cost-Caps + max_turns auf der Loop-1-Seite). Wird
 # das konfigurierbar, wandert es als optionales Feld in die Conductor-Config.
 MAX_DEV_RETRIES: int = 2
+
+# A1: Label, das einen Spec-PR (docs/specs/…) von einem Code-PR unterscheidet.
+SPEC_PR_LABEL = "forge:spec"
+
+# A2: so viele Zerlegungs-Runs ohne erzeugte Items, bevor ein Epic eskaliert.
+MAX_EPIC_RUNS: int = 2
+
+# So viele gescheiterte Review-Versuche (Agent-Timeout/-Fehler) in Folge, bevor
+# das fail-closed ``request_changes`` wie ein echtes Urteil zählt.
+MAX_REVIEW_ATTEMPTS: int = 2
+
+
+def effective_reviews(reviews: list) -> list:
+    """``PRReviewed``-Events ohne gescheiterte Review-Versuche.
+
+    Scheitert der Review-Agent (Timeout, ``CodingAgentError``), ist sein
+    ``request_changes`` fail-closed, aber kein Befund über den Code
+    (``success=False`` im Envelope). Solche Versuche zählen nicht: das Item
+    bleibt in ``qa`` und wird erneut gereviewt, statt eine Nacharbeit ohne
+    Befund zu starten. Erst ``MAX_REVIEW_ATTEMPTS`` Fehlschläge in Folge (nach
+    dem letzten echten Review) zählen wie ein Urteil — sonst reviewt der
+    Conductor bei dauerhaft kaputtem Agent jeden Tick neu."""
+    ordered = sorted(reviews, key=lambda e: e.ts)
+    trailing: list = []
+    for e in reversed(ordered):
+        if getattr(e, "success", None) is not False:
+            break
+        trailing.insert(0, e)
+    kept = [e for e in ordered if getattr(e, "success", None) is not False]
+    return kept + (trailing if len(trailing) >= MAX_REVIEW_ATTEMPTS else [])
 
 # Decisions eines Dev-Runs, die als "kein PR, fehlgeschlagen" zählen. NICHT
 # enthalten: ``pr_created`` (Erfolg) und ``rate_limited`` (gehört dem
@@ -51,6 +87,9 @@ class WorkItem:
     stage: Stage
     depends_on: tuple[int, ...] = ()
     signals: StageSignals = field(default_factory=StageSignals)
+    touches: tuple[str, ...] = ()
+    """G: erwartete Dateien (``Touches:``-Globs). Leer = unbekannt → das Item
+    läuft nie parallel zu einem anderen Code-Run (E14)."""
 
 
 @dataclass(frozen=True)
@@ -81,6 +120,10 @@ class DispatchOrder:
 
     number: int
     stage: Stage
+    kind: str = "run"
+    """Run-Art innerhalb der Stage: ``run`` (regulärer Stage-Run), ``rework``
+    (Nacharbeit nach ``request_changes`` auf dem PR-Branch, L1) oder
+    ``ci_fix`` (roten CI auf dem PR-Branch reparieren, L2)."""
 
 
 @dataclass(frozen=True)
@@ -125,6 +168,10 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
         if nxt != w.stage:
             transitions.append(StageTransition(w.number, w.stage, nxt, reason))
             effective[w.number] = nxt
+            if nxt == Stage.BLOCKED:
+                # Eskalation aus advance (z.B. rework_exhausted): als
+                # WorkItemBlocked sichtbar machen, nicht nur als Label.
+                blocked.append(Blocked(w.number, reason, (), reason))
 
     # 2. CYCLES --------------------------------------------------------
     graph = {w.number: [d for d in w.depends_on] for w in items}
@@ -151,7 +198,111 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
             # gemergter) PR wird nicht jeden Tick erneut reviewt.
             if w.stage == Stage.QA and w.signals.review_done:
                 continue
+            # L3: Train sammelt release-Items selbst ein.
+            if w.stage == Stage.RELEASE and w.signals.release_batched:
+                continue
+            # A1: Spec-PR ungemergt geschlossen → sichtbar eskalieren.
+            if w.stage == Stage.REQUIREMENTS and w.signals.spec_rejected:
+                blocked.append(Blocked(w.number, "error", (), "spec PR closed without merge"))
+                transitions.append(
+                    StageTransition(w.number, Stage.REQUIREMENTS, Stage.BLOCKED, "spec_rejected")
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            # A1: Spec ist verdichtet, wartet nur noch auf den Spec-PR-Merge
+            # → kein erneuter requirements-Run.
+            if w.stage == Stage.REQUIREMENTS and w.signals.has_refined_spec:
+                continue
+            # A2: Zerlegung schlug wiederholt fehl → eskalieren statt Retry.
+            if w.stage == Stage.EPIC and w.signals.epic_failed_runs >= MAX_EPIC_RUNS:
+                blocked.append(
+                    Blocked(w.number, "error", (), "epic decomposition produced no items")
+                )
+                transitions.append(
+                    StageTransition(w.number, Stage.EPIC, Stage.BLOCKED, "epic_no_items")
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            # L2: kein (teures) Review, solange CI noch läuft oder rot ist —
+            # rot geht über advance in den CI-Fix-Pfad.
+            if w.stage == Stage.QA and w.signals.ci_status in ("pending", "fail"):
+                continue
             target = w.stage
+        elif (
+            w.stage == Stage.IN_DEV
+            and eff == Stage.IN_DEV
+            and w.signals.has_open_pr
+            and w.signals.conflicting
+        ):
+            # G: PR-Branch nach einem Geschwister-Merge nachziehen (erst
+            # deterministischer Merge der Basis, nur bei echten Konflikten ein
+            # Agent-Run). Scheitert der Konflikt-Run → eskalieren.
+            if w.signals.conflict_fix_failed:
+                blocked.append(
+                    Blocked(w.number, "merge_conflict", (), "merge conflict not resolvable")
+                )
+                transitions.append(
+                    StageTransition(w.number, Stage.IN_DEV, Stage.BLOCKED, "merge_conflict")
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            if w.signals.conflict_fix_started:
+                continue
+            candidates.append(DispatchOrder(w.number, Stage.IN_DEV, "sync"))
+            continue
+        elif (
+            w.stage == Stage.IN_DEV
+            and eff == Stage.IN_DEV
+            and w.signals.has_open_pr
+            and w.signals.changes_requested
+        ):
+            # L1: Nacharbeit auf dem bestehenden PR-Branch. Höchstens ein
+            # Nacharbeits-Run pro Review; scheitert er (nichts gepusht), wird
+            # eskaliert statt endlos neu zu versuchen.
+            if w.signals.rework_failed:
+                blocked.append(
+                    Blocked(
+                        w.number,
+                        "rework_no_change",
+                        (),
+                        "rework run produced no change for the requested review",
+                    )
+                )
+                transitions.append(
+                    StageTransition(
+                        w.number, Stage.IN_DEV, Stage.BLOCKED, "rework_no_change"
+                    )
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            if w.signals.rework_started:
+                continue  # läuft schon / wartet auf den Push
+            candidates.append(DispatchOrder(w.number, Stage.IN_DEV, "rework"))
+            continue
+        elif (
+            w.stage == Stage.IN_DEV
+            and eff == Stage.IN_DEV
+            and w.signals.has_open_pr
+            and w.signals.ci_failed
+        ):
+            # L2: roten CI auf dem PR-Branch reparieren (gleiches Primitiv wie
+            # L1). Ein Fix-Run pro Head; scheitert er, eskalieren.
+            if w.signals.ci_fix_failed or (
+                w.signals.ci_fix_attempts >= MAX_CI_FIX_ATTEMPTS
+                and not w.signals.ci_fix_started
+            ):
+                blocked.append(
+                    Blocked(w.number, "ci_fix_exhausted", (), "CI stays red after fix runs")
+                )
+                transitions.append(
+                    StageTransition(w.number, Stage.IN_DEV, Stage.BLOCKED, "ci_fix_exhausted")
+                )
+                effective[w.number] = Stage.BLOCKED
+                continue
+            if w.signals.ci_fix_started:
+                continue
+            candidates.append(DispatchOrder(w.number, Stage.IN_DEV, "ci_fix"))
+            continue
         elif w.stage == Stage.IN_DEV and w.signals.dev_failed_no_pr:
             # Dev-Run produzierte keinen PR. Beschränkter Re-Dispatch (A1):
             # bis MAX_DEV_RETRIES erneut dispatchen, danach nach blocked
@@ -200,17 +351,117 @@ def plan_tick(items: list[WorkItem], *, capacity: int) -> TickPlan:
 
     # 4. DISPATCH (gemeinsame Kapazität über alle Teams) ---------------
     by_num = {w.number: w for w in items}
-    selected = candidates[: max(0, capacity)]
+    selected = _select_with_file_conflicts(
+        candidates, by_num=by_num, effective=effective, capacity=capacity, blocked=blocked
+    )
     for order in selected:
         # Der ready→in-dev-Übergang gehört NUR zum Erst-Dispatch aus der
         # Warteschlange — NICHT zum A1-Re-Dispatch eines Items, das bereits auf
         # in-dev steht (sonst ein illegaler ready→in-dev-Übergang).
-        if order.stage == Stage.IN_DEV and by_num[order.number].stage == Stage.READY:
+        if (
+            order.kind == "run"
+            and order.stage == Stage.IN_DEV
+            and by_num[order.number].stage == Stage.READY
+        ):
             transitions.append(
                 StageTransition(order.number, Stage.READY, Stage.IN_DEV, "dispatched")
             )
 
     return TickPlan(transitions=transitions, dispatch=selected, blocked=blocked)
+
+
+def _is_code_run(order: DispatchOrder, item: WorkItem) -> bool:
+    """Neuer Code-Run auf ``main``-Basis (ready → in-dev). Rework/CI-Fix/Sync
+    arbeiten auf dem eigenen PR-Branch, design/requirements/epic/qa/release
+    ändern keinen Code — sie konkurrieren nicht um Dateien."""
+    return order.kind == "run" and order.stage == Stage.IN_DEV and item.stage in (
+        Stage.READY,
+        Stage.IN_DEV,  # A1-Retry: neuer Dev-Run auf main-Basis
+    )
+
+
+def _select_with_file_conflicts(
+    candidates: list[DispatchOrder],
+    *,
+    by_num: dict[int, WorkItem],
+    effective: dict[int, Stage],
+    capacity: int,
+    blocked: list[Blocked],
+) -> list[DispatchOrder]:
+    """G: Kapazität + Konfliktkanten aus ``Touches:``.
+
+    * Ein neuer Code-Run, dessen ``touches`` mit einem Item im Flug (in-dev/qa,
+      PR noch nicht gemergt) oder einem in diesem Tick schon gewählten Code-Run
+      überlappt, wartet (``WorkItemBlocked`` kind ``file_conflict``) — sonst
+      kollidieren die PRs beim Merge.
+    * Ein Code-Run OHNE ``touches`` läuft allein: nur, wenn in diesem Tick noch
+      kein anderer Code-Run gewählt ist, und danach kommt keiner mehr dazu.
+      Gegenüber bereits offenen PRs ohne ``touches`` greift bewusst keine Kante
+      (sonst wäre jede Fabrik ohne Touches-Angaben strikt seriell) — dort fängt
+      das Nachziehen nach dem Merge (``sync``) Konflikte ab.
+    Deterministisch nach Nummer; implizite Kanten werden pro Tick neu
+    berechnet, nicht gespeichert."""
+    in_flight = [
+        w for n, w in by_num.items()
+        if effective.get(n) in (Stage.IN_DEV, Stage.QA) and w.stage in (Stage.IN_DEV, Stage.QA)
+    ]
+    selected: list[DispatchOrder] = []
+    chosen_code: list[WorkItem] = []
+    exclusive = False
+    for order in candidates:
+        if len(selected) >= max(0, capacity):
+            break
+        item = by_num[order.number]
+        if not _is_code_run(order, item):
+            selected.append(order)
+            continue
+        if exclusive:
+            continue
+        if item.touches:
+            clash = [
+                o.number for o in [*in_flight, *chosen_code]
+                if o.number != item.number and o.touches and touches_overlap(item.touches, o.touches)
+            ]
+            if clash:
+                blocked.append(
+                    Blocked(
+                        item.number, "file_conflict", tuple(sorted(clash)),
+                        "touches overlap with " + ", ".join(f"#{c}" for c in sorted(clash)),
+                    )
+                )
+                continue
+        elif chosen_code:
+            continue  # unbekannte Dateien → nicht neben einem anderen Code-Run
+        else:
+            exclusive = True
+        selected.append(order)
+        chosen_code.append(item)
+    return selected
+
+
+def effective_capacity(
+    max_parallel: int,
+    *,
+    daily_cap_usd: float,
+    spent_today_usd: float,
+    avg_run_cost_usd: float | None,
+    disk_free_bytes: int | None = None,
+    min_disk_bytes: int = 2 * 1024**3,
+) -> int:
+    """G: „parallel, wenn nötig" — Kapazität aus Budget und Ressourcen.
+
+    ``min(max_parallel, Budget-Rest / ⌀Kosten pro Run)``; ohne Kosten-Historie
+    zählt nur ``max_parallel``. Kein Budget mehr → 0 (Übergänge laufen weiter,
+    nur keine neuen Runs). Wenig Plattenplatz → höchstens ein Worktree."""
+    cap = max(0, max_parallel)
+    remaining = daily_cap_usd - spent_today_usd
+    if remaining <= 0:
+        return 0
+    if avg_run_cost_usd and avg_run_cost_usd > 0:
+        cap = min(cap, max(1, int(remaining // avg_run_cost_usd)))
+    if disk_free_bytes is not None and disk_free_bytes < min_disk_bytes:
+        cap = min(cap, 1)
+    return cap
 
 
 @dataclass(frozen=True)
@@ -265,6 +516,8 @@ def derive_signals(
     issue_number: int,
     *,
     head_committed_at: datetime | None = None,
+    ci_status: str | None = None,
+    mergeable: str | None = None,
 ) -> StageSignals:
     """Leitet die Stage-Signale eines Work-Items aus dem Event-Strom ab.
 
@@ -310,25 +563,36 @@ def derive_signals(
         and not (e.payload or {}).get("insufficient_context", False)
         for e in events
     )
-    pr_numbers = {
+    created = [
+        e for e in events if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+    ]
+    # A1: Spec-PRs (Label forge:spec) sind keine Code-PRs — sie gaten nur
+    # requirements → design und dürfen in-dev/qa/release nie auslösen.
+    spec_prs = {
         (e.payload or {}).get("pr_number")
-        for e in events
-        if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+        for e in created
+        if SPEC_PR_LABEL in ((e.payload or {}).get("labels") or [])
     }
+    pr_numbers = {(e.payload or {}).get("pr_number") for e in created} - spec_prs
     pr_numbers.discard(None)
+    spec_prs.discard(None)
+    merged_numbers = {
+        (e.payload or {}).get("pr_number") for e in events if e.kind == EventKind.PR_MERGED
+    }
+    spec_pending = bool(spec_prs) and not spec_prs <= merged_numbers
     has_open_pr = bool(pr_numbers)
     has_merged_pr = any(
         e.kind == EventKind.PR_MERGED
         and (e.payload or {}).get("pr_number") in pr_numbers
         for e in events
     )
-    review_tss = [
-        e.ts
+    reviews = effective_reviews([
+        e
         for e in events
         if e.kind == EventKind.PR_REVIEWED
         and (e.payload or {}).get("pr_number") in pr_numbers
-    ]
-    latest_review_ts = max(review_tss) if review_tss else None
+    ])
+    latest_review_ts = reviews[-1].ts if reviews else None
     # Veraltet, sobald ein Commit NACH dem jüngsten Review landete. ``<=`` →
     # ein Commit exakt zur Review-Zeit gilt als "nicht neuer" (bias zu weniger
     # teuren Re-Reviews). Ohne Board-Datum: altes Verhalten (Review existiert).
@@ -337,12 +601,103 @@ def derive_signals(
     )
     # ReleaseTagged ist ein deterministischer forge-Effekt ohne RunStarted →
     # direkt über issue_number korrelieren (nicht über run_id wie der Rest).
+    # 1.1: ein Train-Release liefert mehrere Items aus (issue_numbers).
     release_done = any(
         e.kind == EventKind.RELEASE_TAGGED
-        and (e.payload or {}).get("issue_number") == issue_number
+        and (
+            (e.payload or {}).get("issue_number") == issue_number
+            or issue_number in ((e.payload or {}).get("issue_numbers") or [])
+        )
         for e in events
     )
+    # L1: Nacharbeit. Ein request_changes gilt, solange kein Commit danach kam
+    # (gleiche Veraltungs-Regel wie review_done). Gemergte PRs sind erledigt.
+    latest_verdict = (reviews[-1].payload or {}).get("verdict") if reviews else None
+    review_stale = (
+        latest_review_ts is not None
+        and head_committed_at is not None
+        and head_committed_at > latest_review_ts
+    )
+    changes_requested = (
+        latest_verdict == "request_changes" and not review_stale and not has_merged_pr
+    )
+    rework_rounds = sum(
+        1 for e in reviews if (e.payload or {}).get("verdict") == "request_changes"
+    )
+    rework_started = False
+    rework_failed = False
+    if latest_review_ts is not None:
+        rework_runs = {
+            e.run_id
+            for e in events
+            if e.kind == EventKind.RUN_STARTED
+            and e.run_id in run_ids
+            and (e.payload or {}).get("trigger") == "rework"
+            and not str((e.payload or {}).get("focus") or "").startswith("conflict:")
+            and e.ts > latest_review_ts
+        }
+        rework_started = bool(rework_runs)
+        rework_failed = any(
+            e.kind == EventKind.RUN_FINISHED
+            and e.run_id in rework_runs
+            and (e.payload or {}).get("decision") in _DEV_NO_PR_FAILURES
+            for e in events
+        )
+    # L2: CI-Fix-Runs. "Für den aktuellen Head gestartet" = Run-Start nach dem
+    # Head-Commit (ein erfolgreicher Fix pusht einen neueren Head). Ohne
+    # Head-Datum: nur ein laufender/fehlgeschlagener jüngster Fix zählt.
+    ci_runs = [
+        e
+        for e in events
+        if e.kind == EventKind.RUN_STARTED
+        and e.run_id in run_ids
+        and (e.payload or {}).get("trigger") == "ci_failure"
+    ]
+    ci_fix_started, ci_fix_failed = _branch_run_state(events, ci_runs, head_committed_at)
+    conflict_runs = [
+        e
+        for e in events
+        if e.kind == EventKind.RUN_STARTED
+        and e.run_id in run_ids
+        and str((e.payload or {}).get("focus") or "").startswith("conflict:")
+    ]
+    conflict_started, conflict_failed = _branch_run_state(
+        events, conflict_runs, head_committed_at
+    )
+    # A2: Epic-Zerlegung (Kinder tragen parent = Epic im WorkItemCreated).
+    has_decomposition = any(
+        e.kind == EventKind.WORK_ITEM_CREATED
+        and (e.payload or {}).get("parent") == issue_number
+        and (e.payload or {}).get("source") == "epic_decomposition"
+        for e in events
+    )
+    epic_runs = {
+        e.run_id
+        for e in events
+        if e.kind == EventKind.RUN_STARTED
+        and e.run_id in run_ids
+        and str((e.payload or {}).get("focus") or "").startswith("epic:")
+    }
+    epic_failed_runs = (
+        0
+        if has_decomposition
+        else sum(1 for e in events if e.kind == EventKind.RUN_FINISHED and e.run_id in epic_runs)
+    )
     return StageSignals(
+        conflicting=mergeable == "CONFLICTING" and not has_merged_pr,
+        conflict_fix_started=conflict_started,
+        conflict_fix_failed=conflict_failed,
+        spec_pending=spec_pending,
+        has_decomposition=has_decomposition,
+        epic_failed_runs=epic_failed_runs,
+        ci_status=ci_status,
+        ci_fix_attempts=len(ci_runs),
+        ci_fix_started=ci_fix_started,
+        ci_fix_failed=ci_fix_failed,
+        changes_requested=changes_requested,
+        rework_rounds=rework_rounds,
+        rework_started=rework_started,
+        rework_failed=rework_failed,
         has_refined_spec=has_refined_spec,
         has_plan=has_plan,
         has_open_pr=has_open_pr,
@@ -350,6 +705,63 @@ def derive_signals(
         review_done=review_done,
         release_done=release_done,
     )
+
+
+def _branch_run_state(events: list, runs: list, head_committed_at) -> tuple[bool, bool]:
+    """(started, failed) der Runs auf einem PR-Branch für den AKTUELLEN Head.
+
+    "Für den aktuellen Head" = Run-Start nach dem Head-Commit (ein erfolgreicher
+    Run pusht einen neueren Head). Ohne Head-Datum zählt nur der jüngste Run,
+    und nur wenn er läuft oder fehlschlug (sonst Retry bis zur Obergrenze)."""
+    if not runs:
+        return False, False
+    runs = sorted(runs, key=lambda e: e.ts)
+    if head_committed_at is None:
+        current = runs[-1:]
+    else:
+        current = [e for e in runs if e.ts > head_committed_at]
+    current_ids = {e.run_id for e in current}
+    finished = {
+        e.run_id: (e.payload or {}).get("decision")
+        for e in events
+        if e.kind == EventKind.RUN_FINISHED and e.run_id in current_ids
+    }
+    failed = any(d in _DEV_NO_PR_FAILURES for d in finished.values())
+    in_flight = any(rid not in finished for rid in current_ids)
+    started = bool(current) and (head_committed_at is not None or in_flight or failed)
+    return started, failed
+
+
+def epic_children(events: list, epic_number: int) -> list[int]:
+    """Kind-Items eines Epics (aus ``WorkItemCreated.parent``), sortiert."""
+    return sorted(
+        {
+            int((e.payload or {}).get("number"))
+            for e in events
+            if e.kind == EventKind.WORK_ITEM_CREATED
+            and (e.payload or {}).get("parent") == epic_number
+        }
+    )
+
+
+def spec_pr_for_issue(events: list, issue_number: int) -> int | None:
+    """Offener (nicht gemergter) Spec-PR eines Items, oder ``None`` (A1)."""
+    run_ids = {
+        e.run_id
+        for e in events
+        if e.kind == EventKind.RUN_STARTED
+        and (e.payload or {}).get("issue_number") == issue_number
+    }
+    merged = {(e.payload or {}).get("pr_number") for e in events if e.kind == EventKind.PR_MERGED}
+    specs = [
+        (e.payload or {}).get("pr_number")
+        for e in events
+        if e.kind == EventKind.PR_CREATED
+        and e.run_id in run_ids
+        and SPEC_PR_LABEL in ((e.payload or {}).get("labels") or [])
+        and (e.payload or {}).get("pr_number") not in merged
+    ]
+    return max(specs) if specs else None
 
 
 def pr_number_for_issue(events: list, issue_number: int) -> int | None:
@@ -371,7 +783,9 @@ def pr_number_for_issue(events: list, issue_number: int) -> int | None:
     pr_numbers = {
         (e.payload or {}).get("pr_number")
         for e in events
-        if e.kind == EventKind.PR_CREATED and e.run_id in run_ids
+        if e.kind == EventKind.PR_CREATED
+        and e.run_id in run_ids
+        and SPEC_PR_LABEL not in ((e.payload or {}).get("labels") or [])
     }
     pr_numbers.discard(None)
     merged = {
@@ -396,7 +810,7 @@ def _is_dev_run_started(payload: dict) -> bool:
     focus = payload.get("focus") or ""
     return not any(
         focus.startswith(prefix)
-        for prefix in ("design:", "requirements:", "review:")
+        for prefix in ("design:", "requirements:", "review:", "rework:", "ci-fix:", "epic:")
     )
 
 

@@ -175,3 +175,12 @@ def test_run_raw_no_parsing(tmp_path: Path) -> None:
     assert result.success is True
     assert result.measurements == {}
     assert "hello" in result.stdout
+
+
+def test_parse_pytest_output_ignores_ansi_colors() -> None:
+    """FORCE_COLOR beim Operator darf die Summary nicht unlesbar machen."""
+    from forge_execute.evaluators.command import parse_pytest_output
+
+    colored = "\x1b[31m\x1b[1m1 failed\x1b[0m, \x1b[32m3 passed\x1b[0m\x1b[31m in 0.12s\x1b[0m"
+    out = parse_pytest_output(colored, exit_code=1)
+    assert out["pytest_pass_rate"] == 0.75

@@ -33,6 +33,7 @@ from forge_execute.agents.base import (
     CodingAgentError,
     CodingAgentTimeout,
 )
+from forge_execute.agents.templates import WORKITEMS_FORMAT_HINT
 
 PRReviewVerdict = Literal["approve", "request_changes"]
 
@@ -241,6 +242,14 @@ def _build_context(
         )
 
     out = "\n\n".join(trusted)
+    out += (
+        "\n\nOptional: Findest du NICHT-blockierende Folgeaufgaben (außerhalb "
+        "dieses PRs sinnvoll, z.B. Tech-Debt, fehlende Tests woanders), hänge sie "
+        "am Ende deiner Begründung als YAML-Liste an:\n"
+        f"{WORKITEMS_FORMAT_HINT}\n"
+        "Nur echte Funde; sonst weglassen. Blockierende Mängel gehören ins "
+        "Verdikt, nicht in diesen Block."
+    )
     if untrusted:
         out += (
             "\n\n===== UNTRUSTED USER CONTENT (PR-/Issue-Text) =====\n"

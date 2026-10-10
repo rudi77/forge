@@ -97,6 +97,26 @@ class WorktreeManager:
 
         return Worktree(path=path, branch=branch, base_commit=base_commit)
 
+    def fetch_remote_branch(self, branch: str, *, remote: str = "origin") -> str:
+        """Holt ``<remote>/<branch>`` und liefert den Remote-Tracking-Ref.
+
+        Basis für Nacharbeits-/CI-Fix-Runs auf einem bestehenden PR-Branch
+        (Conductor L1/L2): der Run startet mit ``base_ref`` = diesem Ref auf
+        einem frischen ``forge/<run_id>``-Branch; der Caller pusht das Ergebnis
+        fast-forward auf ``branch`` zurück. Nur der lokale Tracking-Ref wird
+        aktualisiert — kein Push, kein Eingriff in den Remote.
+        """
+        ref = f"refs/remotes/{remote}/{branch}"
+        result = self._run(
+            ["git", "fetch", remote, f"+refs/heads/{branch}:{ref}"],
+            cwd=self.repo_root,
+        )
+        if result.returncode != 0:
+            raise GitError(
+                f"git fetch {remote} {branch} failed: {result.stderr.strip()}"
+            )
+        return ref
+
     def attach(self, *, run_id: str) -> Worktree:
         """Hängt sich an einen BESTEHENDEN Worktree (Resume nach Usage-Limit).
 
@@ -443,7 +463,7 @@ class WorktreeManager:
             if staged.returncode == 0:  # exit 0 = nichts gestaged
                 return self._rev_parse("HEAD", cwd=worktree.path)
 
-        cmd = ["git", "commit", "-m", message]
+        cmd = ["git", *self._identity_args(worktree.path), "commit", "-m", message]
         if allow_empty:
             cmd.append("--allow-empty")
         result = self._run(cmd, cwd=worktree.path)
@@ -451,6 +471,21 @@ class WorktreeManager:
             raise GitError(f"git commit failed: {result.stderr.strip()}")
 
         return self._rev_parse("HEAD", cwd=worktree.path)
+
+    def _identity_args(self, cwd: Path) -> list[str]:
+        """Fallback-Identität, wenn git keine hat (frische Maschine, CI-Runner).
+
+        Ohne ``user.name``/``user.email`` scheitert jeder Commit mit „Author
+        identity unknown". Eine konfigurierte Identität des Operators gewinnt
+        immer — nur wenn keine existiert, committet forge als ``forge``."""
+        name = self._run(["git", "config", "user.name"], cwd=cwd).stdout.strip()
+        email = self._run(["git", "config", "user.email"], cwd=cwd).stdout.strip()
+        args: list[str] = []
+        if not name:
+            args += ["-c", "user.name=forge"]
+        if not email:
+            args += ["-c", "user.email=forge@localhost"]
+        return args
 
     # --- Inspection ----------------------------------------------------
 

@@ -1,0 +1,79 @@
+# forge — Conductor-Heartbeat als Azure Pipeline.
+#
+# Läuft geplant, fährt N Conductor-Ticks (Stage-State-Machine über die
+# forge:<stage>-Tags der Work Items) und beendet sich sauber. Der Event-Store
+# (.forge/events.duckdb) wird als Pipeline-Artefakt zwischen Läufen
+# weitergereicht, damit die Fabrik ihr Gedächtnis behält.
+#
+# Setup: Variable Group "forge" mit ANTHROPIC_API_KEY (secret) anlegen; der
+# Build-Service braucht "Contribute" + "Create branch" + "Contribute to pull
+# requests" auf dem Repo und "Edit work items" auf dem Projekt.
+name: forge-conductor-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+schedules:
+  - cron: "*/30 * * * *"
+    displayName: forge conductor heartbeat
+    branches:
+      include: [main]
+    always: true
+
+variables:
+  - group: forge
+  - name: FORGE_TICKS
+    value: "6"
+  - name: FORGE_INTERVAL
+    value: "240"
+
+jobs:
+  - job: conductor
+    timeoutInMinutes: 50
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: true
+
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: "3.12"
+
+      - task: DownloadPipelineArtifact@2
+        displayName: restore forge event store
+        continueOnError: true
+        inputs:
+          source: specific
+          project: $(System.TeamProjectId)
+          pipeline: $(System.DefinitionId)
+          runVersion: latestFromBranch
+          runBranch: refs/heads/main
+          artifact: forge-events
+          path: .forge
+
+      - script: |
+          pip install uv
+          uv tool install forge-cli
+          npm install -g @anthropic-ai/claude-code
+          az extension add --name azure-devops --upgrade -y
+        displayName: install forge + claude + az devops
+
+      - script: |
+          git config user.email "forge@$(System.TeamProject)"
+          git config user.name "forge"
+          forge doctor --board --fix
+          forge board-loop --watch --conductor \
+            --interval "$(FORGE_INTERVAL)" --max-ticks "$(FORGE_TICKS)"
+        displayName: forge conductor
+        env:
+          ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+          AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+      - task: PublishPipelineArtifact@1
+        displayName: persist forge event store
+        condition: always()
+        inputs:
+          targetPath: .forge/events.duckdb
+          artifact: forge-events

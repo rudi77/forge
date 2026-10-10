@@ -141,6 +141,11 @@ class CapabilitiesConfig(BaseModel):
     + GitHub-Release zu erzeugen (``gh release create``). Default ``false``.
     Erlaubt KEIN push-to-main/force (die bleiben kategorisch deny) — ein
     Release schreibt einen neuen Ref, fasst weder main-History noch force an."""
+    create_work_items: bool = False
+    """Opt-in (Roadmap A): forge darf selbst Work-Items anlegen (Epic-Kinder,
+    Funde aus Runs, Bugs bei rotem ``main``-CI, Schedule-Epics). Zusätzlich
+    durch ``intake``-Obergrenzen und die Freigabe-Stage ``forge:proposed``
+    begrenzt."""
     push_to_main: Literal[False] = False
     push_force: Literal[False] = False
 
@@ -303,10 +308,69 @@ class ReleaseConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conventional_commits: bool = True
+    """SemVer-Bump aus Conventional Commits (feat → minor, fix/perf → patch,
+    ``!``/``BREAKING CHANGE`` → major). ``false`` → jedes Release ist ein Patch."""
     on_main_green: Literal["auto_tag", "off"] = "off"
     """Tagging ist OK (kein Code-Change). Merge ist es nicht."""
 
     changelog: NonEmptyStr | None = None
+    """Changelog-Datei, die der Release-PR fortschreibt (Train-Modus). Default
+    ``CHANGELOG.md``."""
+
+    mode: Literal["per_issue", "train"] = "per_issue"
+    """Roadmap L3. ``per_issue`` (Default, bisheriges Verhalten): ein Tag
+    ``forge-issue-<N>`` pro Item. ``train``: Items sammeln sich in
+    ``forge:release``; ein Release-PR (Changelog + Version) geht durch die
+    normale Review-/Merge-Absicherung, danach Tag ``<tag_prefix>X.Y.Z`` für
+    alle enthaltenen Items. Nie ein direkter Push auf ``main``."""
+
+    schedule: NonEmptyStr | None = None
+    """Train: Cron, wann ein Release vorbereitet wird. ``None`` = sobald
+    ``min_items`` Items warten."""
+
+    min_items: int = Field(default=1, gt=0)
+    """Train: so viele Items müssen in ``forge:release`` warten."""
+
+    version_files: list[NonEmptyStr] = Field(default_factory=list)
+    """Train: Dateien, deren Version der Release-PR anhebt
+    (``pyproject.toml``, ``package.json``, ``VERSION``)."""
+
+    tag_prefix: str = "v"
+
+
+IntakeKind = Literal["epic", "feature", "story", "bug", "task", "spec"]
+
+
+class IntakeConfig(BaseModel):
+    """Wie forge Arbeit erzeugt und Specs veröffentlicht (Roadmap A).
+
+    Eine Fabrik, die ihre eigene Arbeit erzeugt, ist die teuerste mögliche
+    Endlosschleife — daher harte Obergrenzen und per Default ein menschliches
+    Gate (``forge:proposed``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_items_per_epic: int = Field(default=8, gt=0)
+    """Höchstens so viele Items pro Zerlegung/Fund-Block."""
+
+    max_items_per_day: int = Field(default=20, gt=0)
+    """Höchstens so viele von forge angelegte Items in 24 h (alle Quellen)."""
+
+    auto_accept: list[IntakeKind] = Field(default_factory=list)
+    """Typen, die ohne Freigabe direkt in ``forge:requirements`` (bzw.
+    ``forge:epic``) starten. Leer = alles wartet in ``forge:proposed``. Kinder
+    eines vom Menschen freigegebenen Epics gelten immer als freigegeben."""
+
+    watch_main_ci: NonEmptyStr | None = None
+    """Branch, dessen CI der Conductor pro Tick prüft (z.B. ``main``). Rot →
+    ein Bug-Item (höchstens eins pro Tag). ``None`` = aus."""
+
+    spec_dir: NonEmptyStr = "docs/specs"
+    """Zielordner für Feature-Specs (Spec-PR)."""
+
+    spec_publish: Literal["auto", "pr", "comment", "off"] = "auto"
+    """``auto``: Features/Epics/Stories als Spec-PR, Bugs/Tasks als Kommentar.
+    ``pr``/``comment`` erzwingen eine Form, ``off`` veröffentlicht nicht."""
 
 
 class TriageConfig(BaseModel):
@@ -415,15 +479,17 @@ class BoardConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["github"] = "github"
-    """In v1 nur github. ``provider`` ist explizit, damit spätere GitLab-/
-    Linear-Adapter additiv werden statt breaking."""
+    provider: Literal["github", "azure_devops"] | None = None
+    """Anbieter des Boards. ``None`` (Default) = ``provider.tracker`` der Spec.
+    Explizit gesetzt muss er mit ``provider.tracker`` übereinstimmen."""
 
-    owner: NonEmptyStr
-    """GitHub user oder org, der das Project besitzt."""
+    owner: NonEmptyStr | None = None
+    """GitHub user oder org, der das Project besitzt (Pflicht bei GitHub)."""
 
-    project_number: int = Field(gt=0)
-    """Project (v2) Nummer — die ID aus ``gh project list``."""
+    project_number: int | None = Field(default=None, gt=0)
+    """Project (v2) Nummer — die ID aus ``gh project list`` (Pflicht bei
+    GitHub). Bei Azure DevOps ungenutzt: das Board ist das Azure-Projekt aus
+    ``provider.azure``, ``filter_status`` ist der Work-Item-State."""
 
     filter_status: NonEmptyStr = "Todo"
     """Status-Field-Wert, der als 'ready to dispatch' zählt. Case-sensitiv,
@@ -440,6 +506,81 @@ class BoardConfig(BaseModel):
     default_template_id: NonEmptyStr = "board_loop_v1"
     """``prompt_template_id`` für jeden vom board-loop dispatched Run.
     Macht in `forge analyze`-Reports board-loop-Runs unterscheidbar."""
+
+
+_DEFAULT_AZURE_WORK_ITEM_TYPES: dict[str, str] = {
+    "epic": "Epic",
+    "feature": "Feature",
+    "story": "User Story",
+    "bug": "Bug",
+    "task": "Task",
+    "spec": "Feature",
+}
+
+
+class AzureDevOpsConfig(BaseModel):
+    """Azure-DevOps-Ziel (Boards + Repos). Auth über ``AZURE_DEVOPS_EXT_PAT``
+    bzw. ``az login`` — nie in der Spec."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    organization: NonEmptyStr
+    """Org-URL (``https://dev.azure.com/<org>``) oder nur der Org-Name."""
+
+    project: NonEmptyStr
+    repository: NonEmptyStr | None = None
+    """Repo-Name in Azure Repos. Default: gleich dem Projektnamen."""
+
+    work_item_types: dict[NonEmptyStr, NonEmptyStr] = Field(
+        default_factory=lambda: dict(_DEFAULT_AZURE_WORK_ITEM_TYPES)
+    )
+    """forge-``WorkItemKind`` → Work-Item-Type des Prozess-Templates
+    (Agile/Scrum/CMMI haben unterschiedliche Typen)."""
+
+    closed_state: NonEmptyStr = "Closed"
+    """State, auf den ``close`` ein Work Item setzt (Scrum: ``Done``)."""
+
+    @property
+    def org_url(self) -> str:
+        org = self.organization.rstrip("/")
+        if org.startswith("http://") or org.startswith("https://"):
+            return org
+        return f"https://dev.azure.com/{org}"
+
+    @property
+    def repo_name(self) -> str:
+        return self.repository or self.project
+
+
+ProviderKind = Literal["github", "azure_devops"]
+
+
+class ProviderConfig(BaseModel):
+    """Welcher Anbieter für Work-Items (``tracker``) und PRs (``code_host``).
+
+    Getrennt, weil gemischte Setups üblich sind (Azure Boards + GitHub-Repos).
+    Default: alles GitHub — rückwärtskompatibel zu Specs ohne ``provider:``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tracker: ProviderKind = "github"
+    code_host: ProviderKind | None = None
+    """``None`` = derselbe Anbieter wie ``tracker``."""
+
+    azure: AzureDevOpsConfig | None = None
+
+    @property
+    def effective_code_host(self) -> ProviderKind:
+        return self.code_host or self.tracker
+
+    @model_validator(mode="after")
+    def _azure_block_required(self) -> ProviderConfig:
+        if "azure_devops" in (self.tracker, self.effective_code_host) and self.azure is None:
+            raise SpecValidationError(
+                "provider: azure_devops needs an `azure:` block "
+                "(organization, project[, repository])"
+            )
+        return self
 
 
 # --- Top-Level ----------------------------------------------------------
@@ -471,15 +612,38 @@ class ProjectSpec(BaseModel):
     cost_caps: CostCapsConfig
     triggers: TriggersConfig = Field(default_factory=TriggersConfig)
     release: ReleaseConfig = Field(default_factory=ReleaseConfig)
+    provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    """Anbieter für Tracker + Code-Host (GitHub, Azure DevOps). Default GitHub."""
     board: BoardConfig | None = None
     """Optionaler Project-Board-Config; aktiviert ``forge board-loop`` (v0.4)."""
     triage: TriageConfig = Field(default_factory=TriageConfig)
     """Pre-Phase im board-loop. Default: disabled. Siehe :class:`TriageConfig`."""
+    intake: IntakeConfig = Field(default_factory=IntakeConfig)
+    """Arbeit erzeugen + Specs veröffentlichen (Roadmap A). Wirksam nur mit
+    ``capabilities.create_work_items`` (Items) bzw. ``comment_issue``/
+    ``open_pr`` (Spec-Veröffentlichung)."""
     judge: JudgeConfig = Field(default_factory=JudgeConfig)
     """LLM-Judge-Verifikationsphase pro Generation. Default: disabled.
     Siehe :class:`JudgeConfig`."""
 
     # --- Cross-field validation ----------------------------------------
+
+    @model_validator(mode="after")
+    def _board_matches_provider(self) -> ProjectSpec:
+        if self.board is None:
+            return self
+        if self.board.provider is not None and self.board.provider != self.provider.tracker:
+            raise SpecValidationError(
+                f"board.provider={self.board.provider!r} contradicts "
+                f"provider.tracker={self.provider.tracker!r}"
+            )
+        if self.provider.tracker == "github" and (
+            self.board.owner is None or self.board.project_number is None
+        ):
+            raise SpecValidationError(
+                "board: GitHub boards need `owner` and `project_number`"
+            )
+        return self
 
     @model_validator(mode="after")
     def _surfaces_dont_overlap(self) -> ProjectSpec:

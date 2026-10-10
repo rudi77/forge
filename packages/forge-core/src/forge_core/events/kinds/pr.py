@@ -61,6 +61,11 @@ class PRReviewedPayload(BaseModel):
     """Falls ``merged`` False ist obwohl approve: warum (z.B. ci_not_green,
     capability_disabled, below_threshold)."""
 
+    reasoning_blob: str | None = None
+    """1.1: CAS-Ref (``sha256:…``) auf die Review-Begründung. Der Conductor
+    gibt sie dem Nacharbeits-Run (``request_changes`` → in-dev) als Kontext mit
+    — replay-fähig statt nur als Kommentar auf dem Code-Host."""
+
 
 class PRMergedPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -99,7 +104,8 @@ class PRRevertedPayload(BaseModel):
 
 
 register_payload(EventKind.PR_CREATED, PRCreatedPayload, "1.0")
-register_payload(EventKind.PR_REVIEWED, PRReviewedPayload, "1.0")
+# 1.1 (additiv): reasoning_blob für die Nacharbeit (L1).
+register_payload(EventKind.PR_REVIEWED, PRReviewedPayload, "1.1")
 # 1.1: additive Felder merged_by_forge + merge_method (Agent-Review-Merge).
 # Alte 1.0-Events lesen weiter, weil beide Defaults haben.
 register_payload(EventKind.PR_MERGED, PRMergedPayload, "1.1")

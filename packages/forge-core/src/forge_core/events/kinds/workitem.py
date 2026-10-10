@@ -18,7 +18,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from forge_core.events.base import EventKind, register_payload
 
-BlockedKind = Literal["deps", "cycle", "error", "dev_exhausted"]
+BlockedKind = Literal[
+    "deps",
+    "cycle",
+    "error",
+    "dev_exhausted",
+    "rework_exhausted",
+    "rework_no_change",
+    "ci_fix_exhausted",
+    "file_conflict",
+    "merge_conflict",
+]
 
 
 class WorkItemStageChangedPayload(BaseModel):
@@ -44,7 +54,12 @@ class WorkItemBlockedPayload(BaseModel):
     kind: BlockedKind
     """``deps`` = wartet auf offene Dependencies, ``cycle`` = Zyklus im
     Dependency-Graph, ``error`` = Dispatch/Adapter-Fehler, ``dev_exhausted`` =
-    in-dev-Run produzierte nach mehreren Versuchen keinen PR (eskaliert)."""
+    in-dev-Run produzierte nach mehreren Versuchen keinen PR (eskaliert).
+    1.2: ``rework_exhausted`` = zu viele request_changes-Runden,
+    ``rework_no_change`` = Nacharbeits-Run hat nichts gepusht,
+    ``ci_fix_exhausted`` = CI bleibt nach Fix-Versuchen rot,
+    ``file_conflict`` = wartet auf ein Item mit überlappenden Dateien (G),
+    ``merge_conflict`` = PR-Konflikt mit der Basis nicht auflösbar (G)."""
 
     blocked_by: list[int] = Field(default_factory=list)
     """Issue-Nummern, die das Item blockieren (bei ``deps``/``cycle``)."""
@@ -58,4 +73,6 @@ register_payload(
 # 1.1 (additiv): BlockedKind um "dev_exhausted" erweitert (in-dev-Eskalation
 # nach erschöpften Re-Dispatch-Versuchen). Alte 1.0-Events lesen weiter, da der
 # Wertebereich nur erweitert wurde.
-register_payload(EventKind.WORK_ITEM_BLOCKED, WorkItemBlockedPayload, "1.1")
+# 1.2 (additiv): BlockedKind um rework_*/ci_fix_exhausted/file_conflict/
+# merge_conflict erweitert (Roadmap L1/L2/G).
+register_payload(EventKind.WORK_ITEM_BLOCKED, WorkItemBlockedPayload, "1.2")

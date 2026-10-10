@@ -15,6 +15,7 @@ TriggerKind = Literal[
     "ci_failure",
     "schedule",
     "manual",
+    "rework",
 ]
 
 
@@ -32,6 +33,10 @@ class RunStartedPayload(BaseModel):
     pr_number: int | None = None
     max_iterations: int | None = None
     extras: dict[str, Any] = Field(default_factory=dict)
+    provider: str | None = None
+    """1.1: Anbieter des Work-Trackers (``github``/``azure_devops``), damit ein
+    Event-Strom über mehrere Anbieter eindeutig bleibt. ``None`` = unbekannt
+    (alte Events, ``forge run`` ohne Tracker)."""
 
 
 RunDecision = Literal[
@@ -60,7 +65,9 @@ class RunFinishedPayload(BaseModel):
     pr_number: int | None = None
 
 
-register_payload(EventKind.RUN_STARTED, RunStartedPayload, "1.0")
+# 1.1 (additiv): TriggerKind um "rework" erweitert (Nacharbeit auf einem
+# bestehenden PR-Branch, Conductor L1) + optionales ``provider``-Feld.
+register_payload(EventKind.RUN_STARTED, RunStartedPayload, "1.1")
 # 1.1 (additiv): RunDecision um "rate_limited" erweitert (Usage-Limit-Abbruch);
 # alte 1.0-Events lesen weiter, da der Decision-Wertebereich nur erweitert wurde.
 register_payload(EventKind.RUN_FINISHED, RunFinishedPayload, "1.1")

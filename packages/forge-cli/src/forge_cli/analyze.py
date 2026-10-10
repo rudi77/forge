@@ -74,6 +74,9 @@ def _render_report(store, *, project: str, last_runs: int) -> str:
     sections.append(_section_pr_merge_rate(store))
     sections.append(_section_failure_modes(store))
     sections.append(_section_lessons(store))
+    sections.append(_section_intake(store))
+    sections.append(_section_parallelism(store))
+    sections.append(_section_releases(store))
     return "\n".join(sections)
 
 
@@ -299,6 +302,76 @@ def _section_lessons(store, *, limit: int = 25) -> str:
         )
         out.append(
             f"| {category} | {lesson} | {issue} | {r['times_seen']} | {last} |"
+        )
+    out.append("")
+    return "\n".join(out)
+
+
+def _section_intake(store) -> str:
+    """Roadmap A: Annahmequote der von forge erzeugten Arbeit pro Quelle."""
+    rows = store.query(
+        "SELECT source, created, reached_done, blocked, done_rate FROM factory_intake"
+    )
+    if not rows:
+        return "## Intake (forge-generated work)\n\n_no work items created by forge yet._\n"
+    out = [
+        "## Intake (forge-generated work)",
+        "",
+        "| source | created | done | blocked | done rate |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        out.append(
+            f"| {r['source']} | {r['created']} | {r['reached_done']} | {r['blocked']} "
+            f"| {r['done_rate']:.0%} |"
+        )
+    out.append("")
+    return "\n".join(out)
+
+
+def _section_parallelism(store, *, last_days: int = 14) -> str:
+    """Roadmap G: genutzte Parallelität + wirksame Kapazität pro Tag."""
+    rows = store.query(
+        "SELECT day, ticks, mean_parallel, max_parallel, min_capacity "
+        "FROM factory_parallelism LIMIT ?",
+        [last_days],
+    )
+    if not rows:
+        return "## Parallelism\n\n_no conductor ticks yet._\n"
+    out = [
+        "## Parallelism",
+        "",
+        "| day | ticks | mean parallel | max parallel | min capacity |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        mean = f"{r['mean_parallel']:.2f}" if r["mean_parallel"] is not None else "—"
+        cap = r["min_capacity"] if r["min_capacity"] is not None else "—"
+        out.append(f"| {r['day']} | {r['ticks']} | {mean} | {r['max_parallel'] or 0} | {cap} |")
+    out.append("")
+    return "\n".join(out)
+
+
+def _section_releases(store, *, limit: int = 10) -> str:
+    """Roadmap L3: Releases, Items pro Release, Lead-Time erster Run → Release."""
+    rows = store.query(
+        "SELECT tag, version, released_at, items, mean_lead_time_h "
+        "FROM factory_releases LIMIT ?",
+        [limit],
+    )
+    if not rows:
+        return "## Releases\n\n_no releases yet._\n"
+    out = [
+        "## Releases",
+        "",
+        "| tag | released | items | mean lead time |",
+        "|---|---|---|---|",
+    ]
+    for r in rows:
+        lead = f"{r['mean_lead_time_h']:.1f} h" if r["mean_lead_time_h"] is not None else "—"
+        out.append(
+            f"| {r['tag']} | {r['released_at'].isoformat(timespec='minutes')} | "
+            f"{r['items']} | {lead} |"
         )
     out.append("")
     return "\n".join(out)

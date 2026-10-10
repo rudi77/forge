@@ -96,3 +96,65 @@ def unmet_dependencies(
     Reihenfolge = Eingabe.
     """
     return [d for d in depends_on if d not in done]
+
+
+# --- G: erwartete Dateien (Konflikt-Scheduling) -----------------------------
+
+_TOUCHES_LINE = re.compile(r"(?im)^\s*touches\s*:\s*(.+)$")
+_INTEGRATION_LINE = re.compile(r"(?im)^\s*integration\s*:\s*(branch|direct)\s*$")
+_INTEGRATION_BRANCH_LINE = re.compile(r"(?im)^\s*integration-branch\s*:\s*(\S+)\s*$")
+_GLOB_CHARS = set("*?[")
+
+
+def parse_touches(body: str | None) -> list[str]:
+    """``Touches: src/auth/**, tests/auth/**`` → Globs (dedupliziert).
+
+    Wie ``Depends-On:`` eine vom Menschen editierbare Body-Zeile; leer =
+    unbekannt → das Item gilt als „berührt alles" und läuft allein (E14)."""
+    if not body:
+        return []
+    out: list[str] = []
+    for line in _TOUCHES_LINE.findall(body):
+        for glob in re.split(r"[,\s]+", line.strip()):
+            glob = glob.strip("`'\"")
+            if glob and glob not in out:
+                out.append(glob)
+    return out
+
+
+def parse_integration_mode(body: str | None) -> str:
+    """Epic-Feld ``Integration: branch|direct`` (Default ``direct``, E13)."""
+    m = _INTEGRATION_LINE.search(body or "")
+    return m.group(1).lower() if m else "direct"
+
+
+def parse_integration_branch(body: str | None) -> str | None:
+    """``Integration-Branch: forge/epic-12`` eines Epic-Kinds, oder ``None``."""
+    m = _INTEGRATION_BRANCH_LINE.search(body or "")
+    return m.group(1) if m else None
+
+
+def _glob_base(glob: str) -> str:
+    """Fester Pfad-Präfix eines Globs (bis zum ersten Wildcard-Zeichen)."""
+    base = []
+    for ch in glob:
+        if ch in _GLOB_CHARS:
+            break
+        base.append(ch)
+    return "".join(base)
+
+
+def touches_overlap(a: list[str] | tuple[str, ...], b: list[str] | tuple[str, ...]) -> bool:
+    """Konservativer Überlappungs-Test zweier Glob-Mengen.
+
+    Zwei Globs überlappen, wenn ein fester Präfix Präfix des anderen ist
+    (``src/auth/**`` vs. ``src/auth/login.py``). Ein Glob ohne festen Präfix
+    (``**/*.py``) überlappt alles. Lieber eine falsche Serialisierung als ein
+    Merge-Konflikt — deterministisch, ohne Dateisystem."""
+    for x in a:
+        bx = _glob_base(x)
+        for y in b:
+            by = _glob_base(y)
+            if not bx or not by or bx.startswith(by) or by.startswith(bx):
+                return True
+    return False

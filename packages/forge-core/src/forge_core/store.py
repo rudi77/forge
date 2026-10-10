@@ -263,6 +263,113 @@ ORDER BY last_seen DESC;
 """
 
 
+# Intake-Sicht (Roadmap A, Mantra 1): wie viel der von forge erzeugten Arbeit
+# erreicht `done`, wie viel landet in `blocked` — pro Quelle. Eine Quelle mit
+# niedriger Quote ist ein Signal, sie abzuschalten. Read-only.
+_VIEW_FACTORY_INTAKE = """
+CREATE OR REPLACE VIEW factory_intake AS
+WITH created AS (
+    SELECT
+        project,
+        json_extract_string(payload, '$.source') AS source,
+        TRY_CAST(json_extract_string(payload, '$.number') AS INTEGER) AS number
+    FROM events
+    WHERE kind = 'WorkItemCreated'
+),
+done AS (
+    SELECT DISTINCT TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER)
+        AS number
+    FROM events
+    WHERE kind = 'WorkItemStageChanged'
+      AND json_extract_string(payload, '$.to_stage') = 'forge:done'
+),
+blocked AS (
+    SELECT DISTINCT TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER)
+        AS number
+    FROM events
+    WHERE kind = 'WorkItemStageChanged'
+      AND json_extract_string(payload, '$.to_stage') = 'forge:blocked'
+)
+SELECT
+    c.project,
+    c.source,
+    COUNT(*)                                         AS created,
+    COUNT(d.number)                                  AS reached_done,
+    COUNT(b.number)                                  AS blocked,
+    CAST(COUNT(d.number) AS DOUBLE) / COUNT(*)       AS done_rate
+FROM created c
+LEFT JOIN done d ON d.number = c.number
+LEFT JOIN blocked b ON b.number = c.number
+GROUP BY c.project, c.source
+ORDER BY created DESC;
+"""
+
+
+# Auslastungs-Sicht (Roadmap G): wie viel Parallelität die Fabrik pro Tag
+# tatsächlich nutzt und wie weit Budget/Ressourcen die Kapazität drosselten.
+_VIEW_FACTORY_PARALLELISM = """
+CREATE OR REPLACE VIEW factory_parallelism AS
+SELECT
+    project,
+    CAST(ts AS DATE)                                                      AS day,
+    COUNT(*)                                                              AS ticks,
+    AVG(TRY_CAST(json_extract(payload, '$.parallel_running') AS INTEGER)) AS mean_parallel,
+    MAX(TRY_CAST(json_extract(payload, '$.parallel_running') AS INTEGER)) AS max_parallel,
+    MIN(TRY_CAST(json_extract(payload, '$.capacity') AS INTEGER))         AS min_capacity
+FROM events
+WHERE kind = 'ConductorTickCompleted'
+GROUP BY project, CAST(ts AS DATE)
+ORDER BY day DESC;
+"""
+
+
+# Release-Sicht (Roadmap L3): jedes echte Release (keine Integrations-Marker)
+# mit Version, Anzahl ausgelieferter Items und mittlerer Lead-Time vom ersten
+# Run eines Items bis zum Release. Read-only.
+_VIEW_FACTORY_RELEASES = """
+CREATE OR REPLACE VIEW factory_releases AS
+WITH releases AS (
+    SELECT
+        project,
+        event_id,
+        ts AS released_at,
+        json_extract_string(payload, '$.tag')     AS tag,
+        json_extract_string(payload, '$.version') AS version,
+        CASE
+            WHEN json_array_length(json_extract(payload, '$.issue_numbers')) > 0
+            THEN json_extract(payload, '$.issue_numbers')
+            ELSE json_array(TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER))
+        END AS items
+    FROM events
+    WHERE kind = 'ReleaseTagged'
+      AND json_extract_string(payload, '$.integrated_into') IS NULL
+),
+item_rows AS (
+    SELECT r.project, r.event_id, r.released_at, r.tag, r.version,
+           CAST(unnest(from_json(r.items, '["INTEGER"]')) AS INTEGER) AS issue_number
+    FROM releases r
+),
+first_run AS (
+    SELECT TRY_CAST(json_extract_string(payload, '$.issue_number') AS INTEGER) AS issue_number,
+           MIN(ts) AS first_ts
+    FROM events
+    WHERE kind = 'RunStarted'
+    GROUP BY 1
+)
+SELECT
+    i.project,
+    i.tag,
+    i.version,
+    i.released_at,
+    COUNT(*)                                                       AS items,
+    AVG(EXTRACT(EPOCH FROM (i.released_at - f.first_ts)) / 3600.0) AS mean_lead_time_h
+FROM item_rows i
+LEFT JOIN first_run f ON f.issue_number = i.issue_number
+GROUP BY i.project, i.event_id, i.tag, i.version, i.released_at
+ORDER BY i.released_at DESC;
+"""
+
+
 _VIEWS = [
     _VIEW_RUNS_WITH_OUTCOMES,
     _VIEW_COST_PER_FOCUS,
@@ -271,6 +378,9 @@ _VIEWS = [
     _VIEW_FACTORY_KPIS,
     _VIEW_FACTORY_THROUGHPUT,
     _VIEW_LESSONS,
+    _VIEW_FACTORY_INTAKE,
+    _VIEW_FACTORY_PARALLELISM,
+    _VIEW_FACTORY_RELEASES,
 ]
 
 
